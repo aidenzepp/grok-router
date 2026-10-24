@@ -9,8 +9,9 @@
 
 //! `grok-router add` writes one model into a temp config.
 //!
-//! These tests pass `--catalog-file` and `--config`. They do not call the
-//! network, do not read `OPENROUTER_API_KEY`, and do not read a home config.
+//! These tests do not call the network, do not read `OPENROUTER_API_KEY`,
+//! and do not read a home config. A run that omits `--catalog-file` points
+//! `--cache-dir` at the temp directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -527,5 +528,232 @@ fn zero_matches_and_several_matches_exit_1_without_writing() {
     );
     let after = fs::read(&config).expect("the config fixture should still exist");
     assert_eq!(after, before, "a failed resolve should leave the file unchanged");
+    remove_temp(&dir);
+}
+
+const CUSTOM_BASE: &str = "https://example.invalid/v1";
+
+fn config_with_base(base: &str) -> String {
+    format!("[grok_router]\nopenrouter_base_url = \"{base}\"\n\n{}", config_text())
+}
+
+fn mark_fresh(path: &Path) {
+    let file = fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("the cache fixture should open so its age can be set");
+    let modified = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("one minute before now should be representable");
+    file.set_modified(modified)
+        .expect("the cache fixture should be marked younger than one hour");
+}
+
+fn assert_dir_empty(path: &Path) {
+    let mut entries = fs::read_dir(path).expect("the cache directory should be readable");
+    assert!(
+        entries.next().is_none(),
+        "the cache directory {} should contain no files",
+        path.display()
+    );
+}
+
+#[test]
+fn a_custom_base_is_written_on_the_new_block_and_existing_spans_stay() {
+    let dir = temp_root("custom-base");
+    let (config, catalog, cache) = write_fixture(&dir);
+    let text = config_with_base(CUSTOM_BASE);
+    fs::write(&config, &text).expect("the custom-base config should be written");
+    let before = fs::read(&config).expect("the custom-base config should be readable");
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+    );
+    let stdout = stdout_text(&output);
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "add should write the resolved base from --config; stderr: {stderr}; stdout: {stdout}"
+    );
+    let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
+    let new_block_base = format!(
+        "[model.or-widget-v2]\nmodel = \"acme/widget.v2\"\nbase_url = \"{CUSTOM_BASE}\"\n"
+    );
+    assert!(
+        after.contains(&new_block_base),
+        "the new block should use the resolved base {CUSTOM_BASE}; config: {after}"
+    );
+    assert_eq!(
+        after.matches(&format!("\nbase_url = \"{CUSTOM_BASE}\"\n")).count(),
+        1,
+        "the resolved base should appear on the new block only; config: {after}"
+    );
+    assert!(
+        after.contains(&format!("openrouter_base_url = \"{CUSTOM_BASE}\"")),
+        "the settings line should stay; config: {after}"
+    );
+    assert_preserved_spans(&after);
+    assert_ne!(
+        after.as_bytes(),
+        before.as_slice(),
+        "the add should insert a block"
+    );
+    assert_dir_empty(&cache);
+    remove_temp(&dir);
+}
+
+#[test]
+fn a_custom_base_cache_miss_reports_a_missing_key_and_does_not_read_models_json() {
+    let dir = temp_root("hex-miss");
+    let (config, _catalog, cache) = write_fixture(&dir);
+    let text = config_with_base(CUSTOM_BASE);
+    fs::write(&config, &text).expect("the custom-base config should be written");
+    let before = fs::read(&config).expect("the custom-base config should be readable");
+    let models = cache.join("models.json");
+    fs::write(&models, CATALOG).expect("the decoy models.json should be written");
+    mark_fresh(&models);
+    let models_before = fs::read(&models).expect("models.json should be readable before add");
+    let models_url = grok_router::catalog::models_url(CUSTOM_BASE);
+    let hex_path = grok_router::catalog::cache_file_for(&cache, &models_url);
+    let hex_name = hex_path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .expect("the hex cache name should be Unicode");
+    assert_ne!(
+        hex_name, "models.json",
+        "a custom base must not be stored as models.json; name: {hex_name}"
+    );
+    assert!(
+        !hex_path.exists(),
+        "this case misses the hex cache at {}",
+        hex_path.display()
+    );
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "a hex-cache miss should fail closed instead of reading models.json; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("OPENROUTER_API_KEY is missing"),
+        "the miss should fall through to a missing key, not a silent models.json read; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not downloaded"),
+        "the miss should say the catalog was not downloaded; stderr: {stderr}"
+    );
+    let after = fs::read(&config).expect("the config fixture should still exist");
+    assert_eq!(after, before, "a cache miss should leave the config unchanged");
+    let models_after = fs::read(&models).expect("models.json should still exist");
+    assert_eq!(
+        models_before, models_after,
+        "a custom-base miss must not rewrite models.json"
+    );
+    assert!(
+        !hex_path.exists(),
+        "a missing key must not create the hex cache at {}",
+        hex_path.display()
+    );
+    assert!(
+        !config.with_file_name("config.toml.prev").exists(),
+        "a refused add should not write a backup"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn add_without_config_exits_1_and_does_not_open_a_home_config() {
+    let dir = temp_root("no-config");
+    let home_config = dir.join(".grok").join("config.toml");
+    let output = run(&dir, &["add", "acme/widget.v2"]);
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "add without --config should fail; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no --config"),
+        "stderr should say that no --config path was given, not that a home file was missing; stderr: {stderr}"
+    );
+    assert!(
+        !home_config.exists(),
+        "add should not create a home config at {}",
+        home_config.display()
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn an_invalid_base_url_leaves_the_file_and_does_not_download() {
+    let dir = temp_root("bad-base");
+    let (config, _catalog, cache) = write_fixture(&dir);
+    let text = config_with_base("ftp://nope");
+    fs::write(&config, &text).expect("the invalid-base config should be written");
+    let before = fs::read(&config).expect("the invalid-base config should be readable");
+    assert_dir_empty(&cache);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "an invalid openrouter_base_url should fail before a download; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("openrouter_base_url"),
+        "the failure should name openrouter_base_url; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("left unchanged"),
+        "the failure should say the file was left unchanged; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Nothing was downloaded"),
+        "the failure should say nothing was downloaded; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("OPENROUTER_API_KEY is missing"),
+        "an invalid setting should return before the catalog load; stderr: {stderr}"
+    );
+    let after = fs::read(&config).expect("the invalid-base config should still exist");
+    assert_eq!(after, before, "an invalid setting should leave the file unchanged");
+    assert_dir_empty(&cache);
+    assert!(
+        !config.with_file_name("config.toml.prev").exists(),
+        "an invalid setting should not write a backup"
+    );
     remove_temp(&dir);
 }

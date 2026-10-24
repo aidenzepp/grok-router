@@ -1,8 +1,11 @@
 //! `add` subcommand.
 //!
 //! Add writes one OpenRouter model into the file named by `--config`.
-//! `--catalog-file` reads a local catalog and does not use the network.
-//! Without that flag, a missing API key fails before any config write.
+//! That file's OpenRouter base is resolved before any catalog load, and the
+//! new block is spliced with the same base. `--catalog-file` reads a local
+//! catalog and does not use the network. Without that flag, a missing API key
+//! fails before any config write. A missing `--config` fails before any home
+//! path is opened.
 
 use std::env;
 use std::fs;
@@ -107,13 +110,14 @@ fn run_add(root: &ArgMatches, matches: &ArgMatches) -> Result<String, String> {
     let config_path = configured_path(root, matches)?;
     let terms = query_terms(matches)?;
     let slug_override = matches.get_one::<String>("as").map(String::as_str);
-    let rows = load_rows(matches)?;
+    let original = read_config_text(&config_path)?;
+    let base_url = resolved_base(&original)?;
+    let rows = load_rows(matches, &base_url)?;
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let row = catalog::resolve(&rows, &term_refs).map_err(|err| {
         format!("{err} Nothing was written.")
     })?;
     let slug = planned_slug(row.id(), slug_override)?;
-    let original = read_config_text(&config_path)?;
     let edited = edited_config(&original, row, slug_override, &slug, matches.get_flag("default"))?;
     let unchanged = edited == original;
     let dry_run = matches.get_flag("dry-run");
@@ -184,8 +188,42 @@ fn planned_slug(provider_id: &str, slug_override: Option<&str>) -> Result<String
     }
 }
 
-/// Load rows from `--catalog-file`, or from the cache and the network.
-fn load_rows(matches: &ArgMatches) -> Result<Vec<CatalogRow>, String> {
+/// OpenRouter base from `config`.
+///
+/// Called after the config text is read and before any catalog load. An
+/// unusable setting returns here, so the cache helper and the file replace
+/// never run.
+///
+/// # Errors
+///
+/// Returns an error when `[grok_router]` cannot be resolved. The config is
+/// left unchanged and nothing is downloaded.
+fn resolved_base(config: &str) -> Result<String, String> {
+    match config_edit::router_settings(config) {
+        Ok(settings) => Ok(settings.base_url),
+        Err(reason) => Err(settings_failure(&reason)),
+    }
+}
+
+/// What failed, why nothing was downloaded, and what to do next.
+fn settings_failure(reason: &RefuseReason) -> String {
+    let repair = match reason {
+        RefuseReason::InvalidSetting { key, .. } => {
+            format!("Fix {key} in the config and retry.")
+        }
+        RefuseReason::Parse { .. } => {
+            "Fix the config so it parses as TOML and retry.".to_owned()
+        }
+        _ => "Fix the config and retry.".to_owned(),
+    };
+    format!("{reason}. The file was left unchanged. Nothing was downloaded. {repair}")
+}
+
+/// Load rows from `--catalog-file`, or from the cache for `base_url`.
+///
+/// `--catalog-file` returns before the cache helper. `base_url` is the base
+/// already resolved from `--config`.
+fn load_rows(matches: &ArgMatches, base_url: &str) -> Result<Vec<CatalogRow>, String> {
     if let Some(path) = matches.get_one::<PathBuf>("catalog-file") {
         let bytes = fs::read(path).map_err(|err| {
             format!(
@@ -203,7 +241,6 @@ fn load_rows(matches: &ArgMatches) -> Result<Vec<CatalogRow>, String> {
     };
     let api_key = live_api_key()?;
     let now = SystemTime::now();
-    let base_url = config_edit::OPENROUTER_BASE_URL;
     match catalog::prepare_cached_load(
         &cache_dir,
         now,
