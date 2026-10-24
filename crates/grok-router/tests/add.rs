@@ -1634,7 +1634,10 @@ fn a_pasted_secret_refuses_before_a_write() {
         ])
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("DEEPSEEK_API_KEY")
-        .env("MIRROR_API_KEY", std::ffi::OsString::from_vec(vec![0xff, 0xfe]))
+        .env(
+            "MIRROR_API_KEY",
+            std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+        )
         .env("HOME", &raw_dir)
         .env("NO_COLOR", "1")
         .current_dir(&raw_dir)
@@ -1851,6 +1854,14 @@ fn direct_flags_write_the_supplied_block_and_leave_the_four_spans() {
         );
     }
     assert!(
+        after.contains("default = \"grok-4.7\"\n"),
+        "a direct add without --default should leave the default line; config: {after}"
+    );
+    assert!(
+        !after.contains("default = \"claude-opus\""),
+        "a direct add without --default should not set claude-opus; config: {after}"
+    );
+    assert!(
         !source.contains("[router]"),
         "the fixture should have no [router] table"
     );
@@ -2020,6 +2031,119 @@ fn direct_add_refuses_when_the_env_key_value_would_be_written() {
         fs::read(&config).expect("the secret fixture should still exist"),
         before,
         "a secret refusal should write nothing"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn direct_default_writes_the_acceptance_block_and_claude_opus_in_one_replace() {
+    let dir = temp_root("direct-default");
+    let source = four_spans();
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the direct-default fixture should be readable");
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let mut args = acceptance_args(&config_arg);
+    args.push("--default");
+    let output = run(&dir, &args);
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "a direct add with --default should write in one replace; stderr: {stderr}; stdout: {}",
+        stdout_text(&output)
+    );
+    assert_eq!(stdout_text(&output), "claude-opus\n");
+    let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
+    let header_at = after
+        .find("[model.claude-opus]\n")
+        .expect("the acceptance slug should be present");
+    let written = after
+        .get(header_at..)
+        .expect("the acceptance header should start a span");
+    assert!(
+        written.starts_with(ACCEPTANCE_BLOCK),
+        "the new span should equal the acceptance block; config: {after}"
+    );
+    assert!(
+        after.contains("default = \"claude-opus\"\n"),
+        "the same write should set [models].default to claude-opus; config: {after}"
+    );
+    assert!(
+        !after.contains("default = \"grok-4.7\""),
+        "the old default line should be replaced, not kept beside the new one; config: {after}"
+    );
+    assert!(
+        after.contains("default_reasoning_effort = \"high\""),
+        "the reasoning-effort line should stay; config: {after}"
+    );
+    for span in [DEEPSEEK_SPAN, PRO_SPAN, GLM_SPAN, GLM_FLASH_SPAN] {
+        assert!(
+            after.contains(span),
+            "an existing span should stay byte-identical; config: {after}"
+        );
+    }
+    let backup = config.with_file_name("config.toml.prev");
+    let backed_up =
+        fs::read(&backup).expect("one write should leave the original bytes as the sibling backup");
+    assert_eq!(
+        backed_up, before,
+        "the backup should be the original file, which means the block and the default were one replace"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn direct_default_refusal_writes_nothing() {
+    let dir = temp_root("direct-default-refuse");
+    // A multiline default parses, so the insert can succeed. Rewriting that line
+    // leaves the closer behind, and set_default refuses the broken document.
+    let source = four_spans().replace(
+        "default = \"grok-4.7\"\n",
+        "default = \"\"\"\ngrok-4.7\"\"\"\n",
+    );
+    let inserted = grok_router::config_edit::insert_direct(
+        &source,
+        grok_router::config_edit::DirectBlock {
+            slug: "claude-opus",
+            model: "claude-opus-5-5",
+            base_url: "https://proxy.tokenfix.trilogy.com/v1",
+            name: Some("Claude Opus (TokenFix)"),
+            api_backend: "messages",
+            env_key: "ANTHROPIC_AUTH_TOKEN",
+            context_window: None,
+            vision: false,
+        },
+    )
+    .expect("insert_direct should accept this fixture");
+    assert!(
+        grok_router::config_edit::set_default(&inserted, "claude-opus").is_err(),
+        "set_default should refuse the rewritten multiline default"
+    );
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the refusal fixture should be readable");
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let mut args = acceptance_args(&config_arg);
+    args.push("--default");
+    let output = run(&dir, &args);
+    let stderr = stderr_text(&output);
+    assert_ne!(
+        exit_code(&output),
+        0,
+        "a refused default should fail; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("left unchanged"),
+        "stderr should say the file was left unchanged; stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&config).expect("the refusal fixture should still exist"),
+        before,
+        "a refused default should write nothing, including the inserted block"
+    );
+    assert!(
+        !config.with_file_name("config.toml.prev").exists(),
+        "a refused default should not write a backup"
     );
     remove_temp(&dir);
 }

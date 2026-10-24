@@ -4,11 +4,12 @@
 //! resolves one `[router]` provider record and selects its cartridge before
 //! any catalog parse or download. The direct path runs when `--model`,
 //! `--base-url`, `--env-key`, and `--api-backend` are all present: it writes
-//! one block from those flags and does not resolve a provider.
-//! `--catalog-file` reads local bytes and does not use the network. Without
-//! that flag, a missing or blank bearer fails before any config write and
-//! does not write the cache. A missing `--config` fails before any home path
-//! is opened.
+//! one block from those flags and does not resolve a provider. `--default` on
+//! that path sets `[models].default` in the same write. A refused default
+//! writes nothing. `--catalog-file` reads local bytes and does not use the
+//! network. Without that flag, a missing or blank bearer fails before any
+//! config write and does not write the cache. A missing `--config` fails
+//! before any home path is opened.
 
 use std::env;
 use std::fs;
@@ -192,9 +193,6 @@ fn direct_conflicts(args: &AddArgs) -> Vec<&'static str> {
     if args.refresh {
         names.push("--refresh");
     }
-    if args.set_default {
-        names.push("--default");
-    }
     names
 }
 
@@ -261,6 +259,8 @@ fn required_direct_slug(args: &AddArgs) -> Result<&str, String> {
 }
 
 /// Write one block from the four direct flags. Does not resolve a provider or download a catalog.
+///
+/// `--default` sets `[models].default` in the same `replace_file`. A refused default writes nothing.
 fn run_direct_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<String, String> {
     let conflicts = direct_conflicts(args);
     if !conflicts.is_empty() {
@@ -283,7 +283,7 @@ fn run_direct_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<
             ));
         }
     };
-    let edited = config_edit::insert_direct(
+    let inserted = config_edit::insert_direct(
         original,
         config_edit::DirectBlock {
             slug,
@@ -297,6 +297,15 @@ fn run_direct_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<
         },
     )
     .map_err(|refused| edit_failure(&refused.reason))?;
+    // `Refused.text` is the inserted document. Do not write it: the file keeps `original`.
+    let edited = if args.set_default {
+        match config_edit::set_default(&inserted, slug) {
+            Ok(text) => text,
+            Err(refused) => return Err(edit_failure(&refused.reason)),
+        }
+    } else {
+        inserted
+    };
     let unchanged = edited == original;
     let dry_run = args.dry_run;
     let wrote = if unchanged || dry_run {
@@ -318,7 +327,7 @@ fn run_direct_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<
         wrote,
         dry_run,
         unchanged,
-        default: false,
+        default: args.set_default,
     };
     render(args, &report, config_path)
 }
@@ -437,9 +446,9 @@ fn cartridge_failure(provider: &str, err: &CartridgeError) -> String {
     let next = "Set catalog to openrouter-models or deepseek-list-models, or pass --provider for a record that already has one.";
     let preserved = "Nothing was downloaded. Nothing was written.";
     match err {
-        CartridgeError::Missing => format!(
-            "{provider} has no catalog cartridge configured. {preserved} {next}"
-        ),
+        CartridgeError::Missing => {
+            format!("{provider} has no catalog cartridge configured. {preserved} {next}")
+        }
         CartridgeError::Unknown { id } => format!(
             "catalog {id} on {provider} is not a cartridge, so no catalog cartridge is configured. {preserved} {next}"
         ),
