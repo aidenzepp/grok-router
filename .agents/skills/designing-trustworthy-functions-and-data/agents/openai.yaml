@@ -1,0 +1,4 @@
+interface:
+  display_name: "Designing Trustworthy Functions and Data"
+  short_description: "Design truthful functions and invariant-preserving data"
+  default_prompt: "Use $designing-trustworthy-functions-and-data to design or review functions, domain values, data structures, parsing boundaries, dependencies, effects, invariants, and abstractions without introducing needless traits, wrappers, mocks, or helper layers."

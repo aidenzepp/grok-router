@@ -1,0 +1,11 @@
+[package]
+name = "grok-router"
+version = "0.1.0"
+edition = "2024"
+description = "grok-router command line"
+
+[dependencies]
+clap = "4"
+
+[lints]
+workspace = true

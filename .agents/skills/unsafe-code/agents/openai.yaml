@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unsafe code"
+  short_description: "Isolate Rust unsafe in crates/ffi"
+  default_prompt: "Use $unsafe-code when unsafe or FFI is required. Keep app crates under forbid(unsafe_code), apply only the documented crates/ffi lint exception, export a safe API, and write SAFETY comments."

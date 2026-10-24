@@ -1,0 +1,4 @@
+interface:
+  display_name: "Self-Explanatory Tests"
+  short_description: "Write tests that explain every failure"
+  default_prompt: "Use $self-explanatory-tests to map the relevant obligations, pressure weak invariants and dependency boundaries, choose honest evidence, produce self-explanatory failures, and preserve the workspace lint policy."

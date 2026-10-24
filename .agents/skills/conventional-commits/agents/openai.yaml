@@ -1,0 +1,4 @@
+interface:
+  display_name: "Conventional Commits"
+  short_description: "Create targeted commits with idiomatic conventional-commit prefixes"
+  default_prompt: "Use $conventional-commits when staging or committing. Inspect the diff, split changes into targeted DAG-story commits, choose idiomatic prefixes, verify each boundary, and keep demo or scratch work out unless explicitly requested."

@@ -1,0 +1,7 @@
+# Apply error, panic, and safety documentation lints to private production functions.
+check-private-items = true
+# Tests may fail fast, but failures must carry intentional context.
+allow-panic-in-tests = true
+# Keep this explicit: tests may use expect with context, but never unwrap.
+allow-unwrap-in-tests = false
+allow-expect-in-tests = true
