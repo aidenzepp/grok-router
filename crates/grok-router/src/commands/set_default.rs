@@ -9,76 +9,55 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::Args;
 
 use crate::config_edit::{self, Backup, RefuseReason};
 
-/// Adds the `set-default` subcommand and its flags.
-#[must_use]
-pub fn augment(cmd: Command) -> Command {
-    cmd.subcommand(
-        Command::new("set-default")
-            .about(
-                "Set [models].default for the next session. This does not switch the running session. This command writes the saved default unless --dry-run is set.",
-            )
-            .after_help(
-                "Examples:\n  grok-router set-default --config config.toml grok-4.6",
-            )
-            .arg(
-                Arg::new("slug")
-                    .value_name("SLUG")
-                    .required(true)
-                    .help("Built-in or configured slug to save as the default."),
-            )
-            .arg(
-                Arg::new("dry-run")
-                    .long("dry-run")
-                    .action(ArgAction::SetTrue)
-                    .help("Print the slug that would be saved, then do not change the file."),
-            )
-            .arg(
-                Arg::new("json")
-                    .long("json")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("quiet")
-                    .help("Print one JSON object and nothing else."),
-            )
-            .arg(
-                Arg::new("quiet")
-                    .long("quiet")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("json")
-                    .help("Print the slug only."),
-            ),
-    )
+/// Set [models].default for the next session. This does not switch the running session. This command writes the saved default unless --dry-run is set.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router set-default --config config.toml grok-4.6"
+)]
+pub struct SetDefaultArgs {
+    /// Built-in or configured slug to save as the default.
+    #[arg(value_name = "SLUG", verbatim_doc_comment)]
+    slug: String,
+
+    /// Print the slug that would be saved, then do not change the file.
+    #[arg(long, verbatim_doc_comment)]
+    dry_run: bool,
+
+    /// Print one JSON object and nothing else.
+    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
+    json: bool,
+
+    /// Print the slug only.
+    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
+    quiet: bool,
 }
 
-/// Runs `set-default` from the root matches.
+/// Runs `set-default`.
 ///
 /// Returns `0` when the saved default is the requested slug, or would be under `--dry-run`.
 /// Returns `1` when the default was not changed.
 #[must_use]
-pub fn run(matches: &ArgMatches) -> i32 {
-    let Some(sub) = matches.subcommand_matches("set-default") else {
-        return fail(
-            "set-default was not selected. Run `grok-router set-default --help` for the flags and an example.",
-        );
-    };
-    match apply(matches, sub) {
+pub fn run(config: Option<&str>, args: &SetDefaultArgs) -> i32 {
+    match apply(config, args) {
         Ok(body) => write_stdout(&body),
         Err(message) => fail(&message),
     }
 }
 
 /// Read `--config`, set the default in that text, and replace the file unless this is `--dry-run`.
-fn apply(root: &ArgMatches, matches: &ArgMatches) -> Result<String, String> {
-    let path = configured_path(root, matches)?;
-    let slug = requested_slug(matches)?;
+fn apply(config: Option<&str>, args: &SetDefaultArgs) -> Result<String, String> {
+    let path = configured_path(config)?;
+    let slug = requested_slug(&args.slug)?;
     let original = read_config_text(&path)?;
-    let edited =
-        config_edit::set_default(&original, &slug).map_err(|refused| edit_failure(&refused.reason))?;
+    let edited = config_edit::set_default(&original, &slug)
+        .map_err(|refused| edit_failure(&refused.reason))?;
     let unchanged = edited == original;
-    let dry_run = matches.get_flag("dry-run");
+    let dry_run = args.dry_run;
     let wrote = if unchanged || dry_run {
         false
     } else {
@@ -98,15 +77,12 @@ fn apply(root: &ArgMatches, matches: &ArgMatches) -> Result<String, String> {
         dry_run,
         unchanged,
     };
-    render(matches, &report)
+    render(args, &report)
 }
 
-/// `--config` from the subcommand or the global flag. Never a home path.
-fn configured_path(root: &ArgMatches, sub: &ArgMatches) -> Result<PathBuf, String> {
-    let raw = sub
-        .get_one::<String>("config")
-        .or_else(|| root.get_one::<String>("config"));
-    match raw {
+/// `--config` from the global flag. Never a home path.
+fn configured_path(config: Option<&str>) -> Result<PathBuf, String> {
+    match config {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
         Some(_) => Err(
             "--config is empty, so the saved default was not changed. Pass --config with the file to edit."
@@ -120,17 +96,14 @@ fn configured_path(root: &ArgMatches, sub: &ArgMatches) -> Result<PathBuf, Strin
 }
 
 /// The required slug. An empty string is a usage failure.
-fn requested_slug(matches: &ArgMatches) -> Result<String, String> {
-    match matches.get_one::<String>("slug") {
-        Some(slug) if !slug.is_empty() => Ok(slug.clone()),
-        Some(_) => Err(
+fn requested_slug(slug: &str) -> Result<String, String> {
+    if slug.is_empty() {
+        Err(
             "the slug is empty, so the saved default was not changed. Pass a built-in or configured slug."
                 .to_owned(),
-        ),
-        None => Err(
-            "no slug was given, so the saved default was not changed. Pass a built-in or configured slug. Run `grok-router set-default --help` for an example."
-                .to_owned(),
-        ),
+        )
+    } else {
+        Ok(slug.to_owned())
     }
 }
 
@@ -202,15 +175,15 @@ fn next_step(reason: &RefuseReason) -> &'static str {
 }
 
 /// Human text, the slug, or one JSON object.
-fn render(matches: &ArgMatches, report: &SetDefaultReport) -> Result<String, String> {
-    if matches.get_flag("json") {
+fn render(args: &SetDefaultArgs, report: &SetDefaultReport) -> Result<String, String> {
+    if args.json {
         return serde_json::to_string(report).map_err(|err| {
             format!(
                 "could not encode the set-default result as JSON: {err}. Retry the command; report this if it persists."
             )
         });
     }
-    if matches.get_flag("quiet") {
+    if args.quiet {
         return Ok(report.slug.clone());
     }
     if report.dry_run {

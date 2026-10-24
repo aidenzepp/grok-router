@@ -8,81 +8,59 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::Args;
 
 use crate::config_edit::{self, Backup, RefuseReason};
 
-/// Adds the `remove` subcommand and its flags.
-#[must_use]
-pub fn augment(cmd: Command) -> Command {
-    cmd.subcommand(
-        Command::new("remove")
-            .about("Delete one model block from the config. This command deletes a model block.")
-            .after_help(
-                "Examples:\n  grok-router remove --yes --config config.toml or-glm-5-3",
-            )
-            .arg(
-                Arg::new("slug")
-                    .value_name("SLUG")
-                    .required(true)
-                    .help("Slug of the model block to delete."),
-            )
-            .arg(
-                Arg::new("yes")
-                    .long("yes")
-                    .visible_alias("force")
-                    .action(ArgAction::SetTrue)
-                    .help("Delete the model block. Required unless --dry-run is set. --force is the same flag."),
-            )
-            .arg(
-                Arg::new("dry-run")
-                    .long("dry-run")
-                    .action(ArgAction::SetTrue)
-                    .help("Print the slug that would be deleted and do not change the file."),
-            )
-            .arg(
-                Arg::new("json")
-                    .long("json")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("quiet")
-                    .help("Print one JSON object and nothing else."),
-            )
-            .arg(
-                Arg::new("quiet")
-                    .long("quiet")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("json")
-                    .help("Print the slug only."),
-            ),
-    )
+/// Delete one model block from the config. This command deletes a model block.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router remove --yes --config config.toml or-glm-5-3"
+)]
+pub struct RemoveArgs {
+    /// Slug of the model block to delete.
+    #[arg(value_name = "SLUG", verbatim_doc_comment)]
+    slug: String,
+
+    /// Delete the model block. Required unless --dry-run is set. --force is the same flag.
+    #[arg(long, visible_alias = "force", verbatim_doc_comment)]
+    yes: bool,
+
+    /// Print the slug that would be deleted and do not change the file.
+    #[arg(long, verbatim_doc_comment)]
+    dry_run: bool,
+
+    /// Print one JSON object and nothing else.
+    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
+    json: bool,
+
+    /// Print the slug only.
+    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
+    quiet: bool,
 }
 
-/// Runs `remove` from the root matches.
+/// Runs `remove`.
 ///
 /// Returns `0` when the block was deleted, or when `--dry-run` would delete it.
 /// Returns `1` when the file was left unchanged.
 #[must_use]
-pub fn run(matches: &ArgMatches) -> i32 {
-    let Some(sub) = matches.subcommand_matches("remove") else {
-        return fail(
-            "remove was not selected. Run `grok-router remove --help` for the flags and an example.",
-        );
-    };
-    match run_remove(matches, sub) {
+pub fn run(config: Option<&str>, args: &RemoveArgs) -> i32 {
+    match run_remove(config, args) {
         Ok(body) => write_stdout(&body),
         Err(message) => fail(&message),
     }
 }
 
 /// Delete one slug, or preview that deletion. Does not prompt.
-fn run_remove(root: &ArgMatches, matches: &ArgMatches) -> Result<String, String> {
-    let slug = required_slug(matches)?;
-    let config_path = configured_path(root, matches)?;
+fn run_remove(config: Option<&str>, args: &RemoveArgs) -> Result<String, String> {
+    let slug = required_slug(&args.slug)?;
+    let config_path = configured_path(config)?;
     let original = read_config_text(&config_path)?;
-    let edited = config_edit::remove_model(&original, &slug)
-        .map_err(|refused| edit_failure(&refused.reason))?;
-    let dry_run = matches.get_flag("dry-run");
-    let confirmed = matches.get_flag("yes");
+    let edited =
+        config_edit::remove_model(&original, &slug).map_err(|refused| edit_failure(&refused.reason))?;
+    let dry_run = args.dry_run;
+    let confirmed = args.yes;
     if !dry_run && !confirmed {
         return Err(format!(
             "{slug} was not deleted. Nothing was written. To delete that model block, pass --yes. To preview, pass --dry-run."
@@ -105,30 +83,24 @@ fn run_remove(root: &ArgMatches, matches: &ArgMatches) -> Result<String, String>
         removed,
         dry_run,
     };
-    render(matches, &report)
+    render(args, &report)
 }
 
 /// The positional slug. An empty slug is a usage failure and deletes nothing.
-fn required_slug(matches: &ArgMatches) -> Result<String, String> {
-    match matches.get_one::<String>("slug").map(String::as_str) {
-        Some(slug) if !slug.is_empty() => Ok(slug.to_owned()),
-        Some(_) => Err(
+fn required_slug(slug: &str) -> Result<String, String> {
+    if slug.is_empty() {
+        Err(
             "an empty slug was given. Nothing was deleted. Pass the slug of a model block."
                 .to_owned(),
-        ),
-        None => Err(
-            "no slug was given. Nothing was deleted. Pass the slug of the model block to delete."
-                .to_owned(),
-        ),
+        )
+    } else {
+        Ok(slug.to_owned())
     }
 }
 
-/// `--config` from the subcommand or the global flag. Never a home path.
-fn configured_path(root: &ArgMatches, sub: &ArgMatches) -> Result<PathBuf, String> {
-    let raw = sub
-        .get_one::<String>("config")
-        .or_else(|| root.get_one::<String>("config"));
-    match raw {
+/// `--config` from the global flag. Never a home path.
+fn configured_path(config: Option<&str>) -> Result<PathBuf, String> {
+    match config {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
         Some(_) => Err(
             "--config is empty, so nothing was deleted. Pass --config with the file to edit."
@@ -220,15 +192,15 @@ fn next_step(reason: &RefuseReason) -> String {
 }
 
 /// Human text, the slug, or one JSON object.
-fn render(matches: &ArgMatches, report: &RemoveReport) -> Result<String, String> {
-    if matches.get_flag("json") {
+fn render(args: &RemoveArgs, report: &RemoveReport) -> Result<String, String> {
+    if args.json {
         return serde_json::to_string(report).map_err(|err| {
             format!(
                 "could not encode the remove result as JSON: {err}. Retry the remove; report this if it persists."
             )
         });
     }
-    if matches.get_flag("quiet") {
+    if args.quiet {
         return Ok(report.slug.clone());
     }
     if report.dry_run {

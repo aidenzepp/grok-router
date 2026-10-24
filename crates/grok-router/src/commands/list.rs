@@ -8,65 +8,54 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::Args;
 
 use crate::config_edit::{self, ConfiguredInventory, RefuseReason};
 
-/// Adds the `list` subcommand and its flags.
-#[must_use]
-pub fn augment(cmd: Command) -> Command {
-    cmd.subcommand(
-        Command::new("list")
-            .about("List configured models and the saved default. This command does not modify the config.")
-            .after_help("Examples:\n  grok-router list --config config.toml")
-            .arg(
-                Arg::new("json")
-                    .long("json")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("quiet")
-                    .help("Print a JSON array of slug, provider id, and whether it is the default."),
-            )
-            .arg(
-                Arg::new("quiet")
-                    .long("quiet")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("json")
-                    .help("Print one slug per line."),
-            ),
-    )
+/// List configured models and the saved default. This command does not modify the config.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router list --config config.toml"
+)]
+pub struct ListArgs {
+    /// Print a JSON array of slug, provider id, and whether it is the default.
+    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
+    json: bool,
+
+    /// Print one slug per line.
+    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
+    quiet: bool,
 }
 
 /// Runs `list`, including the no-args path.
 ///
+/// `args` is absent when no subcommand was given. That path has neither `--json` nor `--quiet`.
+///
 /// Returns `0` when the inventory was printed and `1` when the config could not be read.
 #[must_use]
-pub fn run(matches: &ArgMatches) -> i32 {
-    let sub = matches.subcommand_matches("list");
-    if matches.subcommand_name().is_some() && sub.is_none() {
-        return fail(
-            "list was not selected. Run `grok-router list --help` for the flags and an example.",
-        );
-    }
-    match list_models(matches, sub) {
+pub fn run(config: Option<&str>, args: Option<&ListArgs>) -> i32 {
+    match list_models(config, args) {
         Ok(body) => write_stdout(&body),
         Err(message) => fail(&message),
     }
 }
 
 /// Read the config and render the inventory. Does not write the file.
-fn list_models(root: &ArgMatches, sub: Option<&ArgMatches>) -> Result<String, String> {
-    let path = config_path(root, sub)?;
+fn list_models(config: Option<&str>, args: Option<&ListArgs>) -> Result<String, String> {
+    let path = config_path(config)?;
     let text = read_config_text(&path)?;
-    let inventory = config_edit::read_configured(&text).map_err(|refused| read_failure(&refused.reason))?;
+    let inventory =
+        config_edit::read_configured(&text).map_err(|refused| read_failure(&refused.reason))?;
     let rows = display_rows(&inventory);
-    render(&rows, flag(sub, "json"), flag(sub, "quiet"))
+    let json = args.is_some_and(|args| args.json);
+    let quiet = args.is_some_and(|args| args.quiet);
+    render(&rows, json, quiet)
 }
 
-/// `--config` from the subcommand or the root. Otherwise `${GROK_HOME:-$HOME/.grok}/config.toml`.
-fn config_path(root: &ArgMatches, sub: Option<&ArgMatches>) -> Result<PathBuf, String> {
-    let from_sub = sub.and_then(|matches| matches.get_one::<String>("config"));
-    let from_root = root.get_one::<String>("config");
-    match from_sub.or(from_root).map(String::as_str) {
+/// `--config` when it was passed. Otherwise `${GROK_HOME:-$HOME/.grok}/config.toml`.
+fn config_path(config: Option<&str>) -> Result<PathBuf, String> {
+    match config {
         Some("") => Err(
             "--config is empty, so the models were not listed. Pass --config with the file to read."
                 .to_owned(),
@@ -126,11 +115,6 @@ fn read_failure(reason: &RefuseReason) -> String {
     format!(
         "{reason}. The models were not listed. Fix the config so it parses as TOML, or pass --config with a readable file."
     )
-}
-
-/// A flag from the `list` subcommand. No-args has neither `--json` nor `--quiet`.
-fn flag(sub: Option<&ArgMatches>, name: &str) -> bool {
-    sub.is_some_and(|matches| matches.get_flag(name))
 }
 
 /// Configured models in slug order, plus the saved default when it has no block.

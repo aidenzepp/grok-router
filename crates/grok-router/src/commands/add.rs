@@ -13,114 +13,82 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::{ArgAction, Args};
 
 use crate::catalog::{self, CachedOrFetch, CatalogRow};
 use crate::config_edit::{self, Backup, RefuseReason};
 
-/// Adds the `add` subcommand and its flags.
-#[must_use]
-pub fn augment(cmd: Command) -> Command {
-    cmd.subcommand(
-        Command::new("add")
-            .about("Add one OpenRouter model to the config. This command writes unless --dry-run is set.")
-            .after_help(
-                "Examples:\n  grok-router add --catalog-file models.json --config config.toml z-ai/glm-5.3",
-            )
-            .arg(
-                Arg::new("query")
-                    .value_name("QUERY")
-                    .action(ArgAction::Append)
-                    .help("Provider id or terms. Repeat to require every term. Optional when the catalog has one row."),
-            )
-            .arg(
-                Arg::new("as")
-                    .long("as")
-                    .value_name("SLUG")
-                    .help("Slug to write instead of the derived or- slug."),
-            )
-            .arg(
-                Arg::new("default")
-                    .long("default")
-                    .action(ArgAction::SetTrue)
-                    .help("Set this slug as [models].default in the same write."),
-            )
-            .arg(
-                Arg::new("catalog-file")
-                    .long("catalog-file")
-                    .value_name("PATH")
-                    .value_parser(clap::value_parser!(PathBuf))
-                    .help("Read this catalog JSON instead of the network or the cache."),
-            )
-            .arg(
-                Arg::new("cache-dir")
-                    .long("cache-dir")
-                    .value_name("DIR")
-                    .value_parser(clap::value_parser!(PathBuf))
-                    .help("Directory for the models.json cache. Used only when --catalog-file is absent."),
-            )
-            .arg(
-                Arg::new("refresh")
-                    .long("refresh")
-                    .action(ArgAction::SetTrue)
-                    .help("Download a new catalog even when the cache is younger than one hour."),
-            )
-            .arg(
-                Arg::new("dry-run")
-                    .long("dry-run")
-                    .action(ArgAction::SetTrue)
-                    .help("Print the slug and that it would write, then do not change the file."),
-            )
-            .arg(
-                Arg::new("json")
-                    .long("json")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("quiet")
-                    .help("Print one JSON object and nothing else."),
-            )
-            .arg(
-                Arg::new("quiet")
-                    .long("quiet")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("json")
-                    .help("Print the slug only."),
-            ),
-    )
+/// Add one OpenRouter model to the config. This command writes unless --dry-run is set.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router add --catalog-file models.json --config config.toml z-ai/glm-5.3"
+)]
+pub struct AddArgs {
+    /// Provider id or terms. Repeat to require every term. Optional when the catalog has one row.
+    #[arg(value_name = "QUERY", action = ArgAction::Append, verbatim_doc_comment)]
+    query: Vec<String>,
+
+    /// Slug to write instead of the derived or- slug.
+    #[arg(long = "as", value_name = "SLUG", verbatim_doc_comment)]
+    as_slug: Option<String>,
+
+    /// Set this slug as [models].default in the same write.
+    #[arg(long = "default", verbatim_doc_comment)]
+    set_default: bool,
+
+    /// Read this catalog JSON instead of the network or the cache.
+    #[arg(long, value_name = "PATH", verbatim_doc_comment)]
+    catalog_file: Option<PathBuf>,
+
+    /// Directory for the models.json cache. Used only when --catalog-file is absent.
+    #[arg(long, value_name = "DIR", verbatim_doc_comment)]
+    cache_dir: Option<PathBuf>,
+
+    /// Download a new catalog even when the cache is younger than one hour.
+    #[arg(long, verbatim_doc_comment)]
+    refresh: bool,
+
+    /// Print the slug and that it would write, then do not change the file.
+    #[arg(long, verbatim_doc_comment)]
+    dry_run: bool,
+
+    /// Print one JSON object and nothing else.
+    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
+    json: bool,
+
+    /// Print the slug only.
+    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
+    quiet: bool,
 }
 
-/// Runs `add` from the root matches.
+/// Runs `add`.
 ///
 /// Returns `0` when the model is present in the config (or would be, under `--dry-run`).
 /// Returns `1` when the add did not apply.
 #[must_use]
-pub fn run(matches: &ArgMatches) -> i32 {
-    let Some(sub) = matches.subcommand_matches("add") else {
-        return fail(
-            "add was not selected. Run `grok-router add --help` for the flags and an example.",
-        );
-    };
-    match run_add(matches, sub) {
+pub fn run(config: Option<&str>, args: &AddArgs) -> i32 {
+    match run_add(config, args) {
         Ok(body) => write_stdout(&body),
         Err(message) => fail(&message),
     }
 }
 
 /// Resolve one catalog row, splice it, and write once unless this is a no-op or `--dry-run`.
-fn run_add(root: &ArgMatches, matches: &ArgMatches) -> Result<String, String> {
-    let config_path = configured_path(root, matches)?;
-    let terms = query_terms(matches)?;
-    let slug_override = matches.get_one::<String>("as").map(String::as_str);
+fn run_add(config: Option<&str>, args: &AddArgs) -> Result<String, String> {
+    let config_path = configured_path(config)?;
+    let terms = query_terms(&args.query)?;
+    let slug_override = args.as_slug.as_deref();
     let original = read_config_text(&config_path)?;
     let base_url = resolved_base(&original)?;
-    let rows = load_rows(matches, &base_url)?;
+    let rows = load_rows(args, &base_url)?;
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-    let row = catalog::resolve(&rows, &term_refs).map_err(|err| {
-        format!("{err} Nothing was written.")
-    })?;
+    let row = catalog::resolve(&rows, &term_refs)
+        .map_err(|err| format!("{err} Nothing was written."))?;
     let slug = planned_slug(row.id(), slug_override)?;
-    let edited = edited_config(&original, row, slug_override, &slug, matches.get_flag("default"))?;
+    let edited = edited_config(&original, row, slug_override, &slug, args.set_default)?;
     let unchanged = edited == original;
-    let dry_run = matches.get_flag("dry-run");
+    let dry_run = args.dry_run;
     let wrote = if unchanged || dry_run {
         false
     } else {
@@ -139,17 +107,14 @@ fn run_add(root: &ArgMatches, matches: &ArgMatches) -> Result<String, String> {
         wrote,
         dry_run,
         unchanged,
-        default: matches.get_flag("default"),
+        default: args.set_default,
     };
-    render(matches, &report, &config_path)
+    render(args, &report, &config_path)
 }
 
-/// `--config` from the subcommand or the global flag. Never a home path.
-fn configured_path(root: &ArgMatches, sub: &ArgMatches) -> Result<PathBuf, String> {
-    let raw = sub
-        .get_one::<String>("config")
-        .or_else(|| root.get_one::<String>("config"));
-    match raw {
+/// `--config` from the global flag. Never a home path.
+fn configured_path(config: Option<&str>) -> Result<PathBuf, String> {
+    match config {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
         Some(_) => Err(
             "--config is empty, so nothing was written. Pass --config with the file to edit."
@@ -163,10 +128,7 @@ fn configured_path(root: &ArgMatches, sub: &ArgMatches) -> Result<PathBuf, Strin
 }
 
 /// Positional query terms. An empty term is a usage failure.
-fn query_terms(matches: &ArgMatches) -> Result<Vec<String>, String> {
-    let Some(values) = matches.get_many::<String>("query") else {
-        return Ok(Vec::new());
-    };
+fn query_terms(values: &[String]) -> Result<Vec<String>, String> {
     let mut terms = Vec::new();
     for term in values {
         if term.is_empty() {
@@ -223,8 +185,8 @@ fn settings_failure(reason: &RefuseReason) -> String {
 ///
 /// `--catalog-file` returns before the cache helper. `base_url` is the base
 /// already resolved from `--config`.
-fn load_rows(matches: &ArgMatches, base_url: &str) -> Result<Vec<CatalogRow>, String> {
-    if let Some(path) = matches.get_one::<PathBuf>("catalog-file") {
+fn load_rows(args: &AddArgs, base_url: &str) -> Result<Vec<CatalogRow>, String> {
+    if let Some(path) = &args.catalog_file {
         let bytes = fs::read(path).map_err(|err| {
             format!(
                 "could not read catalog file {}. {err}. Nothing was written. Pass a readable --catalog-file, or omit it to use the cache.",
@@ -235,19 +197,13 @@ fn load_rows(matches: &ArgMatches, base_url: &str) -> Result<Vec<CatalogRow>, St
             .map_err(|err| format!("{err} Nothing was written."));
     }
 
-    let cache_dir = match matches.get_one::<PathBuf>("cache-dir") {
+    let cache_dir = match &args.cache_dir {
         Some(path) => path.clone(),
         None => default_cache_dir()?,
     };
     let api_key = live_api_key()?;
     let now = SystemTime::now();
-    match catalog::prepare_cached_load(
-        &cache_dir,
-        now,
-        matches.get_flag("refresh"),
-        &api_key,
-        base_url,
-    )
+    match catalog::prepare_cached_load(&cache_dir, now, args.refresh, &api_key, base_url)
     .map_err(|err| format!("{err} Nothing was written."))?
     {
         CachedOrFetch::Cached(rows) => Ok(rows),
@@ -381,15 +337,15 @@ fn next_step(reason: &RefuseReason) -> String {
 }
 
 /// Human text, the slug, or one JSON object.
-fn render(matches: &ArgMatches, report: &AddReport, path: &Path) -> Result<String, String> {
-    if matches.get_flag("json") {
+fn render(args: &AddArgs, report: &AddReport, path: &Path) -> Result<String, String> {
+    if args.json {
         return serde_json::to_string(report).map_err(|err| {
             format!(
                 "could not encode the add result as JSON: {err}. Retry the add; report this if it persists."
             )
         });
     }
-    if matches.get_flag("quiet") {
+    if args.quiet {
         return Ok(report.slug.clone());
     }
     if report.dry_run {

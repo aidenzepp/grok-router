@@ -9,24 +9,27 @@
 
 //! Binary for the `grok-router` command.
 
+use clap::Parser;
 use grok_router::commands::{add, list, remove, search, set_default, skill};
+use grok_router::{Cli, Commands};
 
 /// Runs the `grok-router` binary.
 fn main() {
-    let cmd = list::augment(grok_router::command());
-    let cmd = search::augment(cmd);
-    let cmd = add::augment(cmd);
-    let cmd = set_default::augment(cmd);
-    let cmd = remove::augment(cmd);
-    let cmd = skill::augment(cmd);
-    let matches = cmd.get_matches();
-    match matches.subcommand_name() {
-        None | Some("list") => std::process::exit(list::run(&matches)),
-        Some("search") => std::process::exit(search::run(&matches)),
-        Some("add") => std::process::exit(add::run(&matches)),
-        Some("set-default") => std::process::exit(set_default::run(&matches)),
-        Some("remove") => std::process::exit(remove::run(&matches)),
-        Some("skill" | "__internal") => std::process::exit(skill::run(&matches)),
-        Some(_) => {}
+    let cli = Cli::parse();
+    std::process::exit(dispatch(&cli));
+}
+
+/// Routes one parsed invocation. No subcommand runs `list`.
+fn dispatch(cli: &Cli) -> i32 {
+    let config = cli.config.as_deref();
+    match &cli.command {
+        None => list::run(config, None),
+        Some(Commands::List(args)) => list::run(config, Some(args)),
+        Some(Commands::Search(args)) => search::run(config, args),
+        Some(Commands::Add(args)) => add::run(config, args),
+        Some(Commands::SetDefault(args)) => set_default::run(config, args),
+        Some(Commands::Remove(args)) => remove::run(config, args),
+        Some(Commands::Skill(args)) => skill::run(args),
+        Some(Commands::Internal(args)) => skill::run_internal(args),
     }
 }

@@ -12,92 +12,68 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::{ArgAction, Args};
 
 use crate::catalog::{self, CachedOrFetch, CatalogRow};
 use crate::config_edit::{self, RefuseReason};
 
-/// Adds the `search` subcommand and its flags.
-#[must_use]
-pub fn augment(cmd: Command) -> Command {
-    cmd.subcommand(
-        Command::new("search")
-            .about("Search the OpenRouter catalog. This command does not modify the config.")
-            .after_help("Examples:\n  grok-router search --catalog-file models.json glm")
-            .arg(
-                Arg::new("terms")
-                    .value_name("TERM")
-                    .action(ArgAction::Append)
-                    .help("Case-insensitive term. Repeat to require every term. Each term must match the id, name, or description."),
-            )
-            .arg(
-                Arg::new("catalog-file")
-                    .long("catalog-file")
-                    .value_name("PATH")
-                    .value_parser(clap::value_parser!(PathBuf))
-                    .help("Read this catalog JSON instead of the network or the cache."),
-            )
-            .arg(
-                Arg::new("cache-dir")
-                    .long("cache-dir")
-                    .value_name("DIR")
-                    .value_parser(clap::value_parser!(PathBuf))
-                    .help("Directory for the models.json cache. Used only when --catalog-file is absent."),
-            )
-            .arg(
-                Arg::new("refresh")
-                    .long("refresh")
-                    .action(ArgAction::SetTrue)
-                    .help("Download a new catalog even when the cache is younger than one hour."),
-            )
-            .arg(
-                Arg::new("limit")
-                    .long("limit")
-                    .value_name("N")
-                    .default_value("30")
-                    .value_parser(parse_limit)
-                    .help("Maximum rows to print."),
-            )
-            .arg(
-                Arg::new("json")
-                    .long("json")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("quiet")
-                    .help("Print a JSON array of id, name, and context_length."),
-            )
-            .arg(
-                Arg::new("quiet")
-                    .long("quiet")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("json")
-                    .help("Print one model id per line and no header."),
-            ),
-    )
+/// Search the OpenRouter catalog. This command does not modify the config.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router search --catalog-file models.json glm"
+)]
+pub struct SearchArgs {
+    /// Case-insensitive term. Repeat to require every term. Each term must match the id, name, or description.
+    #[arg(value_name = "TERM", action = ArgAction::Append, verbatim_doc_comment)]
+    terms: Vec<String>,
+
+    /// Read this catalog JSON instead of the network or the cache.
+    #[arg(long, value_name = "PATH", verbatim_doc_comment)]
+    catalog_file: Option<PathBuf>,
+
+    /// Directory for the models.json cache. Used only when --catalog-file is absent.
+    #[arg(long, value_name = "DIR", verbatim_doc_comment)]
+    cache_dir: Option<PathBuf>,
+
+    /// Download a new catalog even when the cache is younger than one hour.
+    #[arg(long, verbatim_doc_comment)]
+    refresh: bool,
+
+    /// Maximum rows to print.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "30",
+        value_parser = parse_limit,
+        verbatim_doc_comment
+    )]
+    limit: usize,
+
+    /// Print a JSON array of id, name, and context_length.
+    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
+    json: bool,
+
+    /// Print one model id per line and no header.
+    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
+    quiet: bool,
 }
 
-/// Runs `search` from the root matches.
+/// Runs `search`.
 ///
 /// Returns `0` when at least one row was printed and `1` when the search failed.
 #[must_use]
-pub fn run(matches: &ArgMatches) -> i32 {
-    let Some(sub) = matches.subcommand_matches("search") else {
-        return fail(
-            "search was not selected. Run `grok-router search --help` for the flags and an example.",
-        );
-    };
-    run_search(matches, sub)
+pub fn run(config: Option<&str>, args: &SearchArgs) -> i32 {
+    run_search(config, args)
 }
 
 /// Collect flags, load rows, and print the matches.
-fn run_search(root: &ArgMatches, matches: &ArgMatches) -> i32 {
-    let terms = match collect_terms(matches) {
+fn run_search(config: Option<&str>, args: &SearchArgs) -> i32 {
+    let terms = match collect_terms(&args.terms) {
         Ok(terms) => terms,
         Err(message) => return fail(&message),
     };
-    let Some(limit) = matches.get_one::<usize>("limit").copied() else {
-        return fail("--limit is missing. Pass --limit 30.");
-    };
-    let rows = match load_rows(root, matches) {
+    let rows = match load_rows(config, args) {
         Ok(rows) => rows,
         Err(message) => return fail(&message),
     };
@@ -106,14 +82,14 @@ fn run_search(root: &ArgMatches, matches: &ArgMatches) -> i32 {
     if matched.is_empty() {
         return fail(&empty_message(&terms));
     }
-    let shown = take_rows(&matched, limit);
+    let shown = take_rows(&matched, args.limit);
     let color = allow_color(io::stdout().is_terminal(), no_color_is_set());
-    let body = if matches.get_flag("json") {
+    let body = if args.json {
         match format_json(&shown) {
             Ok(body) => body,
             Err(message) => return fail(&message),
         }
-    } else if matches.get_flag("quiet") {
+    } else if args.quiet {
         format_quiet(&shown, color)
     } else {
         format_table(&shown, color)
@@ -122,10 +98,7 @@ fn run_search(root: &ArgMatches, matches: &ArgMatches) -> i32 {
 }
 
 /// Terms from the positional arguments. An empty term is a usage failure.
-fn collect_terms(matches: &ArgMatches) -> Result<Vec<String>, String> {
-    let Some(values) = matches.get_many::<String>("terms") else {
-        return Ok(Vec::new());
-    };
+fn collect_terms(values: &[String]) -> Result<Vec<String>, String> {
     let mut terms = Vec::new();
     for term in values {
         if term.is_empty() {
@@ -148,8 +121,8 @@ fn collect_terms(matches: &ArgMatches) -> Result<Vec<String>, String> {
 /// # Errors
 ///
 /// Returns an error when the catalog file, the config, or the cache cannot be used.
-fn load_rows(root: &ArgMatches, matches: &ArgMatches) -> Result<Vec<CatalogRow>, String> {
-    if let Some(path) = matches.get_one::<PathBuf>("catalog-file") {
+fn load_rows(config: Option<&str>, args: &SearchArgs) -> Result<Vec<CatalogRow>, String> {
+    if let Some(path) = &args.catalog_file {
         let bytes = fs::read(path).map_err(|err| {
             format!(
                 "could not read catalog file {}. {err}. Pass a readable --catalog-file, or omit it to use the cache.",
@@ -159,20 +132,14 @@ fn load_rows(root: &ArgMatches, matches: &ArgMatches) -> Result<Vec<CatalogRow>,
         return catalog::parse_catalog(&bytes).map_err(|err| err.to_string());
     }
 
-    let base_url = resolved_base(&search_config_path(root)?)?;
-    let cache_dir = match matches.get_one::<PathBuf>("cache-dir") {
+    let base_url = resolved_base(&search_config_path(config)?)?;
+    let cache_dir = match &args.cache_dir {
         Some(path) => path.clone(),
         None => default_cache_dir()?,
     };
     let api_key = live_api_key()?;
     let now = SystemTime::now();
-    match catalog::prepare_cached_load(
-        &cache_dir,
-        now,
-        matches.get_flag("refresh"),
-        &api_key,
-        &base_url,
-    )
+    match catalog::prepare_cached_load(&cache_dir, now, args.refresh, &api_key, &base_url)
     .map_err(|err| err.to_string())?
     {
         CachedOrFetch::Cached(rows) => Ok(rows),
@@ -199,8 +166,8 @@ fn load_rows(root: &ArgMatches, matches: &ArgMatches) -> Result<Vec<CatalogRow>,
 /// # Errors
 ///
 /// Returns an error when `--config` is empty, or when no default path can be named.
-fn search_config_path(root: &ArgMatches) -> Result<PathBuf, String> {
-    match root.get_one::<String>("config").map(String::as_str) {
+fn search_config_path(config: Option<&str>) -> Result<PathBuf, String> {
+    match config {
         Some("") => Err(
             "--config is empty, so the catalog was not read. Pass --config with the file to read, or pass --catalog-file."
                 .to_owned(),

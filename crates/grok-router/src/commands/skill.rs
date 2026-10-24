@@ -7,252 +7,222 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::{Args, Subcommand};
 
 use crate::skill::{
     Confirmation, Effect, Presence, Report, SkillFailure, WriteMode, guide, inspect, remove, setup,
 };
 
-/// Adds the `skill` command and the hidden `__internal` command.
-#[must_use]
-pub fn augment(cmd: Command) -> Command {
-    cmd.subcommand(skill_command()).subcommand(internal_command())
+/// Install, check, or remove the skill stub, or print its guide. setup and remove write; status and show do not.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    subcommand_required = true,
+    arg_required_else_help = true,
+    after_help = "Examples:\n  grok-router skill setup --skill-root /tmp/skills\n  grok-router skill status --skill-root /tmp/skills\n  grok-router skill show\n  grok-router skill remove --yes --skill-root /tmp/skills"
+)]
+pub struct SkillArgs {
+    /// Selected skill command.
+    #[command(subcommand)]
+    command: SkillCommand,
 }
 
-/// Runs `skill` or `__internal` from the root matches.
+/// `skill` subcommands.
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Write the grok-router skill stub under --skill-root. This command writes unless --dry-run is set.
+    #[command(verbatim_doc_comment)]
+    Setup(SetupArgs),
+    /// Report whether the skill stub is current. This command does not modify anything.
+    #[command(verbatim_doc_comment)]
+    Status(StatusArgs),
+    /// Delete the grok-router stub directory when it carries the marker. This command writes unless --dry-run is set. Refuses without --yes.
+    #[command(verbatim_doc_comment)]
+    Remove(RemoveArgs),
+    /// Print the skill guide. This command does not modify anything.
+    #[command(verbatim_doc_comment)]
+    Show(ShowArgs),
+}
+
+/// Write the grok-router skill stub under --skill-root. This command writes unless --dry-run is set.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router skill setup --skill-root /tmp/skills\n  grok-router skill setup --skill-root /tmp/skills --dry-run --json"
+)]
+struct SetupArgs {
+    /// Flags shared by the writing skill commands.
+    #[command(flatten)]
+    flags: WriteFlags,
+}
+
+/// Report whether the skill stub is current. This command does not modify anything.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router skill status --skill-root /tmp/skills\n  grok-router skill status --skill-root /tmp/skills --json"
+)]
+struct StatusArgs {
+    /// Flags shared by the reading skill commands.
+    #[command(flatten)]
+    flags: ReadFlags,
+}
+
+/// Delete the grok-router stub directory when it carries the marker. This command writes unless --dry-run is set. Refuses without --yes.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router skill remove --skill-root /tmp/skills --dry-run --yes\n  grok-router skill remove --skill-root /tmp/skills --yes --json"
+)]
+struct RemoveArgs {
+    /// Flags shared by the writing skill commands.
+    #[command(flatten)]
+    flags: WriteFlags,
+
+    /// Required to delete. Without it, the command refuses and writes nothing. Does not prompt.
+    #[arg(long, alias = "force", verbatim_doc_comment)]
+    yes: bool,
+}
+
+/// Print the skill guide. This command does not modify anything.
+#[derive(Debug, Args)]
+#[command(verbatim_doc_comment, after_help = "Examples:\n  grok-router skill show")]
+struct ShowArgs {}
+
+/// Print the built-in skill guide. Not a human command. This command does not modify anything.
+#[derive(Debug, Args)]
+#[command(
+    hide = true,
+    verbatim_doc_comment,
+    subcommand_required = true,
+    arg_required_else_help = true,
+    after_help = "Examples:\n  grok-router __internal skill"
+)]
+pub struct InternalArgs {
+    /// Selected hidden command.
+    #[command(subcommand)]
+    command: InternalCommand,
+}
+
+/// Hidden commands under `__internal`.
+#[derive(Debug, Subcommand)]
+enum InternalCommand {
+    /// Print the skill guide. This command does not modify anything.
+    #[command(
+        verbatim_doc_comment,
+        after_help = "Examples:\n  grok-router __internal skill"
+    )]
+    Skill,
+}
+
+/// Flags for `skill status` and the read half of setup and remove.
+#[derive(Debug, Args)]
+struct ReadFlags {
+    /// Directory that will contain the grok-router stub. Required. Does not read or write the home directory.
+    #[arg(long, value_name = "DIR", verbatim_doc_comment)]
+    skill_root: Option<PathBuf>,
+
+    /// text, json, or jsonl. json and jsonl print the same one JSON object. --json selects json.
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        value_parser = clap::builder::PossibleValuesParser::new(["text", "json", "jsonl"]),
+        conflicts_with_all = ["json", "quiet"],
+        verbatim_doc_comment
+    )]
+    output: Option<String>,
+
+    /// Print one JSON object and nothing else. Same as --output json.
+    #[arg(long, conflicts_with_all = ["quiet", "output"], verbatim_doc_comment)]
+    json: bool,
+
+    /// Print only the answer line.
+    #[arg(long, conflicts_with_all = ["json", "output"], verbatim_doc_comment)]
+    quiet: bool,
+}
+
+/// Flags for `skill setup` and `skill remove`, including [`ReadFlags`].
+#[derive(Debug, Args)]
+struct WriteFlags {
+    /// Read flags, plus `--dry-run`.
+    #[command(flatten)]
+    read: ReadFlags,
+
+    /// Validate and report the change, then do not write.
+    #[arg(long, verbatim_doc_comment)]
+    dry_run: bool,
+}
+
+/// Runs `skill`.
 ///
 /// Returns `0` when the command finished and `1` when it refused or failed.
 #[must_use]
-pub fn run(matches: &ArgMatches) -> i32 {
-    match matches.subcommand_name() {
-        Some("skill") => run_skill(matches),
-        Some("__internal") => run_internal(matches),
-        _ => fail_text(
-            "skill was not selected. Run `grok-router skill --help` for the flags and an example.",
-        ),
+pub fn run(args: &SkillArgs) -> i32 {
+    match &args.command {
+        SkillCommand::Setup(setup) => run_setup(setup),
+        SkillCommand::Status(status) => run_status(status),
+        SkillCommand::Remove(remove_args) => run_remove(remove_args),
+        SkillCommand::Show(_) => write_stdout(guide()),
     }
 }
 
-fn skill_command() -> Command {
-    Command::new("skill")
-        .about("Install, check, or remove the skill stub, or print its guide. setup and remove write; status and show do not.")
-        .after_help(
-            "Examples:\n  grok-router skill setup --skill-root /tmp/skills\n  grok-router skill status --skill-root /tmp/skills\n  grok-router skill show\n  grok-router skill remove --yes --skill-root /tmp/skills",
-        )
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .subcommand(setup_command())
-        .subcommand(status_command())
-        .subcommand(remove_command())
-        .subcommand(show_command())
-}
-
-fn setup_command() -> Command {
-    with_write_flags(
-        Command::new("setup")
-            .about("Write the grok-router skill stub under --skill-root. This command writes unless --dry-run is set.")
-            .after_help(
-                "Examples:\n  grok-router skill setup --skill-root /tmp/skills\n  grok-router skill setup --skill-root /tmp/skills --dry-run --json",
-            ),
-    )
-}
-
-fn status_command() -> Command {
-    with_read_flags(
-        Command::new("status")
-            .about("Report whether the skill stub is current. This command does not modify anything.")
-            .after_help(
-                "Examples:\n  grok-router skill status --skill-root /tmp/skills\n  grok-router skill status --skill-root /tmp/skills --json",
-            ),
-    )
-}
-
-fn remove_command() -> Command {
-    with_write_flags(
-        Command::new("remove")
-            .about("Delete the grok-router stub directory when it carries the marker. This command writes unless --dry-run is set. Refuses without --yes.")
-            .after_help(
-                "Examples:\n  grok-router skill remove --skill-root /tmp/skills --dry-run --yes\n  grok-router skill remove --skill-root /tmp/skills --yes --json",
-            ),
-    )
-    .arg(yes_arg())
-}
-
-fn show_command() -> Command {
-    Command::new("show")
-        .about("Print the skill guide. This command does not modify anything.")
-        .after_help("Examples:\n  grok-router skill show")
-}
-
-fn internal_command() -> Command {
-    Command::new("__internal")
-        .hide(true)
-        .about("Print the built-in skill guide. Not a human command. This command does not modify anything.")
-        .after_help("Examples:\n  grok-router __internal skill")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .subcommand(
-            Command::new("skill")
-                .about("Print the skill guide. This command does not modify anything.")
-                .after_help("Examples:\n  grok-router __internal skill"),
-        )
-}
-
-fn with_read_flags(cmd: Command) -> Command {
-    cmd.arg(skill_root_arg())
-        .arg(output_arg())
-        .arg(json_arg())
-        .arg(quiet_arg())
-}
-
-fn with_write_flags(cmd: Command) -> Command {
-    with_read_flags(cmd).arg(dry_run_arg())
-}
-
-fn skill_root_arg() -> Arg {
-    Arg::new("skill-root")
-        .long("skill-root")
-        .value_name("DIR")
-        .value_parser(clap::value_parser!(PathBuf))
-        .help("Directory that will contain the grok-router stub. Required. Does not read or write the home directory.")
-}
-
-fn dry_run_arg() -> Arg {
-    Arg::new("dry-run")
-        .long("dry-run")
-        .action(ArgAction::SetTrue)
-        .help("Validate and report the change, then do not write.")
-}
-
-fn json_arg() -> Arg {
-    Arg::new("json")
-        .long("json")
-        .action(ArgAction::SetTrue)
-        .conflicts_with("quiet")
-        .conflicts_with("output")
-        .help("Print one JSON object and nothing else. Same as --output json.")
-}
-
-fn quiet_arg() -> Arg {
-    Arg::new("quiet")
-        .long("quiet")
-        .action(ArgAction::SetTrue)
-        .conflicts_with("json")
-        .conflicts_with("output")
-        .help("Print only the answer line.")
-}
-
-fn output_arg() -> Arg {
-    Arg::new("output")
-        .long("output")
-        .value_name("FORMAT")
-        .value_parser(["text", "json", "jsonl"])
-        .conflicts_with("json")
-        .conflicts_with("quiet")
-        .help("text, json, or jsonl. json and jsonl print the same one JSON object. --json selects json.")
-}
-
-fn yes_arg() -> Arg {
-    Arg::new("yes")
-        .long("yes")
-        .alias("force")
-        .action(ArgAction::SetTrue)
-        .help("Required to delete. Without it, the command refuses and writes nothing. Does not prompt.")
-}
-
-fn run_skill(root: &ArgMatches) -> i32 {
-    let Some(skill) = root.subcommand_matches("skill") else {
-        return fail_text(
-            "skill was not selected. Run `grok-router skill --help` for the flags and an example.",
-        );
-    };
-    match skill.subcommand_name() {
-        Some("setup") => run_setup(skill),
-        Some("status") => run_status(skill),
-        Some("remove") => run_remove(skill),
-        Some("show") => write_stdout(guide()),
-        Some(other) => fail_text(&format!(
-            "unknown skill command {other}. Nothing was written. Run `grok-router skill --help` for setup, status, remove, and show."
-        )),
-        None => fail_text(
-            "no skill command was selected. Nothing was written. Run `grok-router skill --help` for setup, status, remove, and show.",
-        ),
+/// Runs `__internal`.
+///
+/// Returns `0` when the guide was printed.
+#[must_use]
+pub fn run_internal(args: &InternalArgs) -> i32 {
+    match args.command {
+        InternalCommand::Skill => write_stdout(guide()),
     }
 }
 
-fn run_internal(root: &ArgMatches) -> i32 {
-    let Some(internal) = root.subcommand_matches("__internal") else {
-        return fail_text(
-            "`__internal` was not selected. Run `grok-router __internal skill` to print the guide.",
-        );
-    };
-    match internal.subcommand_name() {
-        Some("skill") => write_stdout(guide()),
-        Some(other) => fail_text(&format!(
-            "`__internal {other}` is not a command. Nothing was written. Run `grok-router __internal skill` to print the guide."
-        )),
-        None => fail_text(
-            "no __internal command was selected. Nothing was written. Run `grok-router __internal skill` to print the guide.",
-        ),
-    }
-}
-
-fn run_setup(skill: &ArgMatches) -> i32 {
-    let Some(matches) = skill.subcommand_matches("setup") else {
-        return fail_text(
-            "setup was not selected. Run `grok-router skill setup --help` for the flags and an example.",
-        );
-    };
-    let mode = match output_mode(matches) {
+fn run_setup(args: &SetupArgs) -> i32 {
+    let flags = &args.flags.read;
+    let mode = match output_mode(flags) {
         Ok(mode) => mode,
         Err(message) => return fail_text(&message),
     };
-    let root = match skill_root(matches) {
+    let root = match skill_root(flags) {
         Ok(root) => root,
         Err(message) => return fail_for(mode, "usage", &message),
     };
-    finish(mode, "setup", setup(&root, write_mode(matches)))
+    finish(mode, "setup", setup(&root, write_mode(args.flags.dry_run)))
 }
 
-fn run_status(skill: &ArgMatches) -> i32 {
-    let Some(matches) = skill.subcommand_matches("status") else {
-        return fail_text(
-            "status was not selected. Run `grok-router skill status --help` for the flags and an example.",
-        );
-    };
-    let mode = match output_mode(matches) {
+fn run_status(args: &StatusArgs) -> i32 {
+    let mode = match output_mode(&args.flags) {
         Ok(mode) => mode,
         Err(message) => return fail_text(&message),
     };
-    let root = match skill_root(matches) {
+    let root = match skill_root(&args.flags) {
         Ok(root) => root,
         Err(message) => return fail_for(mode, "usage", &message),
     };
     finish(mode, "status", inspect(&root))
 }
 
-fn run_remove(skill: &ArgMatches) -> i32 {
-    let Some(matches) = skill.subcommand_matches("remove") else {
-        return fail_text(
-            "remove was not selected. Run `grok-router skill remove --help` for the flags and an example.",
-        );
-    };
-    let mode = match output_mode(matches) {
+fn run_remove(args: &RemoveArgs) -> i32 {
+    let flags = &args.flags.read;
+    let mode = match output_mode(flags) {
         Ok(mode) => mode,
         Err(message) => return fail_text(&message),
     };
-    let confirmation = confirmation(matches);
+    let confirmation = confirmation(args.yes);
     if confirmation == Confirmation::No {
-        return fail_for(mode, SkillFailure::NeedsYes.kind(), &SkillFailure::NeedsYes.to_string());
+        return fail_for(
+            mode,
+            SkillFailure::NeedsYes.kind(),
+            &SkillFailure::NeedsYes.to_string(),
+        );
     }
-    let root = match skill_root(matches) {
+    let root = match skill_root(flags) {
         Ok(root) => root,
         Err(message) => return fail_for(mode, "usage", &message),
     };
     finish(
         mode,
         "remove",
-        remove(&root, confirmation, write_mode(matches)),
+        remove(&root, confirmation, write_mode(args.flags.dry_run)),
     )
 }
 
@@ -266,8 +236,8 @@ fn finish(mode: OutputMode, command: &str, result: Result<Report, SkillFailure>)
     }
 }
 
-fn skill_root(matches: &ArgMatches) -> Result<PathBuf, String> {
-    let Some(path) = matches.get_one::<PathBuf>("skill-root") else {
+fn skill_root(flags: &ReadFlags) -> Result<PathBuf, String> {
+    let Some(path) = &flags.skill_root else {
         return Err(
             "no --skill-root was given, so nothing was written. Pass --skill-root with the directory that should hold the grok-router stub."
                 .to_owned(),
@@ -282,16 +252,16 @@ fn skill_root(matches: &ArgMatches) -> Result<PathBuf, String> {
     Ok(path.clone())
 }
 
-fn write_mode(matches: &ArgMatches) -> WriteMode {
-    if matches.get_flag("dry-run") {
+fn write_mode(dry_run: bool) -> WriteMode {
+    if dry_run {
         WriteMode::DryRun
     } else {
         WriteMode::Apply
     }
 }
 
-fn confirmation(matches: &ArgMatches) -> Confirmation {
-    if matches.get_flag("yes") {
+fn confirmation(yes: bool) -> Confirmation {
+    if yes {
         Confirmation::Yes
     } else {
         Confirmation::No
@@ -308,14 +278,14 @@ enum OutputMode {
     Json,
 }
 
-fn output_mode(matches: &ArgMatches) -> Result<OutputMode, String> {
-    if matches.get_flag("json") {
+fn output_mode(flags: &ReadFlags) -> Result<OutputMode, String> {
+    if flags.json {
         return Ok(OutputMode::Json);
     }
-    if matches.get_flag("quiet") {
+    if flags.quiet {
         return Ok(OutputMode::Quiet);
     }
-    match matches.get_one::<String>("output").map(String::as_str) {
+    match flags.output.as_deref() {
         None | Some("text") => Ok(OutputMode::Text),
         Some("json" | "jsonl") => Ok(OutputMode::Json),
         Some(other) => Err(format!(
@@ -444,14 +414,12 @@ struct JsonReport<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::augment;
-
     #[test]
-    fn augment_registers_skill_and_internal_but_not_session_start() {
-        let cmd = augment(crate::command());
+    fn command_registers_skill_and_internal_but_not_session_start() {
+        let cmd = crate::command();
         let skill = cmd
             .find_subcommand("skill")
-            .expect("augment should register skill");
+            .expect("command should register skill");
         for name in ["setup", "status", "remove", "show"] {
             assert!(
                 skill.find_subcommand(name).is_some(),
@@ -464,7 +432,7 @@ mod tests {
         );
         let internal = cmd
             .find_subcommand("__internal")
-            .expect("augment should register __internal");
+            .expect("command should register __internal");
         assert!(
             internal.find_subcommand("skill").is_some(),
             "__internal should register skill"
