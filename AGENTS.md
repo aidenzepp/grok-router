@@ -33,6 +33,7 @@ Resolve all warnings before finishing.
 
 - `.agents/skills/conventional-commits`: commit decisions, boundaries, staging, and messages.
 - `.agents/skills/designing-trustworthy-functions-and-data`: functions, domain types, data structures, parsing boundaries, dependencies, effects, invariants, and abstraction levels.
+- `.agents/skills/error-messages`: user-facing and developer-facing error messages.
 - `.agents/skills/self-explanatory-tests`: test design, organization, failure messages, and debugging.
 - `.agents/skills/unsafe-code`: unsafe Rust, FFI, raw pointers, syscalls, and `extern` blocks.
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Error Messages"
+  short_description: "Write clear, actionable error messages"
+  default_prompt: "Use $error-messages to inspect the real failure boundary, identify the audience, state what happened and how to fix it, preserve user state where relevant, avoid blame or generic wording, and add structured error details for machine-facing surfaces."
