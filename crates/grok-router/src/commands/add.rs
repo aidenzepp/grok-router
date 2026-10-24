@@ -203,16 +203,23 @@ fn load_rows(matches: &ArgMatches) -> Result<Vec<CatalogRow>, String> {
     };
     let api_key = live_api_key()?;
     let now = SystemTime::now();
-    match catalog::prepare_cached_load(&cache_dir, now, matches.get_flag("refresh"), &api_key)
-        .map_err(|err| format!("{err} Nothing was written."))?
+    let base_url = config_edit::OPENROUTER_BASE_URL;
+    match catalog::prepare_cached_load(
+        &cache_dir,
+        now,
+        matches.get_flag("refresh"),
+        &api_key,
+        base_url,
+    )
+    .map_err(|err| format!("{err} Nothing was written."))?
     {
         CachedOrFetch::Cached(rows) => Ok(rows),
         CachedOrFetch::Fetch(request) => {
             let bytes = catalog::fetch_catalog_bytes(&request)
                 .map_err(|err| format!("{err} Nothing was written."))?;
-            let stored = catalog::write_cache(&cache_dir, &bytes)
+            let stored = catalog::write_cache(&cache_dir, base_url, &bytes)
                 .map_err(|err| format!("{err} Nothing was written."))?;
-            if stored != catalog::cache_file(&cache_dir) {
+            if stored != catalog::cache_file_for(&cache_dir, &catalog::models_url(base_url)) {
                 return Err(format!(
                     "the catalog cache was written to {}, outside {}. The config was not written. Pass --cache-dir.",
                     stored.display(),
