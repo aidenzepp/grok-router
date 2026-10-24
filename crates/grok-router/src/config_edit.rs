@@ -7,7 +7,9 @@
 //! [`read_configured`] reports the saved default and configured models and does
 //! not change the text. [`router_settings`] reads `[grok_router]` from that
 //! same text. A missing table or key keeps [`OPENROUTER_BASE_URL`] and
-//! [`BUILTIN_SLUGS`]. The edit never writes the table back.
+//! [`BUILTIN_SLUGS`]. [`direct_provider`] reads one
+//! `[grok_router.provider.<name>]` table and returns owned strings. It does
+//! not write the document. The edit never writes either table back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -65,6 +67,19 @@ pub struct RouterSettings {
     pub base_url: String,
     /// `builtins`, or [`BUILTIN_SLUGS`] when that key is absent. Empty means none.
     pub builtins: Vec<String>,
+}
+
+/// One `[grok_router.provider.<name>]` table, as owned strings.
+///
+/// Reading it does not rewrite the document, read the environment, or fetch a catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectProvider {
+    /// `base_url`, kept exactly, including a trailing slash.
+    pub base_url: String,
+    /// `env_key`. This is the variable name, not its value.
+    pub env_key: String,
+    /// `catalog` when that key is present. An empty or unverified string stays that string.
+    pub catalog: Option<String>,
 }
 
 /// Why a text edit was refused.
@@ -160,7 +175,7 @@ pub enum RefuseReason {
     },
     /// A present `[grok_router]` key cannot be used.
     InvalidSetting {
-        /// `openrouter_base_url` or `builtins`.
+        /// `openrouter_base_url`, `builtins`, `base_url`, `env_key`, `catalog`, or a provider name.
         key: String,
         /// Constraint the value failed.
         detail: String,
@@ -340,7 +355,8 @@ pub fn derive_slug(provider_id: &str) -> Result<String, RefuseReason> {
 /// A missing table or a missing key uses [`OPENROUTER_BASE_URL`] and
 /// [`BUILTIN_SLUGS`]. `openrouter_base_url` must match `^https?://\S+$` with
 /// no trim. `builtins` must be an array of non-empty strings, and an empty
-/// array means there are no built-ins.
+/// array means there are no built-ins. Any other key, including `provider`,
+/// is ignored. This function does not call [`direct_provider`].
 ///
 /// # Errors
 ///
@@ -358,6 +374,35 @@ pub fn router_settings(config: &str) -> Result<RouterSettings, RefuseReason> {
         }
     };
     settings_from_root(&root)
+}
+
+/// Read one `[grok_router.provider.<name>]` table from `config`.
+///
+/// `name` is the table key, compared exactly: it is not trimmed or case-folded.
+/// `base_url` must match `^https?://\S+$` with no trim. `env_key` must match
+/// `^[A-Za-z_][A-Za-z0-9_]*$`. Absent `catalog` is [`None`]. Any other string,
+/// including `""`, is returned as that string. `deepseek-list-models` is
+/// refused unless `base_url` is `https://api.deepseek.com` or that URL with
+/// one trailing slash. This function does not splice, read the environment,
+/// or fetch a catalog.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when `name` has no table or a
+/// present key cannot be used, or a parse or structural error when the
+/// document cannot be read. The caller's text is not rewritten.
+#[must_use = "the provider table is the caller's only copy of the base, env key, and catalog"]
+pub fn direct_provider(config: &str, name: &str) -> Result<DirectProvider, RefuseReason> {
+    structural_problem(config)?;
+    let root = match config.parse::<toml::Table>() {
+        Ok(root) => root,
+        Err(error) => {
+            return Err(RefuseReason::Parse {
+                detail: error.to_string(),
+            });
+        }
+    };
+    provider_from_root(&root, name)
 }
 
 /// Render one new model block, including its trailing newline.
@@ -718,6 +763,8 @@ fn compiled_builtins() -> Vec<String> {
 }
 
 /// Read the base and built-ins from a parsed `[grok_router]` table.
+///
+/// Keys other than `openrouter_base_url` and `builtins` are ignored.
 fn settings_from_root(root: &toml::Table) -> Result<RouterSettings, RefuseReason> {
     let Some(value) = root.get("grok_router") else {
         return Ok(compiled_settings());
@@ -795,6 +842,129 @@ fn invalid_setting(key: &str, detail: &str) -> RefuseReason {
         key: key.to_owned(),
         detail: detail.to_owned(),
     }
+}
+
+/// Verified catalog value. The provider name does not select it.
+const DEEPSEEK_LIST_MODELS: &str = "deepseek-list-models";
+
+/// `base_url` values that may carry [`DEEPSEEK_LIST_MODELS`].
+const DEEPSEEK_CATALOG_BASES: [&str; 2] = [
+    "https://api.deepseek.com",
+    "https://api.deepseek.com/",
+];
+
+/// Read `grok_router.provider.<name>` from an already parsed document.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when `name` has no table or a
+/// present key cannot be used.
+fn provider_from_root(root: &toml::Table, name: &str) -> Result<DirectProvider, RefuseReason> {
+    let Some(table) = named_provider_table(root, name) else {
+        return Err(missing_provider(name));
+    };
+    let base_url = provider_base(table.get("base_url"))?;
+    let env_key = provider_env_key(table.get("env_key"))?;
+    let catalog = provider_catalog(table.get("catalog"), &base_url)?;
+    Ok(DirectProvider {
+        base_url,
+        env_key,
+        catalog,
+    })
+}
+
+/// The table at `grok_router.provider.<name>`, when that key is a table.
+fn named_provider_table<'a>(root: &'a toml::Table, name: &str) -> Option<&'a toml::Table> {
+    root.get("grok_router")
+        .and_then(toml::Value::as_table)
+        .and_then(|grok| grok.get("provider"))
+        .and_then(toml::Value::as_table)
+        .and_then(|providers| providers.get(name))
+        .and_then(toml::Value::as_table)
+}
+
+/// Refuse `name` because no provider table uses that exact key.
+fn missing_provider(name: &str) -> RefuseReason {
+    invalid_setting(name, "no [grok_router.provider] table has this name")
+}
+
+/// Accept a provider `base_url` only when it matches `^https?://\S+$`.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] on `base_url` when the value is
+/// missing, not a string, or fails the pattern. The string is not trimmed.
+fn provider_base(value: Option<&toml::Value>) -> Result<String, RefuseReason> {
+    let Some(text) = value.and_then(toml::Value::as_str) else {
+        return Err(invalid_setting(
+            "base_url",
+            "must be a string matching ^https?://\\S+$",
+        ));
+    };
+    if !is_http_base(text) {
+        return Err(invalid_setting(
+            "base_url",
+            &format!("must match ^https?://\\S+$ with no trim, got {text:?}"),
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+/// Accept a provider `env_key` only when it matches `^[A-Za-z_][A-Za-z0-9_]*$`.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] on `env_key` when the value is
+/// missing, not a string, or fails the pattern. The string is not trimmed.
+fn provider_env_key(value: Option<&toml::Value>) -> Result<String, RefuseReason> {
+    let Some(text) = value.and_then(toml::Value::as_str) else {
+        return Err(invalid_setting(
+            "env_key",
+            "must be a string matching ^[A-Za-z_][A-Za-z0-9_]*$",
+        ));
+    };
+    if !is_env_key(text) {
+        return Err(invalid_setting(
+            "env_key",
+            &format!("must match ^[A-Za-z_][A-Za-z0-9_]*$ with no trim, got {text:?}"),
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+/// Report whether `text` is a shell-style environment variable name.
+fn is_env_key(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Return `catalog` as written, or refuse the verified value on another base.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] on `catalog` when the value is
+/// not a string, or when it is `deepseek-list-models` on any other base.
+fn provider_catalog(
+    value: Option<&toml::Value>,
+    base_url: &str,
+) -> Result<Option<String>, RefuseReason> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(text) = value.as_str() else {
+        return Err(invalid_setting("catalog", "must be a string"));
+    };
+    if text == DEEPSEEK_LIST_MODELS && !DEEPSEEK_CATALOG_BASES.contains(&base_url) {
+        return Err(invalid_setting(
+            "catalog",
+            "deepseek-list-models requires base_url https://api.deepseek.com or https://api.deepseek.com/",
+        ));
+    }
+    Ok(Some(text.to_owned()))
 }
 
 /// Turn every non-alphanumeric run into one hyphen, then trim and lowercase.
@@ -1489,6 +1659,20 @@ context_window = 1000000
 [models]
 default = \"grok-4.7\"
 default_reasoning_effort = \"high\"
+";
+    const PROVIDERS: &str = "\
+[grok_router]
+openrouter_base_url = \"https://openrouter.ai/api/v1\"
+builtins = [\"grok-4.7\", \"grok-4.7-build-fast\", \"grok-4.6\", \"grok-4.5\"]
+
+[grok_router.provider.deepseek]
+base_url = \"https://api.deepseek.com\"
+env_key = \"DEEPSEEK_API_KEY\"
+catalog = \"deepseek-list-models\"
+
+[grok_router.provider.zai]
+base_url = \"https://api.z.ai/api/paas/v4\"
+env_key = \"ZAI_API_KEY\"
 ";
 
     fn widget(context: Option<i64>, sees_image: bool) -> CatalogModel<'static> {
@@ -2338,6 +2522,175 @@ default = \"or-glm-5-3\"
             }
             other => panic!("{key} should be an invalid setting, got {other}"),
         }
+    }
+
+    #[test]
+    fn router_settings_ignores_provider_tables() {
+        assert_compiled(FIXTURE, "a missing [grok_router] table");
+        assert_compiled(
+            "[grok_router]\n",
+            "a [grok_router] table with no provider key",
+        );
+        assert_compiled(PROVIDERS, "a present provider table");
+        assert_compiled(
+            "\
+[grok_router.provider.deepseek]
+base_url = \"https://api.deepseek.com \"
+env_key = \"sk-secret\"
+",
+            "a provider table with an illegal base_url",
+        );
+    }
+
+    #[test]
+    fn direct_provider_reads_the_deepseek_table() {
+        let provider = direct_provider(PROVIDERS, "deepseek")
+            .expect("the deepseek table should be readable");
+        assert_eq!(provider.base_url, "https://api.deepseek.com");
+        assert_eq!(provider.env_key, "DEEPSEEK_API_KEY");
+        assert_eq!(
+            provider.catalog.as_deref(),
+            Some("deepseek-list-models"),
+            "the verified catalog string should be returned as written"
+        );
+    }
+
+    #[test]
+    fn direct_provider_reads_the_zai_table() {
+        let provider =
+            direct_provider(PROVIDERS, "zai").expect("the zai table should be readable");
+        assert_eq!(provider.base_url, "https://api.z.ai/api/paas/v4");
+        assert_eq!(provider.env_key, "ZAI_API_KEY");
+        assert_eq!(provider.catalog, None, "an absent catalog key is not an error");
+    }
+
+    #[test]
+    fn direct_provider_refuses_a_missing_name_and_leaves_the_text_unchanged() {
+        let original = PROVIDERS.to_owned();
+        for name in ["missing", "Deepseek", "deepseek ", " deepseek"] {
+            let refused = direct_provider(&original, name)
+                .expect_err("a name that is not an exact table key should be refused");
+            assert_eq!(
+                original, PROVIDERS,
+                "{name:?} should leave the config text unchanged"
+            );
+            assert_setting(&refused, name);
+        }
+        let bare = FIXTURE.to_owned();
+        let missing = direct_provider(&bare, "deepseek")
+            .expect_err("a config with no provider table should refuse the name");
+        assert_eq!(bare, FIXTURE, "a missing table should leave the config text unchanged");
+        assert_setting(&missing, "deepseek");
+    }
+
+    #[test]
+    fn direct_provider_rejects_a_base_url_that_fails_the_http_rule() {
+        let spaced = one_provider(
+            "deepseek",
+            "base_url = \"https://api.deepseek.com \"\nenv_key = \"DEEPSEEK_API_KEY\"\n",
+        );
+        let spaced_error = direct_provider(&spaced, "deepseek")
+            .expect_err("a trailing space in base_url should not be trimmed");
+        assert_setting(&spaced_error, "base_url");
+
+        let number = one_provider("deepseek", "base_url = 1\nenv_key = \"DEEPSEEK_API_KEY\"\n");
+        let number_error = direct_provider(&number, "deepseek")
+            .expect_err("a non-string base_url should be refused");
+        assert_setting(&number_error, "base_url");
+
+        let slash = one_provider(
+            "deepseek",
+            "\
+base_url = \"https://api.deepseek.com/\"
+env_key = \"DEEPSEEK_API_KEY\"
+catalog = \"deepseek-list-models\"
+",
+        );
+        let provider = direct_provider(&slash, "deepseek")
+            .expect("a trailing slash should stay part of the base");
+        assert_eq!(provider.base_url, "https://api.deepseek.com/");
+        assert_eq!(provider.catalog.as_deref(), Some("deepseek-list-models"));
+    }
+
+    #[test]
+    fn direct_provider_rejects_an_env_key_outside_the_shell_name_rule() {
+        for key in ["sk-secret", "1KEY"] {
+            let config = one_provider(
+                "deepseek",
+                &format!("base_url = \"https://api.deepseek.com\"\nenv_key = \"{key}\"\n"),
+            );
+            let error = direct_provider(&config, "deepseek")
+                .expect_err("an env_key outside the shell name rule should be refused");
+            assert_setting(&error, "env_key");
+            let rendered = error.to_string();
+            assert!(
+                rendered.starts_with("env_key is invalid:"),
+                "display should keep the invalid-setting shape, got {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_provider_refuses_the_deepseek_catalog_on_another_base() {
+        let config = one_provider(
+            "zai",
+            "\
+base_url = \"https://api.z.ai/api/paas/v4\"
+env_key = \"ZAI_API_KEY\"
+catalog = \"deepseek-list-models\"
+",
+        );
+        let error = direct_provider(&config, "zai").expect_err(
+            "deepseek-list-models on a base other than the two legal strings should be refused",
+        );
+        assert_setting(&error, "catalog");
+    }
+
+    #[test]
+    fn direct_provider_returns_catalog_strings_that_are_not_a_verified_document() {
+        let empty = one_provider(
+            "zai",
+            "\
+base_url = \"https://api.z.ai/api/paas/v4\"
+env_key = \"ZAI_API_KEY\"
+catalog = \"\"
+",
+        );
+        let empty_provider = direct_provider(&empty, "zai")
+            .expect("an empty catalog string should be returned, not refused");
+        assert_eq!(empty_provider.catalog.as_deref(), Some(""));
+
+        let other = one_provider(
+            "zai",
+            "\
+base_url = \"https://api.z.ai/api/paas/v4\"
+env_key = \"ZAI_API_KEY\"
+catalog = \"not-a-document\"
+",
+        );
+        let other_provider = direct_provider(&other, "zai")
+            .expect("an unverified catalog string should be returned, not refused");
+        assert_eq!(other_provider.catalog.as_deref(), Some("not-a-document"));
+    }
+
+    /// Require `config` to resolve to the compiled base and the four built-in slugs.
+    fn assert_compiled(config: &str, situation: &str) {
+        let settings = router_settings(config)
+            .unwrap_or_else(|error| panic!("{situation} should resolve, got {error}"));
+        assert_eq!(
+            settings.base_url, OPENROUTER_BASE_URL,
+            "{situation} should keep the compiled base"
+        );
+        assert_eq!(
+            settings.builtins,
+            BUILTIN_SLUGS.map(str::to_owned).to_vec(),
+            "{situation} should keep the four compiled slugs"
+        );
+    }
+
+    /// One provider table whose header key is the bare name `name`.
+    fn one_provider(name: &str, body: &str) -> String {
+        format!("[grok_router.provider.{name}]\n{body}")
     }
 
     #[test]
