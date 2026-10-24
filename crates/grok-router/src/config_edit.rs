@@ -217,7 +217,7 @@ impl fmt::Display for RefuseReason {
                 "slug {slug:?} must start with a letter or digit and contain only letters, digits, dots, underscores, and hyphens"
             ),
             Self::NonPositiveContext { provider_id } => {
-                write!(formatter, "{provider_id} has no context_length")
+                write!(formatter, "{provider_id} has no positive context window")
             }
             Self::DuplicateProvider {
                 provider_id,
@@ -489,7 +489,9 @@ pub fn builtins_from(config: &str) -> Result<Vec<String>, RefuseReason> {
 
 /// Render one new model block, including its trailing newline.
 ///
-/// `base_url` is written on this span only.
+/// `base_url` and `env_key` are written on this span only. `env_key` is the
+/// variable name the caller already resolved. This function does not read
+/// [`router_settings`] and does not invent `OPENROUTER_API_KEY`.
 ///
 /// # Errors
 ///
@@ -498,6 +500,7 @@ pub fn render_block(
     slug: &str,
     model: CatalogModel<'_>,
     base_url: &str,
+    env_key: &str,
 ) -> Result<String, RefuseReason> {
     require_slug(slug)?;
     if model.id.is_empty() {
@@ -513,7 +516,7 @@ pub fn render_block(
         format!("model = {}", toml_basic_string(model.id)),
         format!("base_url = {}", toml_basic_string(base_url)),
         format!("name = {}", toml_basic_string(display_name(model))),
-        "env_key = \"OPENROUTER_API_KEY\"".to_owned(),
+        format!("env_key = {}", toml_basic_string(env_key)),
         "api_backend = \"chat_completions\"".to_owned(),
         format!("context_window = {context}"),
     ];
@@ -525,12 +528,14 @@ pub fn render_block(
     Ok(block)
 }
 
-/// Insert one OpenRouter model block into `config`.
+/// Insert one model block into `config`.
 ///
-/// `slug` overrides derivation. `None` derives the slug from the provider id.
-/// The same slug, the same provider id, and the same resolved base returns `config` unchanged.
-/// Built-in membership comes from [`builtins_from`]. The base URL still comes from
-/// [`router_settings`].
+/// `slug` is the slug the caller already chose. This function calls
+/// [`require_slug`] and does not call [`derive_slug`] or [`router_settings`].
+/// The same provider id at `base_url` with the same slug returns `config`
+/// unchanged. The same id at `base_url` under a different slug is
+/// [`RefuseReason::DuplicateProvider`]. The same id at a different base is not
+/// a duplicate. Built-in membership comes from [`builtins_from`].
 ///
 /// # Errors
 ///
@@ -538,9 +543,10 @@ pub fn render_block(
 pub fn insert_model(
     config: &str,
     model: CatalogModel<'_>,
-    slug: Option<&str>,
+    slug: &str,
+    base_url: &str,
+    env_key: &str,
 ) -> Result<String, Refused> {
-    let settings = require_settings(config)?;
     let builtins = require_builtins(config)?;
     let root = read_config(config)?;
     if model.id.is_empty() {
@@ -554,15 +560,11 @@ pub fn insert_model(
             },
         ));
     }
-    let resolved = match resolved_slug(model.id, slug) {
-        Ok(resolved) => resolved,
-        Err(reason) => return Err(refuse(config, reason)),
-    };
-    let matches = provider_slugs(&root, model.id, &settings.base_url);
-    if let Some(existing) = matches
-        .iter()
-        .find(|existing| existing.as_str() != resolved)
-    {
+    if let Err(reason) = require_slug(slug) {
+        return Err(refuse(config, reason));
+    }
+    let matches = provider_slugs(&root, model.id, base_url);
+    if let Some(existing) = matches.iter().find(|existing| existing.as_str() != slug) {
         return Err(refuse(
             config,
             RefuseReason::DuplicateProvider {
@@ -574,10 +576,15 @@ pub fn insert_model(
     if !matches.is_empty() {
         return Ok(config.to_owned());
     }
-    if is_builtin(&builtins, &resolved) || configured_models(&root).contains_key(&resolved) {
-        return Err(refuse(config, RefuseReason::SlugInUse { slug: resolved }));
+    if is_builtin(&builtins, slug) || configured_models(&root).contains_key(slug) {
+        return Err(refuse(
+            config,
+            RefuseReason::SlugInUse {
+                slug: slug.to_owned(),
+            },
+        ));
     }
-    let block = match render_block(&resolved, model, &settings.base_url) {
+    let block = match render_block(slug, model, base_url, env_key) {
         Ok(block) => block,
         Err(reason) => return Err(refuse(config, reason)),
     };
@@ -586,7 +593,7 @@ pub fn insert_model(
         config,
         &root,
         spliced,
-        Some(resolved.as_str()),
+        Some(slug),
         None,
         DefaultExpectation::Unchanged,
         Some(model.id),
@@ -787,14 +794,6 @@ fn refuse(config: &str, reason: RefuseReason) -> Refused {
     }
 }
 
-/// Resolve settings, or refuse with the original text before any splice.
-fn require_settings(config: &str) -> Result<RouterSettings, Refused> {
-    match router_settings(config) {
-        Ok(settings) => Ok(settings),
-        Err(reason) => Err(refuse(config, reason)),
-    }
-}
-
 /// Resolve built-ins from `[router]`, or refuse with the original text before any splice.
 ///
 /// # Errors
@@ -804,17 +803,6 @@ fn require_builtins(config: &str) -> Result<Vec<String>, Refused> {
     match builtins_from(config) {
         Ok(builtins) => Ok(builtins),
         Err(reason) => Err(refuse(config, reason)),
-    }
-}
-
-/// Choose the explicit slug or derive one from `provider_id`.
-fn resolved_slug(provider_id: &str, slug: Option<&str>) -> Result<String, RefuseReason> {
-    match slug {
-        Some(explicit) => {
-            require_slug(explicit)?;
-            Ok(explicit.to_owned())
-        }
-        None => derive_slug(provider_id),
     }
 }
 
@@ -1620,7 +1608,11 @@ fn table_spans(lines: &[&str]) -> Vec<Span> {
 /// Return the inside of a single `[header]` line.
 fn header_name(stripped: &str) -> Option<&str> {
     let rest = stripped.strip_prefix('[')?.strip_suffix(']')?;
-    if rest.is_empty() { None } else { Some(rest) }
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
 }
 
 /// Insert `block` immediately before the first `[models]` header.
@@ -1822,6 +1814,17 @@ fn discard_temp(path: &Path) {
 mod tests {
     use super::*;
 
+    /// Splice with the OpenRouter base and env name. The slug is already chosen.
+    fn open_insert(config: &str, model: CatalogModel<'_>, slug: &str) -> Result<String, Refused> {
+        insert_model(
+            config,
+            model,
+            slug,
+            OPENROUTER_BASE_URL,
+            "OPENROUTER_API_KEY",
+        )
+    }
+
     const COMMENT: &str = "# kept comment\n";
     const MARKETPLACE: &str = "[[marketplace.sources]]\nname = \"local\"\n";
     const FLASH: &str = "\
@@ -1942,6 +1945,7 @@ env_key = \"ZAI_API_KEY\"
             "or-widget-v2",
             widget(Some(1_048_576), false),
             OPENROUTER_BASE_URL,
+            "OPENROUTER_API_KEY",
         )
         .expect("a positive context window should render a block");
         assert_eq!(
@@ -1973,7 +1977,7 @@ context_window = 1048576
             "text-only input must omit vision"
         );
 
-        let updated = insert_model(FIXTURE, widget(Some(1_048_576), false), None)
+        let updated = open_insert(FIXTURE, widget(Some(1_048_576), false), "or-widget-v2")
             .expect("a new provider id should insert one block");
         assert_fixture_blocks(&updated);
         assert!(
@@ -1992,7 +1996,7 @@ context_window = 1048576
 
     #[test]
     fn same_provider_and_slug_returns_the_original_text() {
-        let updated = insert_model(
+        let updated = open_insert(
             FIXTURE,
             CatalogModel {
                 id: "z-ai/glm-5.3",
@@ -2000,7 +2004,7 @@ context_window = 1048576
                 context_window: Some(1_048_576),
                 sees_image: true,
             },
-            Some("or-glm-5-3"),
+            "or-glm-5-3",
         )
         .expect("the same slug and provider id should be a no-op");
 
@@ -2012,7 +2016,7 @@ context_window = 1048576
 
     #[test]
     fn different_slug_for_the_same_provider_returns_the_original_text() {
-        let refused = insert_model(
+        let refused = open_insert(
             FIXTURE,
             CatalogModel {
                 id: "deepseek/deepseek-v4.1-flash-1017",
@@ -2020,7 +2024,7 @@ context_window = 1048576
                 context_window: Some(1_048_576),
                 sees_image: false,
             },
-            None,
+            "or-deepseek-v4-1-flash-1017",
         )
         .expect_err("a derived slug that differs from the configured slug should be refused");
 
@@ -2054,7 +2058,7 @@ context_window = 1048576
             context_window: Some(128_000),
             sees_image: true,
         };
-        let updated = insert_model(FIXTURE, quoted, Some("or.vision"))
+        let updated = open_insert(FIXTURE, quoted, "or.vision")
             .expect("a dotted slug should be inserted as one quoted key");
 
         assert!(
@@ -2096,7 +2100,7 @@ context_window = 1048576
 
     #[test]
     fn name_falls_back_and_context_must_be_positive() {
-        let nameless = insert_model(
+        let nameless = open_insert(
             FIXTURE,
             CatalogModel {
                 id: "acme/nameless",
@@ -2104,7 +2108,7 @@ context_window = 1048576
                 context_window: Some(32),
                 sees_image: false,
             },
-            None,
+            "or-nameless",
         )
         .expect("a missing catalog name should still insert");
         assert!(
@@ -2112,7 +2116,7 @@ context_window = 1048576
             "a missing name should fall back to the provider id"
         );
 
-        let blank = insert_model(
+        let blank = open_insert(
             &nameless,
             CatalogModel {
                 id: "acme/blank",
@@ -2120,7 +2124,7 @@ context_window = 1048576
                 context_window: Some(32),
                 sees_image: false,
             },
-            None,
+            "or-blank",
         )
         .expect("a blank catalog name should still insert");
         assert!(
@@ -2129,7 +2133,7 @@ context_window = 1048576
         );
 
         for context in [None, Some(0), Some(-1)] {
-            let refused = insert_model(FIXTURE, widget(context, false), None)
+            let refused = open_insert(FIXTURE, widget(context, false), "or-widget-v2")
                 .expect_err("a non-positive context_window should refuse the add");
             assert_eq!(
                 refused.text, FIXTURE,
@@ -2150,26 +2154,15 @@ context_window = 1048576
             "or-glm-5-3"
         );
         for provider_id in ["acme/", "@@@", "/"] {
-            let refused = insert_model(
-                FIXTURE,
-                CatalogModel {
-                    id: provider_id,
-                    name: Some("Nope"),
-                    context_window: Some(8),
-                    sees_image: false,
-                },
-                None,
-            )
-            .expect_err("an empty leaf should refuse derivation");
-            assert_eq!(refused.text, FIXTURE);
+            let refused =
+                derive_slug(provider_id).expect_err("an empty leaf should refuse derivation");
             assert!(
-                matches!(refused.reason, RefuseReason::EmptySlugLeaf { .. }),
-                "{provider_id} should be an empty leaf, got {}",
-                refused.reason
+                matches!(refused, RefuseReason::EmptySlugLeaf { .. }),
+                "{provider_id} should be an empty leaf, got {refused}"
             );
         }
 
-        let updated = insert_model(
+        let updated = open_insert(
             FIXTURE,
             CatalogModel {
                 id: "@@@",
@@ -2177,7 +2170,7 @@ context_window = 1048576
                 context_window: Some(8),
                 sees_image: false,
             },
-            Some("or-custom"),
+            "or-custom",
         )
         .expect("an explicit slug should bypass an empty leaf");
         assert!(updated.contains("[model.or-custom]\n"));
@@ -2186,7 +2179,7 @@ context_window = 1048576
     #[test]
     fn slug_already_used_by_a_model_or_a_builtin_is_an_error() {
         for slug in ["or-glm-5-3", "grok-4.5"] {
-            let refused = insert_model(FIXTURE, widget(Some(8), false), Some(slug))
+            let refused = open_insert(FIXTURE, widget(Some(8), false), slug)
                 .expect_err("a taken slug should be refused");
             assert_eq!(
                 refused.text, FIXTURE,
@@ -2198,7 +2191,7 @@ context_window = 1048576
                 refused.reason
             );
         }
-        let refused = insert_model(FIXTURE, widget(Some(8), false), Some("-nope"))
+        let refused = open_insert(FIXTURE, widget(Some(8), false), "-nope")
             .expect_err("a slug must start with a letter or digit");
         assert_eq!(refused.text, FIXTURE);
         assert!(matches!(refused.reason, RefuseReason::InvalidSlug { .. }));
@@ -2207,7 +2200,7 @@ context_window = 1048576
     #[test]
     fn insert_puts_one_blank_line_around_the_block() {
         let text = "# c\nkey = 1\n[models]\ndefault = \"grok-4.7\"\n";
-        let updated = insert_model(text, widget(Some(1_048_576), false), None)
+        let updated = open_insert(text, widget(Some(1_048_576), false), "or-widget-v2")
             .expect("a root key plus [models] should accept an insert");
         assert!(
             updated.contains("key = 1\n\n[model.or-widget-v2]\n"),
@@ -2228,9 +2221,14 @@ context_window = 1048576
             head.ends_with("\n\n"),
             "the fixture should already separate [models] with a blank line"
         );
-        let block = render_block("or-widget-v2", widget(Some(8), false), OPENROUTER_BASE_URL)
-            .expect("the widget block should render");
-        let appended = insert_model(head, widget(Some(8), false), None)
+        let block = render_block(
+            "or-widget-v2",
+            widget(Some(8), false),
+            OPENROUTER_BASE_URL,
+            "OPENROUTER_API_KEY",
+        )
+        .expect("the widget block should render");
+        let appended = open_insert(head, widget(Some(8), false), "or-widget-v2")
             .expect("a document without [models] should append the block");
         assert_eq!(appended, format!("{head}{block}"));
         assert!(
@@ -2294,7 +2292,7 @@ context_window = 1048576
 
     #[test]
     fn remove_deletes_only_that_table_span() {
-        let inserted = insert_model(FIXTURE, widget(Some(8), false), None)
+        let inserted = open_insert(FIXTURE, widget(Some(8), false), "or-widget-v2")
             .expect("insert should succeed before the round trip");
         let restored = remove_model(&inserted, "or-widget-v2")
             .expect("removing the inserted slug should succeed");
@@ -2396,27 +2394,44 @@ default = \"grok-4.7\"
         ));
 
         let malformed = "[\n";
-        let parsed = insert_model(malformed, widget(Some(8), false), None)
+        let parsed = open_insert(malformed, widget(Some(8), false), "or-widget-v2")
             .expect_err("malformed toml should be refused");
         assert_eq!(parsed.text, malformed);
         assert!(matches!(parsed.reason, RefuseReason::Parse { .. }));
     }
 
     #[test]
-    fn missing_settings_table_uses_the_compiled_base_and_env_key() {
-        let updated = insert_model(FIXTURE, widget(Some(8), false), None)
-            .expect("a document with no settings table should still insert");
+    fn insert_writes_the_caller_base_and_env_and_does_not_read_router_settings() {
+        let base = "https://caller.example/v1";
+        let env_key = "CALLER_API_KEY";
+        let updated = insert_model(
+            FIXTURE,
+            widget(Some(8), false),
+            "or-widget-v2",
+            base,
+            env_key,
+        )
+        .expect("a document with no settings table should still insert the caller record");
+        let block = "\
+[model.or-widget-v2]
+model = \"acme/widget.v2\"
+base_url = \"https://caller.example/v1\"
+name = \"Widget\"
+env_key = \"CALLER_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 8
+";
         assert!(
-            updated.contains("base_url = \"https://openrouter.ai/api/v1\"\n"),
-            "the new block should use the compiled base, got:\n{updated}"
-        );
-        assert!(
-            updated.contains("env_key = \"OPENROUTER_API_KEY\"\n"),
-            "the new block should keep the OpenRouter env key, got:\n{updated}"
+            updated.contains(block),
+            "the new block should use the caller base and env name, not a compiled fallback, got:\n{updated}"
         );
         assert!(
             !updated.contains("[grok_router]"),
             "insert must not write [grok_router], got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("\n[router]\n"),
+            "insert must not write [router], got:\n{updated}"
         );
         assert!(
             !updated.contains("model_provider"),
@@ -2430,15 +2445,21 @@ default = \"grok-4.7\"
     }
 
     #[test]
-    fn custom_base_is_written_on_the_new_block_only() {
-        let base = "https://example.invalid/v1/";
-        let config = with_settings(&format!("openrouter_base_url = \"{base}\""));
-        let updated = insert_model(&config, widget(Some(8), false), None)
-            .expect("a custom base should still insert one block");
+    fn caller_base_is_written_on_the_new_block_only() {
+        let base = "https://caller.example/v1/";
+        let config = with_settings("openrouter_base_url = \"https://decoy.example/v1\"");
+        let updated = insert_model(
+            &config,
+            widget(Some(8), false),
+            "or-widget-v2",
+            base,
+            "OPENROUTER_API_KEY",
+        )
+        .expect("the caller base should still insert one block");
         let block = "\
 [model.or-widget-v2]
 model = \"acme/widget.v2\"
-base_url = \"https://example.invalid/v1/\"
+base_url = \"https://caller.example/v1/\"
 name = \"Widget\"
 env_key = \"OPENROUTER_API_KEY\"
 api_backend = \"chat_completions\"
@@ -2446,14 +2467,18 @@ context_window = 8
 ";
         assert!(
             updated.contains(block),
-            "the new block should keep the trailing slash, got:\n{updated}"
+            "the new block should keep the trailing slash from the caller, got:\n{updated}"
         );
         assert_eq!(
             updated
-                .matches("\nbase_url = \"https://example.invalid/v1/\"\n")
+                .matches("\nbase_url = \"https://caller.example/v1/\"\n")
                 .count(),
             1,
-            "the resolved base should appear on the new block only, got:\n{updated}"
+            "the caller base should appear on the new block only, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("\nbase_url = \"https://decoy.example/v1\"\n"),
+            "insert must not copy openrouter_base_url onto a model span, got:\n{updated}"
         );
         assert_eq!(
             updated.matches("[grok_router]").count(),
@@ -2461,7 +2486,7 @@ context_window = 8
             "the edit must not insert another [grok_router]"
         );
         assert!(
-            updated.contains("openrouter_base_url = \"https://example.invalid/v1/\""),
+            updated.contains("openrouter_base_url = \"https://decoy.example/v1\""),
             "the settings line should stay byte-identical"
         );
         assert_fixture_blocks(&updated);
@@ -2476,25 +2501,22 @@ context_window = 8
     }
 
     #[test]
-    fn duplicate_detection_uses_the_resolved_base() {
+    fn duplicate_detection_uses_the_passed_base() {
         let base = "https://example.invalid/v1";
-        let settings = format!("[grok_router]\nopenrouter_base_url = \"{base}\"\n\n");
+        let settings = "[grok_router]\nopenrouter_base_url = \"https://openrouter.ai/api/v1\"\n\n";
         let same = format!("{settings}[model.or-glm-5-3]\nmodel = \"z-ai/glm-5.3\"\n");
         let same = format!("{same}base_url = \"{base}\"\nname = \"GLM 5.3\"\n");
-        let unchanged = insert_model(
-            &same,
-            CatalogModel {
-                id: "z-ai/glm-5.3",
-                name: Some("replacement name"),
-                context_window: Some(9),
-                sees_image: true,
-            },
-            Some("or-glm-5-3"),
-        )
-        .expect("the same provider id and resolved base should be a no-op");
+        let model = CatalogModel {
+            id: "z-ai/glm-5.3",
+            name: Some("replacement name"),
+            context_window: Some(9),
+            sees_image: true,
+        };
+        let unchanged = insert_model(&same, model, "or-glm-5-3", base, "OPENROUTER_API_KEY")
+            .expect("the same provider id and passed base should be a no-op");
         assert_eq!(
             unchanged, same,
-            "the same provider id at the resolved base should return the original text"
+            "the same provider id at the passed base should return the original text"
         );
 
         let different = format!("{settings}{GLM}");
@@ -2506,7 +2528,9 @@ context_window = 8
                 context_window: Some(8),
                 sees_image: false,
             },
-            Some("or-glm-elsewhere"),
+            "or-glm-elsewhere",
+            base,
+            "OPENROUTER_API_KEY",
         )
         .expect("the same provider id at a different base should not be a duplicate");
         assert!(
@@ -2515,7 +2539,7 @@ context_window = 8
         );
         assert!(
             updated.contains(&format!("base_url = \"{base}\"\n")),
-            "the new block should use the resolved base, got:\n{updated}"
+            "the new block should use the passed base, not openrouter_base_url, got:\n{updated}"
         );
         assert!(
             updated.contains(GLM),
@@ -2629,7 +2653,7 @@ name = \"GLM 5.3\"
             ordinary.reason
         );
 
-        let in_use = insert_model(config, widget(Some(8), false), Some("grok-4.8"))
+        let in_use = open_insert(config, widget(Some(8), false), "grok-4.8")
             .expect_err("a listed built-in slug should be in use");
         assert_eq!(in_use.text, config);
         assert!(
@@ -2687,7 +2711,7 @@ default = \"or-glm-5-3\"
         );
         assert!(updated.contains("default = \"or-glm-5-3\"\n"));
 
-        let inserted = insert_model(config, widget(Some(8), false), Some("grok-4.7"))
+        let inserted = open_insert(config, widget(Some(8), false), "grok-4.7")
             .expect("an empty builtins array should not reserve a compiled slug");
         assert!(
             inserted.contains("[model.\"grok-4.7\"]\n"),
@@ -2696,36 +2720,37 @@ default = \"or-glm-5-3\"
     }
 
     #[test]
-    fn invalid_grok_router_settings_still_refuse_insert() {
+    fn invalid_grok_router_settings_do_not_block_insert() {
         let cases = [
-            ("openrouter_base_url = \"\"", "openrouter_base_url"),
-            (
-                "openrouter_base_url = \"ftp://nope\"",
-                "openrouter_base_url",
-            ),
-            (
-                "openrouter_base_url = \"https://ex ample.invalid/v1\"",
-                "openrouter_base_url",
-            ),
-            (
-                "openrouter_base_url = \"https://example.invalid/v1 \"",
-                "openrouter_base_url",
-            ),
-            ("openrouter_base_url = \"http://\"", "openrouter_base_url"),
-            ("builtins = \"grok-4.8\"", "builtins"),
-            ("builtins = [\"\"]", "builtins"),
-            ("builtins = [1]", "builtins"),
-            ("builtins = [\"grok-4.8\", \"\"]", "builtins"),
+            "openrouter_base_url = \"\"",
+            "openrouter_base_url = \"ftp://nope\"",
+            "openrouter_base_url = \"https://ex ample.invalid/v1\"",
+            "openrouter_base_url = \"https://example.invalid/v1 \"",
+            "openrouter_base_url = \"http://\"",
+            "builtins = \"grok-4.8\"",
+            "builtins = [\"\"]",
+            "builtins = [1]",
+            "builtins = [\"grok-4.8\", \"\"]",
         ];
-        for (body, key) in cases {
+        for body in cases {
             let config = with_settings(body);
-            let inserted = insert_model(&config, widget(Some(8), false), None)
-                .expect_err("insert should refuse an invalid [grok_router] setting");
-            assert_eq!(
-                inserted.text, config,
-                "insert should return the original text for {key}"
+            let inserted = insert_model(
+                &config,
+                widget(Some(8), false),
+                "or-widget-v2",
+                OPENROUTER_BASE_URL,
+                "OPENROUTER_API_KEY",
+            )
+            .expect("insert should ignore an invalid [grok_router] table");
+            assert!(
+                inserted.contains(body),
+                "insert should leave the invalid [grok_router] line in place for {body}, got:\n{inserted}"
             );
-            assert_setting(&inserted.reason, key);
+            assert!(
+                inserted.contains("[model.or-widget-v2]\n"),
+                "insert should still splice the caller slug for {body}, got:\n{inserted}"
+            );
+            assert_fixture_blocks(&inserted);
         }
     }
 
@@ -2742,11 +2767,21 @@ default = \"or-glm-5-3\"
                 .any(|model| model.slug == "or-glm-5-3"),
             "the reader should still report configured models"
         );
-        let refused = insert_model(&config, widget(Some(8), false), None)
-            .expect_err("the same text should still refuse an edit");
-        assert_eq!(
-            refused.text, config,
-            "the refused edit should return the original text"
+        let inserted = insert_model(
+            &config,
+            widget(Some(8), false),
+            "or-widget-v2",
+            OPENROUTER_BASE_URL,
+            "OPENROUTER_API_KEY",
+        )
+        .expect("an invalid [grok_router] table should not refuse insert");
+        assert!(
+            inserted.contains("openrouter_base_url = \"\""),
+            "insert should leave the invalid settings line in place, got:\n{inserted}"
+        );
+        assert!(
+            inserted.contains("[model.or-widget-v2]\n"),
+            "insert should splice the caller slug, got:\n{inserted}"
         );
     }
 
@@ -2757,7 +2792,7 @@ default = \"or-glm-5-3\"
 
     /// Refuse `config` from insert, set-default, and remove, and name `key`.
     fn assert_invalid_setting(config: &str, key: &str) {
-        let inserted = insert_model(config, widget(Some(8), false), None)
+        let inserted = open_insert(config, widget(Some(8), false), "or-widget-v2")
             .expect_err("insert should refuse an invalid setting");
         assert_eq!(
             inserted.text, config,

@@ -94,6 +94,16 @@ default = \"grok-4.7\"
 default_reasoning_effort = \"high\"
 ";
 
+const OPENROUTER_RECORD: &str = "\
+[router]
+default_provider = \"openrouter\"
+
+[router.provider.openrouter]
+base_url = \"https://openrouter.ai/api/v1\"
+env_key = \"OPENROUTER_API_KEY\"
+catalog = \"openrouter-models\"
+";
+
 const CATALOG: &str = r#"{
     "data": [
         {
@@ -213,6 +223,8 @@ fn assert_lived_in_outside_models(text: &str) {
 fn add_inserts_only_the_new_block_and_keeps_every_other_byte() {
     let dir = temp_root("add");
     let (config, catalog) = write_fixture(&dir);
+    let source = format!("{OPENROUTER_RECORD}\n{LIVED_IN}");
+    fs::write(&config, &source).expect("the add fixture should include a provider record");
     let output = run(
         &dir,
         &[
@@ -232,13 +244,13 @@ fn add_inserts_only_the_new_block_and_keeps_every_other_byte() {
         stdout_text(&output)
     );
     let edited = read_config(&config);
-    let models_at = LIVED_IN
+    let models_at = source
         .rfind("[models]\n")
         .expect("the fixture should end with one [models] table");
-    let head = LIVED_IN
+    let head = source
         .get(..models_at)
         .expect("the [models] header should sit inside the fixture");
-    let tail = LIVED_IN
+    let tail = source
         .get(models_at..)
         .expect("the [models] header should start the fixture tail");
     assert!(
@@ -260,7 +272,9 @@ fn add_inserts_only_the_new_block_and_keeps_every_other_byte() {
         .and_then(toml::Value::as_table)
         .expect("the inserted block should contain [model.or-widget-v2]");
     assert_eq!(
-        model.get("context_window").and_then(toml::Value::as_integer),
+        model
+            .get("context_window")
+            .and_then(toml::Value::as_integer),
         Some(4096),
         "the new block should record the catalog context_length"
     );
@@ -376,6 +390,12 @@ fn refused_edits_leave_the_fixture_byte_identical() {
     for (label, command) in cases {
         let dir = temp_root(label);
         let (config, _) = write_fixture(&dir);
+        let source = if label == "add-configured" {
+            format!("{OPENROUTER_RECORD}\n{LIVED_IN}")
+        } else {
+            LIVED_IN.to_owned()
+        };
+        fs::write(&config, &source).expect("the refusal fixture should be written");
         let config_arg = utf8_arg(&config, "the config path should be UTF-8");
         let mut args = vec!["--config", config_arg.as_str()];
         args.extend_from_slice(command);
@@ -388,12 +408,14 @@ fn refused_edits_leave_the_fixture_byte_identical() {
             stdout_text(&output)
         );
         assert!(
-            stderr.to_ascii_lowercase().contains("file was left unchanged"),
+            stderr
+                .to_ascii_lowercase()
+                .contains("file was left unchanged"),
             "{label} should say that the file was left unchanged; stderr: {stderr}"
         );
         let edited = read_config(&config);
         assert_eq!(
-            edited, LIVED_IN,
+            edited, source,
             "{label} should leave the fixture byte-identical"
         );
         assert!(

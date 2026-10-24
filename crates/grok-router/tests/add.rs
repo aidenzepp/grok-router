@@ -7,11 +7,12 @@
     )
 )]
 
-//! `grok-router add` writes one model into a temp config.
+//! `grok-router add` writes one model from a `[router]` provider record.
 //!
-//! These tests do not call the network, do not read `OPENROUTER_API_KEY`,
-//! and do not read a home config. A run that omits `--catalog-file` points
-//! `--cache-dir` at the temp directory.
+//! These tests do not call the network and do not read a home config. A run
+//! that omits `--catalog-file` points `--cache-dir` at the temp directory.
+//! The bearer is set only when a case needs a fresh cache. Secret values are
+//! not printed when an assertion fails.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,16 @@ default = \"grok-4.7\"
 default_reasoning_effort = \"high\"
 ";
 
+const OPENROUTER_RECORD: &str = "\
+[router]
+default_provider = \"openrouter\"
+
+[router.provider.openrouter]
+base_url = \"https://openrouter.ai/api/v1\"
+env_key = \"OPENROUTER_API_KEY\"
+catalog = \"openrouter-models\"
+";
+
 const CATALOG: &str = r#"{
     "data": [
         {
@@ -73,7 +84,7 @@ const CATALOG: &str = r#"{
 }"#;
 
 fn config_text() -> String {
-    format!("{COMMENT}\n{DEEPSEEK_SPAN}\n{GLM_SPAN}\n{CONFIG_TAIL}")
+    format!("{OPENROUTER_RECORD}\n{COMMENT}\n{DEEPSEEK_SPAN}\n{GLM_SPAN}\n{CONFIG_TAIL}")
 }
 
 fn remove_temp(path: &Path) {
@@ -88,10 +99,7 @@ fn remove_temp(path: &Path) {
 }
 
 fn temp_root(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "grok-router-add-{label}-{}",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("grok-router-add-{label}-{}", std::process::id()));
     remove_temp(&path);
     fs::create_dir_all(&path).expect("the temp add directory should be created");
     path
@@ -108,18 +116,26 @@ fn write_fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 fn utf8_arg(path: &Path, what: &str) -> String {
-    path.to_str()
-        .expect(what)
-        .to_owned()
+    path.to_str().expect(what).to_owned()
 }
 
 fn run(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_grok-router"))
-        .args(args)
-        .env_remove("OPENROUTER_API_KEY")
-        .env("HOME", dir)
-        .env("NO_COLOR", "1")
-        .current_dir(dir)
+    run_with(dir, args, &[])
+}
+
+fn run_with(dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_grok-router"));
+    let command = env_vars.iter().fold(
+        command
+            .args(args)
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("DEEPSEEK_API_KEY")
+            .env("HOME", dir)
+            .env("NO_COLOR", "1")
+            .current_dir(dir),
+        |command, (key, value)| command.env(key, value),
+    );
+    command
         .output()
         .expect("the grok-router binary should start")
 }
@@ -180,8 +196,18 @@ fn add_help_contains_an_example_and_says_it_writes_unless_dry_run() {
         "add --help should contain an example; help: {help}"
     );
     assert!(
-        help.contains("grok-router add --catalog-file models.json --config config.toml z-ai/glm-5.3"),
+        help.contains(
+            "grok-router add --catalog-file models.json --config config.toml z-ai/glm-5.3"
+        ),
         "add --help should contain a concrete example; help: {help}"
+    );
+    assert!(
+        help.contains("grok-router add --provider deepseek --catalog-file deepseek.json --config config.toml deepseek-v4-pro"),
+        "add --help should show the deepseek record example; help: {help}"
+    );
+    assert!(
+        help.contains("--provider"),
+        "add --help should document --provider; help: {help}"
     );
     assert!(
         help.contains("writes unless --dry-run"),
@@ -237,7 +263,25 @@ fn a_named_add_inserts_one_block_and_leaves_existing_spans_unchanged() {
     );
     assert!(
         after.contains("[model.or-widget-v2]"),
-        "the derived slug should be the new header; config: {after}"
+        "the cartridge slug should be the new header; config: {after}"
+    );
+    let new_block = "\
+[model.or-widget-v2]
+model = \"acme/widget.v2\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"Widget\"
+env_key = \"OPENROUTER_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 4096
+vision = true
+";
+    assert!(
+        after.contains(new_block),
+        "the new span should use the record base, the record env name, and vision for image input; config: {after}"
+    );
+    assert!(
+        after.contains(OPENROUTER_RECORD),
+        "the [router] record should stay byte-identical; config: {after}"
     );
     assert_preserved_spans(&after);
     assert!(
@@ -285,9 +329,13 @@ fn a_second_slug_for_the_same_provider_exits_1_and_leaves_the_file() {
         "the failure should say what to do next; stderr: {stderr}"
     );
     let after = fs::read(&config).expect("the config fixture should still exist");
-    assert_eq!(after, before, "a refused add should leave the file unchanged");
+    assert_eq!(
+        after, before,
+        "a refused add should leave the file unchanged"
+    );
     assert!(
-        !config.with_extension("toml.prev").exists() && !config.with_file_name("config.toml.prev").exists(),
+        !config.with_extension("toml.prev").exists()
+            && !config.with_file_name("config.toml.prev").exists(),
         "a refused add should not write a backup"
     );
     remove_temp(&dir);
@@ -317,7 +365,10 @@ fn the_same_slug_and_provider_exits_0_and_leaves_the_bytes() {
     );
     assert_eq!(stdout_text(&output), "or-glm-5-3\n");
     let after = fs::read(&config).expect("the config fixture should still exist");
-    assert_eq!(after, before, "a no-op add should leave the bytes unchanged");
+    assert_eq!(
+        after, before,
+        "a no-op add should leave the bytes unchanged"
+    );
     assert!(
         !config.with_file_name("config.toml.prev").exists(),
         "a no-op add should not write a backup"
@@ -359,7 +410,8 @@ fn default_sets_the_default_in_the_same_write() {
     );
     assert_preserved_spans(&after);
     let backup = config.with_file_name("config.toml.prev");
-    let backed_up = fs::read(&backup).expect("one write should leave the original bytes as the sibling backup");
+    let backed_up =
+        fs::read(&backup).expect("one write should leave the original bytes as the sibling backup");
     assert_eq!(
         backed_up, before,
         "the backup should be the original file, which means the insert and the default were one write"
@@ -400,7 +452,10 @@ fn dry_run_prints_the_slug_and_would_write_and_changes_nothing() {
         "dry-run should say that it would write; stdout: {stdout}"
     );
     let after = fs::read(&config).expect("the config fixture should still exist");
-    assert_eq!(after, before, "--dry-run should leave the file bytes identical");
+    assert_eq!(
+        after, before,
+        "--dry-run should leave the file bytes identical"
+    );
     assert!(
         !config.with_file_name("config.toml.prev").exists(),
         "--dry-run should not write a backup"
@@ -426,11 +481,21 @@ fn json_prints_one_object_and_quiet_prints_the_slug_only() {
     );
     let stdout = stdout_text(&json_out);
     let stderr = stderr_text(&json_out);
-    assert_eq!(exit_code(&json_out), 0, "json add should succeed; stderr: {stderr}");
-    assert!(stderr.is_empty(), "diagnostics should stay off stdout; stderr: {stderr}");
+    assert_eq!(
+        exit_code(&json_out),
+        0,
+        "json add should succeed; stderr: {stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "diagnostics should stay off stdout; stderr: {stderr}"
+    );
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("add --json should be one JSON value");
-    assert!(parsed.is_object(), "add --json should print one object; stdout: {stdout}");
+    assert!(
+        parsed.is_object(),
+        "add --json should print one object; stdout: {stdout}"
+    );
     assert_eq!(
         parsed.get("slug").and_then(serde_json::Value::as_str),
         Some("or-widget-v2"),
@@ -527,14 +592,19 @@ fn zero_matches_and_several_matches_exit_1_without_writing() {
         "several matches should say what to do next; stderr: {many_err}"
     );
     let after = fs::read(&config).expect("the config fixture should still exist");
-    assert_eq!(after, before, "a failed resolve should leave the file unchanged");
+    assert_eq!(
+        after, before,
+        "a failed resolve should leave the file unchanged"
+    );
     remove_temp(&dir);
 }
 
 const CUSTOM_BASE: &str = "https://example.invalid/v1";
 
-fn config_with_base(base: &str) -> String {
-    format!("[grok_router]\nopenrouter_base_url = \"{base}\"\n\n{}", config_text())
+fn config_with_record_base(base: &str) -> String {
+    format!(
+        "[router]\ndefault_provider = \"openrouter\"\n\n[router.provider.openrouter]\nbase_url = \"{base}\"\nenv_key = \"OPENROUTER_API_KEY\"\ncatalog = \"openrouter-models\"\n\n{COMMENT}\n{DEEPSEEK_SPAN}\n{GLM_SPAN}\n{CONFIG_TAIL}"
+    )
 }
 
 fn mark_fresh(path: &Path) {
@@ -562,7 +632,7 @@ fn assert_dir_empty(path: &Path) {
 fn a_custom_base_is_written_on_the_new_block_and_existing_spans_stay() {
     let dir = temp_root("custom-base");
     let (config, catalog, cache) = write_fixture(&dir);
-    let text = config_with_base(CUSTOM_BASE);
+    let text = config_with_record_base(CUSTOM_BASE);
     fs::write(&config, &text).expect("the custom-base config should be written");
     let before = fs::read(&config).expect("the custom-base config should be readable");
     let output = run(
@@ -583,24 +653,24 @@ fn a_custom_base_is_written_on_the_new_block_and_existing_spans_stay() {
     assert_eq!(
         exit_code(&output),
         0,
-        "add should write the resolved base from --config; stderr: {stderr}; stdout: {stdout}"
+        "add should write the record base from --config; stderr: {stderr}; stdout: {stdout}"
     );
     let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
-    let new_block_base = format!(
-        "[model.or-widget-v2]\nmodel = \"acme/widget.v2\"\nbase_url = \"{CUSTOM_BASE}\"\n"
-    );
+    let new_block_base =
+        format!("[model.or-widget-v2]\nmodel = \"acme/widget.v2\"\nbase_url = \"{CUSTOM_BASE}\"\n");
     assert!(
         after.contains(&new_block_base),
-        "the new block should use the resolved base {CUSTOM_BASE}; config: {after}"
-    );
-    assert_eq!(
-        after.matches(&format!("\nbase_url = \"{CUSTOM_BASE}\"\n")).count(),
-        1,
-        "the resolved base should appear on the new block only; config: {after}"
+        "the new block should use the record base {CUSTOM_BASE}; config: {after}"
     );
     assert!(
-        after.contains(&format!("openrouter_base_url = \"{CUSTOM_BASE}\"")),
-        "the settings line should stay; config: {after}"
+        after.contains(&format!(
+            "[router.provider.openrouter]\nbase_url = \"{CUSTOM_BASE}\"\n"
+        )),
+        "the [router] record should stay; config: {after}"
+    );
+    assert!(
+        !after.contains("openrouter_base_url"),
+        "add must not read or write openrouter_base_url; config: {after}"
     );
     assert_preserved_spans(&after);
     assert_ne!(
@@ -616,7 +686,7 @@ fn a_custom_base_is_written_on_the_new_block_and_existing_spans_stay() {
 fn a_custom_base_cache_miss_reports_a_missing_key_and_does_not_read_models_json() {
     let dir = temp_root("hex-miss");
     let (config, _catalog, cache) = write_fixture(&dir);
-    let text = config_with_base(CUSTOM_BASE);
+    let text = config_with_record_base(CUSTOM_BASE);
     fs::write(&config, &text).expect("the custom-base config should be written");
     let before = fs::read(&config).expect("the custom-base config should be readable");
     let models = cache.join("models.json");
@@ -665,7 +735,10 @@ fn a_custom_base_cache_miss_reports_a_missing_key_and_does_not_read_models_json(
         "the miss should say the catalog was not downloaded; stderr: {stderr}"
     );
     let after = fs::read(&config).expect("the config fixture should still exist");
-    assert_eq!(after, before, "a cache miss should leave the config unchanged");
+    assert_eq!(
+        after, before,
+        "a cache miss should leave the config unchanged"
+    );
     let models_after = fs::read(&models).expect("models.json should still exist");
     assert_eq!(
         models_before, models_after,
@@ -710,7 +783,7 @@ fn add_without_config_exits_1_and_does_not_open_a_home_config() {
 fn an_invalid_base_url_leaves_the_file_and_does_not_download() {
     let dir = temp_root("bad-base");
     let (config, _catalog, cache) = write_fixture(&dir);
-    let text = config_with_base("ftp://nope");
+    let text = config_with_record_base("ftp://nope");
     fs::write(&config, &text).expect("the invalid-base config should be written");
     let before = fs::read(&config).expect("the invalid-base config should be readable");
     assert_dir_empty(&cache);
@@ -729,12 +802,20 @@ fn an_invalid_base_url_leaves_the_file_and_does_not_download() {
     assert_eq!(
         exit_code(&output),
         1,
-        "an invalid openrouter_base_url should fail before a download; stdout: {}",
+        "an invalid record base_url should fail before a download; stdout: {}",
         stdout_text(&output)
     );
     assert!(
-        stderr.contains("openrouter_base_url"),
-        "the failure should name openrouter_base_url; stderr: {stderr}"
+        stderr.contains("base_url"),
+        "the failure should name base_url; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("openrouter_base_url"),
+        "the failure must not treat openrouter_base_url as the base; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("https://openrouter.ai/api/v1"),
+        "the failure must not choose the compiled OpenRouter URL; stderr: {stderr}"
     );
     assert!(
         stderr.contains("left unchanged"),
@@ -749,11 +830,829 @@ fn an_invalid_base_url_leaves_the_file_and_does_not_download() {
         "an invalid setting should return before the catalog load; stderr: {stderr}"
     );
     let after = fs::read(&config).expect("the invalid-base config should still exist");
-    assert_eq!(after, before, "an invalid setting should leave the file unchanged");
+    assert_eq!(
+        after, before,
+        "an invalid setting should leave the file unchanged"
+    );
     assert_dir_empty(&cache);
     assert!(
         !config.with_file_name("config.toml.prev").exists(),
         "an invalid setting should not write a backup"
     );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("json"),
+        "an invalid record should fail before a catalog parse; stderr: {stderr}"
+    );
     remove_temp(&dir);
+}
+
+const PRO_SPAN: &str = "\
+[model.or-deepseek-pro]
+model = \"deepseek/deepseek-v4-pro-0813\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"DeepSeek Pro\"
+env_key = \"OPENROUTER_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 1000000
+";
+
+const GLM_FLASH_SPAN: &str = "\
+[model.or-glm-5-3-flash]
+model = \"z-ai/glm-5.3-flash\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"GLM 5.3 Flash\"
+env_key = \"OPENROUTER_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 1000000
+";
+
+const DEEPSEEK_BASE: &str = "https://api.deepseek.com";
+
+const DEEPSEEK_DOC: &str = r#"{
+    "data": [
+        {
+            "id": "deepseek-v4-pro",
+            "name": "DeepSeek V4 Pro",
+            "context_window": 1000000,
+            "input_modalities": ["text", "image"]
+        },
+        {
+            "id": "deepseek-v4-text",
+            "name": "DeepSeek V4 Text",
+            "context_window": 4096,
+            "input_modalities": ["text"]
+        }
+    ]
+}"#;
+
+fn four_spans() -> String {
+    format!("{COMMENT}\n{DEEPSEEK_SPAN}\n{PRO_SPAN}\n{GLM_SPAN}\n{GLM_FLASH_SPAN}\n{CONFIG_TAIL}")
+}
+
+fn deepseek_router(default_line: &str) -> String {
+    format!(
+        "[router]\n{default_line}\n[router.provider.deepseek]\nbase_url = \"{DEEPSEEK_BASE}\"\nenv_key = \"DEEPSEEK_API_KEY\"\ncatalog = \"deepseek-list-models\"\n\n[router.provider.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"OPENROUTER_API_KEY\"\ncatalog = \"openrouter-models\"\n\n{}",
+        four_spans()
+    )
+}
+
+fn write_named(dir: &Path, name: &str, text: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, text).expect("the temp fixture should be written");
+    path
+}
+
+fn assert_secret_absent(label: &str, text: &str, secret: &str) {
+    assert!(
+        !text.contains(secret),
+        "{label} included a watched secret value"
+    );
+}
+
+#[test]
+fn other_commands_do_not_grow_provider() {
+    let dir = temp_root("no-provider-flag");
+    for command in ["search", "set-default", "remove", "list"] {
+        let output = run(&dir, &[command, "--help"]);
+        let help = stdout_text(&output);
+        assert_eq!(
+            exit_code(&output),
+            0,
+            "{command} --help should succeed; stderr: {}",
+            stderr_text(&output)
+        );
+        assert!(
+            !help.contains("--provider"),
+            "{command} must not grow --provider; help: {help}"
+        );
+    }
+    remove_temp(&dir);
+}
+
+#[test]
+fn text_only_input_omits_the_vision_line() {
+    let dir = temp_root("no-vision");
+    let (config, catalog, _cache) = write_fixture(&dir);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "acme/other.v2",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "a text-only row should be added; stderr: {stderr}"
+    );
+    let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
+    assert!(
+        after.contains("[model.or-other-v2]\n"),
+        "the cartridge slug should be or-other-v2; config: {after}"
+    );
+    assert!(
+        !after.contains("vision"),
+        "text-only input must not write a vision line; config: {after}"
+    );
+    assert_preserved_spans(&after);
+    remove_temp(&dir);
+}
+
+#[test]
+fn deepseek_add_writes_one_direct_span_and_keeps_the_old_bytes() {
+    let dir = temp_root("deepseek-add");
+    let router = "\
+[router]
+default_provider = \"openrouter\"
+
+[router.provider.deepseek]
+base_url = \"https://api.deepseek.com\"
+env_key = \"DEEPSEEK_API_KEY\"
+catalog = \"deepseek-list-models\"
+
+[router.provider.openrouter]
+base_url = \"https://openrouter.ai/api/v1\"
+env_key = \"OPENROUTER_API_KEY\"
+catalog = \"openrouter-models\"
+";
+    let source = format!("{router}\n{}", four_spans());
+    let config = write_named(&dir, "config.toml", &source);
+    let catalog = write_named(&dir, "deepseek.json", DEEPSEEK_DOC);
+    let openrouter_secret = "openrouter-secret-value";
+    let deepseek_secret = "deepseek-secret-value";
+    let output = run_with(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--provider",
+            "deepseek",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "deepseek-v4-pro",
+        ],
+        &[
+            ("OPENROUTER_API_KEY", openrouter_secret),
+            ("DEEPSEEK_API_KEY", deepseek_secret),
+        ],
+    );
+    let stdout = stdout_text(&output);
+    let stderr = stderr_text(&output);
+    assert_secret_absent("stderr", &stderr, openrouter_secret);
+    assert_secret_absent("stderr", &stderr, deepseek_secret);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "a deepseek add should exit 0; stderr: {stderr}; stdout: {stdout}"
+    );
+    assert_eq!(stdout, "deepseek-v4-pro\n");
+    let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
+    assert_secret_absent("config", &after, openrouter_secret);
+    assert_secret_absent("config", &after, deepseek_secret);
+    let new_span = "\
+[model.deepseek-v4-pro]
+model = \"deepseek-v4-pro\"
+base_url = \"https://api.deepseek.com\"
+name = \"DeepSeek V4 Pro\"
+env_key = \"DEEPSEEK_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 1000000
+vision = true
+";
+    assert!(
+        after.contains(new_span),
+        "the new span should be the direct id with the record base and env name; config: {after}"
+    );
+    assert!(
+        !new_span.contains("or-deepseek")
+            && !new_span.contains("deepseek/deepseek-v4-pro-0813")
+            && !new_span.contains("api_key"),
+        "the new span must not use an or- slug, an OpenRouter id, or api_key"
+    );
+    for span in [DEEPSEEK_SPAN, PRO_SPAN, GLM_SPAN, GLM_FLASH_SPAN] {
+        assert!(
+            after.contains(span),
+            "an existing span should stay byte-identical; config: {after}"
+        );
+    }
+    assert!(
+        after.contains(router),
+        "the [router] table should stay byte-identical; config: {after}"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn deepseek_text_row_omits_vision() {
+    let dir = temp_root("deepseek-text");
+    let source = deepseek_router("default_provider = \"openrouter\"\n");
+    let config = write_named(&dir, "config.toml", &source);
+    let catalog = write_named(&dir, "deepseek.json", DEEPSEEK_DOC);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--provider",
+            "deepseek",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "deepseek-v4-text",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "a text deepseek row should be added; stderr: {stderr}"
+    );
+    let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
+    let header_at = after
+        .find("[model.deepseek-v4-text]\n")
+        .expect("the direct slug should be present");
+    let span = after
+        .get(header_at..)
+        .and_then(|rest| rest.split_once("\n\n"))
+        .map(|(span, _)| span)
+        .expect("the new span should end at a blank line");
+    assert!(
+        !span.contains("vision"),
+        "a text modality must not write vision; span: {span}"
+    );
+    assert!(span.contains("env_key = \"DEEPSEEK_API_KEY\"\n"));
+    remove_temp(&dir);
+}
+
+#[test]
+fn explicit_provider_does_not_need_default_provider() {
+    let dir = temp_root("explicit-provider");
+    let source = deepseek_router("");
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "deepseek.json", DEEPSEEK_DOC);
+    let added = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--provider",
+            "deepseek",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "deepseek-v4-text",
+        ],
+    );
+    assert_eq!(
+        exit_code(&added),
+        0,
+        "--provider deepseek should add without default_provider; stderr: {}",
+        stderr_text(&added)
+    );
+    let omitted = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "deepseek-v4-pro",
+        ],
+    );
+    let stderr = stderr_text(&omitted);
+    assert_eq!(
+        exit_code(&omitted),
+        1,
+        "omitted --provider should not pick a record; stdout: {}",
+        stdout_text(&omitted)
+    );
+    assert!(
+        stderr.contains("default_provider"),
+        "the refusal should name default_provider; stderr: {stderr}"
+    );
+    let after = fs::read_to_string(&config).expect("the config should stay UTF-8");
+    assert!(
+        after.contains("[model.deepseek-v4-text]\n"),
+        "the explicit add should have landed before the omitted refusal; config: {after}"
+    );
+    assert!(
+        !after.contains("[model.deepseek-v4-pro]"),
+        "the omitted provider must not write a second span; config: {after}"
+    );
+    assert_ne!(
+        after.as_bytes(),
+        before.as_slice(),
+        "the explicit add should have changed the file"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn blank_default_provider_still_honors_an_explicit_provider() {
+    let dir = temp_root("blank-default");
+    let source = deepseek_router("default_provider = \"\"\n");
+    let config = write_named(&dir, "config.toml", &source);
+    let catalog = write_named(&dir, "deepseek.json", DEEPSEEK_DOC);
+    let omitted = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "deepseek-v4-text",
+        ],
+    );
+    let omitted_err = stderr_text(&omitted);
+    assert_eq!(
+        exit_code(&omitted),
+        1,
+        "a blank default should refuse; stderr: {omitted_err}"
+    );
+    assert!(
+        omitted_err.contains("default_provider"),
+        "the refusal should name the blank default; stderr: {omitted_err}"
+    );
+    let before = fs::read(&config).expect("the refused config should still exist");
+    let added = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--provider",
+            "deepseek",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "deepseek-v4-text",
+        ],
+    );
+    assert_eq!(
+        exit_code(&added),
+        0,
+        "--provider should ignore a blank default; stderr: {}",
+        stderr_text(&added)
+    );
+    let after = fs::read(&config).expect("the explicit add should leave a file");
+    assert_ne!(
+        after, before,
+        "the explicit add should write the direct span"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn a_missing_router_refuses_before_a_catalog_parse() {
+    let dir = temp_root("missing-router");
+    let source = four_spans();
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", "this is not json");
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "a missing [router] should refuse; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("[router]"),
+        "stderr should name the missing [router] data; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("must write that record"),
+        "stderr should say the operator must write that record; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Nothing was downloaded"),
+        "the refusal should happen before a download; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("https://openrouter.ai/api/v1"),
+        "stderr must not choose the compiled OpenRouter URL; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("json"),
+        "a non-JSON catalog must not be parsed when [router] is missing; stderr: {stderr}"
+    );
+    let after = fs::read(&config).expect("the config should still exist");
+    assert_eq!(
+        after, before,
+        "a missing [router] should leave the file unchanged"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn a_grok_router_table_is_not_a_provider_record() {
+    let dir = temp_root("grok-router-only");
+    let source = format!(
+        "[grok_router]\nopenrouter_base_url = \"https://openrouter.ai/api/v1\"\n\n[grok_router.provider.deepseek]\nbase_url = \"{DEEPSEEK_BASE}\"\nenv_key = \"DEEPSEEK_API_KEY\"\ncatalog = \"deepseek-list-models\"\n\n{}",
+        four_spans()
+    );
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", "this is not json");
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "only [grok_router] should refuse; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("[router]"),
+        "stderr should name [router]; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("must write that record"),
+        "stderr should say the operator must write that record; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("https://openrouter.ai/api/v1"),
+        "stderr must not choose the compiled URL; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("json"),
+        "the catalog file must not be parsed; stderr: {stderr}"
+    );
+    let after = fs::read(&config).expect("the config should still exist");
+    assert_eq!(after, before);
+    remove_temp(&dir);
+}
+
+#[test]
+fn a_windowless_deepseek_row_refuses_the_add() {
+    let dir = temp_root("deepseek-window");
+    let source = deepseek_router("default_provider = \"deepseek\"\n");
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let cases = [
+        r#"{"data":[{"id":"deepseek-v4-pro","name":"Pro"}]}"#,
+        r#"{"data":[{"id":"deepseek-v4-pro","name":"Pro","context_window":0}]}"#,
+        r#"{"data":[{"id":"deepseek-v4-pro","name":"Pro","context_length":128000}]}"#,
+    ];
+    for (index, document) in cases.iter().enumerate() {
+        let catalog = write_named(&dir, &format!("case-{index}.json"), document);
+        let output = run(
+            &dir,
+            &[
+                "--config",
+                &utf8_arg(&config, "the config path should be UTF-8"),
+                "add",
+                "--provider",
+                "deepseek",
+                "--catalog-file",
+                &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+                "deepseek-v4-pro",
+            ],
+        );
+        let stderr = stderr_text(&output);
+        assert_eq!(
+            exit_code(&output),
+            1,
+            "case {index} should refuse a non-positive window; stdout: {}",
+            stdout_text(&output)
+        );
+        assert!(
+            stderr.contains("left unchanged"),
+            "case {index} should leave the file unchanged; stderr: {stderr}"
+        );
+        let after = fs::read(&config).expect("the config should still exist");
+        assert_eq!(after, before, "case {index} should not write a span");
+    }
+    remove_temp(&dir);
+}
+
+#[test]
+fn an_openrouter_fixture_fed_to_deepseek_does_not_write_an_or_slug() {
+    let dir = temp_root("wrong-fixture");
+    let source = deepseek_router("default_provider = \"deepseek\"\n");
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", CATALOG);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--provider",
+            "deepseek",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "an OpenRouter fixture should not satisfy a deepseek add; stdout: {}",
+        stdout_text(&output)
+    );
+    let after = fs::read_to_string(&config).expect("the config should stay UTF-8");
+    assert_eq!(
+        after.as_bytes(),
+        before.as_slice(),
+        "the file should stay unchanged; stderr: {stderr}"
+    );
+    assert!(
+        !after.contains("[model.or-widget-v2]"),
+        "deepseek must not write an or- slug; config: {after}"
+    );
+    assert!(
+        !after.contains("context_window = 4096"),
+        "context_length must not be copied into context_window; config: {after}"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn zai_without_a_cartridge_does_not_parse_or_write() {
+    let dir = temp_root("zai");
+    let source = format!(
+        "[router]\ndefault_provider = \"zai\"\n\n[router.provider.zai]\nbase_url = \"https://api.z.ai/api/paas/v4\"\nenv_key = \"ZAI_API_KEY\"\n\n{}",
+        four_spans()
+    );
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", "this is not json");
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--provider",
+            "zai",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "glm-5.3",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "zai should refuse; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("zai"),
+        "stderr should name zai; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no catalog cartridge"),
+        "stderr should say no catalog cartridge is configured; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Nothing was downloaded") && stderr.contains("Nothing was written"),
+        "stderr should say nothing was downloaded and nothing was written; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("openrouter-models") && stderr.contains("deepseek-list-models"),
+        "stderr should name the two catalog ids; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--provider"),
+        "stderr should say to pass --provider for a record that already has one; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("try again"),
+        "stderr must not say try again; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("json"),
+        "a non-JSON catalog must not be parsed; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("parser"),
+        "stderr must not offer a Z.ai parser; stderr: {stderr}"
+    );
+    let after = fs::read(&config).expect("the config should still exist");
+    assert_eq!(after, before, "zai should write nothing");
+    remove_temp(&dir);
+}
+
+#[test]
+fn an_unknown_catalog_id_is_named_and_does_not_select_openrouter() {
+    let dir = temp_root("unknown-catalog");
+    let source = format!(
+        "[router]\ndefault_provider = \"mirror\"\n\n[router.provider.mirror]\nbase_url = \"https://example.invalid/v1\"\nenv_key = \"OPENROUTER_API_KEY\"\ncatalog = \"not-a-cartridge\"\n\n{}",
+        four_spans()
+    );
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", CATALOG);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "not-a-cartridge should refuse; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("not-a-cartridge"),
+        "stderr should name that catalog id; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no catalog cartridge"),
+        "stderr should say no catalog cartridge is configured; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("json"),
+        "the fixture must not be parsed as OpenRouter; stderr: {stderr}"
+    );
+    let after = fs::read_to_string(&config).expect("the config should stay UTF-8");
+    assert_eq!(after.as_bytes(), before.as_slice());
+    assert!(!after.contains("[model.or-widget-v2]"));
+    remove_temp(&dir);
+}
+
+#[test]
+fn a_pasted_secret_refuses_before_a_write() {
+    let dir = temp_root("pasted-secret");
+    let (config, _catalog, _cache) = write_fixture(&dir);
+    let before = fs::read(&config).expect("the config should be readable");
+    let openrouter_secret = "pasted-openrouter-token";
+    let deepseek_secret = "pasted-deepseek-token";
+    let document = format!(
+        "{{\"data\":[{{\"id\":\"acme/widget.v2\",\"name\":\"{openrouter_secret}\",\"context_length\":8,\"architecture\":{{\"input_modalities\":[\"text\"]}}}}]}}"
+    );
+    let catalog = write_named(&dir, "secret.json", &document);
+    let output = run_with(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+        &[
+            ("OPENROUTER_API_KEY", openrouter_secret),
+            ("DEEPSEEK_API_KEY", deepseek_secret),
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_secret_absent("stderr", &stderr, openrouter_secret);
+    assert_secret_absent("stderr", &stderr, deepseek_secret);
+    assert_eq!(exit_code(&output), 1, "a pasted token should refuse");
+    assert!(
+        stderr.contains("OPENROUTER_API_KEY"),
+        "stderr should name the variable, not its value"
+    );
+    let after = fs::read(&config).expect("the config should still exist");
+    assert_eq!(after, before, "a pasted token should not write the file");
+    let after_text = String::from_utf8(after).expect("the config should stay UTF-8");
+    assert_secret_absent("config", &after_text, openrouter_secret);
+    assert_secret_absent("config", &after_text, deepseek_secret);
+    remove_temp(&dir);
+}
+
+#[test]
+fn an_openrouter_base_reads_models_json_and_a_deepseek_base_does_not() {
+    let dir = temp_root("cache-names");
+    let (config, _catalog, cache) = write_fixture(&dir);
+    let models = cache.join("models.json");
+    fs::write(&models, CATALOG).expect("models.json should be written");
+    mark_fresh(&models);
+    let models_before = fs::read(&models).expect("models.json should be readable");
+    let openrouter_url = grok_router::catalog::models_url("https://openrouter.ai/api/v1");
+    assert_eq!(
+        openrouter_url,
+        grok_router::catalog::MODELS_URL,
+        "the OpenRouter record base should be the models.json URL"
+    );
+    assert_eq!(
+        grok_router::catalog::cache_file_for(&cache, &openrouter_url),
+        models,
+        "that URL should cache as models.json"
+    );
+    let hit = run_with(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+        &[("OPENROUTER_API_KEY", "cache-hit-token")],
+    );
+    let hit_err = stderr_text(&hit);
+    assert_secret_absent("stderr", &hit_err, "cache-hit-token");
+    assert_eq!(
+        exit_code(&hit),
+        0,
+        "a fresh models.json should answer an OpenRouter base; stderr: {hit_err}; stdout: {}",
+        stdout_text(&hit)
+    );
+    let models_after = fs::read(&models).expect("models.json should still exist");
+    assert_eq!(
+        models_before, models_after,
+        "a cache hit must not rewrite models.json"
+    );
+    let after = fs::read_to_string(&config).expect("the config should be UTF-8");
+    assert_secret_absent("config", &after, "cache-hit-token");
+    assert!(after.contains("[model.or-widget-v2]\n"));
+
+    let deepseek_dir = temp_root("deepseek-cache");
+    let deepseek_config = write_named(
+        &deepseek_dir,
+        "config.toml",
+        &deepseek_router("default_provider = \"deepseek\"\n"),
+    );
+    let deepseek_cache = deepseek_dir.join("cache");
+    fs::create_dir_all(&deepseek_cache).expect("the deepseek cache dir should exist");
+    let decoy = deepseek_cache.join("models.json");
+    fs::write(&decoy, CATALOG).expect("the decoy models.json should be written");
+    mark_fresh(&decoy);
+    let decoy_before = fs::read(&decoy).expect("the decoy should be readable");
+    let deepseek_url = grok_router::catalog::models_url(DEEPSEEK_BASE);
+    let hex_path = grok_router::catalog::cache_file_for(&deepseek_cache, &deepseek_url);
+    assert_ne!(
+        hex_path.file_name().and_then(|name| name.to_str()),
+        Some("models.json"),
+        "a deepseek base must not use models.json"
+    );
+    fs::write(&hex_path, DEEPSEEK_DOC).expect("the deepseek cache should be written");
+    mark_fresh(&hex_path);
+    let cached = run_with(
+        &deepseek_dir,
+        &[
+            "--config",
+            &utf8_arg(&deepseek_config, "the config path should be UTF-8"),
+            "add",
+            "--cache-dir",
+            &utf8_arg(&deepseek_cache, "the cache path should be UTF-8"),
+            "deepseek-v4-text",
+        ],
+        &[("DEEPSEEK_API_KEY", "deepseek-cache-token")],
+    );
+    let cached_err = stderr_text(&cached);
+    assert_secret_absent("stderr", &cached_err, "deepseek-cache-token");
+    assert_eq!(
+        exit_code(&cached),
+        0,
+        "a deepseek base should read its own cache, not models.json; stderr: {cached_err}; stdout: {}",
+        stdout_text(&cached)
+    );
+    let decoy_after = fs::read(&decoy).expect("models.json should still exist");
+    assert_eq!(
+        decoy_before, decoy_after,
+        "a deepseek add must not read or write models.json by changing it"
+    );
+    let written =
+        fs::read_to_string(&deepseek_config).expect("the deepseek config should be UTF-8");
+    assert!(written.contains("[model.deepseek-v4-text]\n"));
+    assert!(written.contains(&format!("base_url = \"{DEEPSEEK_BASE}\"\n")));
+    assert_secret_absent("config", &written, "deepseek-cache-token");
+    remove_temp(&dir);
+    remove_temp(&deepseek_dir);
 }
