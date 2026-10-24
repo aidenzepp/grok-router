@@ -5,16 +5,18 @@
 //! when a top-level table, an existing provider id, the intended membership, or
 //! the saved default drifts. Refusal returns the caller's original text.
 //! [`read_configured`] reports the saved default and configured models and does
-//! not change the text.
+//! not change the text. [`router_settings`] reads `[grok_router]` from that
+//! same text. A missing table or key keeps [`OPENROUTER_BASE_URL`] and
+//! [`BUILTIN_SLUGS`]. The edit never writes the table back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// OpenRouter base URL written on every new model block.
+/// OpenRouter base URL used when `openrouter_base_url` is absent.
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
-/// Built-in Grok slugs. They have no config block.
+/// Built-in Grok slugs used when `builtins` is absent. They have no config block.
 pub const BUILTIN_SLUGS: [&str; 4] = [
     "grok-4.7",
     "grok-4.7-build-fast",
@@ -56,6 +58,15 @@ pub struct CatalogModel<'a> {
     pub sees_image: bool,
 }
 
+/// Resolved OpenRouter base and built-in slugs from `[grok_router]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterSettings {
+    /// `openrouter_base_url`, or [`OPENROUTER_BASE_URL`] when that key is absent.
+    pub base_url: String,
+    /// `builtins`, or [`BUILTIN_SLUGS`] when that key is absent. Empty means none.
+    pub builtins: Vec<String>,
+}
+
 /// Why a text edit was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefuseReason {
@@ -80,7 +91,7 @@ pub enum RefuseReason {
     DuplicateProvider {
         /// Provider id that is already present.
         provider_id: String,
-        /// Slug already bound to that provider id and the OpenRouter base URL.
+        /// Slug already bound to that provider id at the resolved base URL.
         existing_slug: String,
     },
     /// The slug is already a configured model or a built-in.
@@ -147,6 +158,13 @@ pub enum RefuseReason {
         /// Default the re-parse observed, if any.
         actual: Option<String>,
     },
+    /// A present `[grok_router]` key cannot be used.
+    InvalidSetting {
+        /// `openrouter_base_url` or `builtins`.
+        key: String,
+        /// Constraint the value failed.
+        detail: String,
+    },
 }
 
 impl fmt::Display for RefuseReason {
@@ -201,6 +219,9 @@ impl fmt::Display for RefuseReason {
                 display_optional(actual),
                 display_optional(expected)
             ),
+            Self::InvalidSetting { key, detail } => {
+                write!(formatter, "{key} is invalid: {detail}")
+            }
         }
     }
 }
@@ -314,12 +335,43 @@ pub fn derive_slug(provider_id: &str) -> Result<String, RefuseReason> {
     Ok(slug)
 }
 
+/// Resolve `[grok_router]` from `config` without rewriting it.
+///
+/// A missing table or a missing key uses [`OPENROUTER_BASE_URL`] and
+/// [`BUILTIN_SLUGS`]. `openrouter_base_url` must match `^https?://\S+$` with
+/// no trim. `builtins` must be an array of non-empty strings, and an empty
+/// array means there are no built-ins.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when a present key is unusable,
+/// or a parse or structural error when the document cannot be read.
+#[must_use = "the resolved settings are the caller's only copy of the base and built-ins"]
+pub fn router_settings(config: &str) -> Result<RouterSettings, RefuseReason> {
+    structural_problem(config)?;
+    let root = match config.parse::<toml::Table>() {
+        Ok(root) => root,
+        Err(error) => {
+            return Err(RefuseReason::Parse {
+                detail: error.to_string(),
+            });
+        }
+    };
+    settings_from_root(&root)
+}
+
 /// Render one new model block, including its trailing newline.
+///
+/// `base_url` is written on this span only.
 ///
 /// # Errors
 ///
 /// Returns an error when the slug, provider id, or context window is unusable.
-pub fn render_block(slug: &str, model: CatalogModel<'_>) -> Result<String, RefuseReason> {
+pub fn render_block(
+    slug: &str,
+    model: CatalogModel<'_>,
+    base_url: &str,
+) -> Result<String, RefuseReason> {
     check_slug(slug)?;
     if model.id.is_empty() {
         return Err(RefuseReason::EmptyProviderId);
@@ -332,7 +384,7 @@ pub fn render_block(slug: &str, model: CatalogModel<'_>) -> Result<String, Refus
     let mut lines = vec![
         model_header(slug)?,
         format!("model = {}", toml_basic_string(model.id)),
-        format!("base_url = \"{OPENROUTER_BASE_URL}\""),
+        format!("base_url = {}", toml_basic_string(base_url)),
         format!("name = {}", toml_basic_string(display_name(model))),
         "env_key = \"OPENROUTER_API_KEY\"".to_owned(),
         "api_backend = \"chat_completions\"".to_owned(),
@@ -349,7 +401,7 @@ pub fn render_block(slug: &str, model: CatalogModel<'_>) -> Result<String, Refus
 /// Insert one OpenRouter model block into `config`.
 ///
 /// `slug` overrides derivation. `None` derives the slug from the provider id.
-/// The same slug and the same provider id returns `config` unchanged.
+/// The same slug, the same provider id, and the same resolved base returns `config` unchanged.
 ///
 /// # Errors
 ///
@@ -359,6 +411,7 @@ pub fn insert_model(
     model: CatalogModel<'_>,
     slug: Option<&str>,
 ) -> Result<String, Refused> {
+    let settings = require_settings(config)?;
     let root = read_config(config)?;
     if model.id.is_empty() {
         return Err(refuse(config, RefuseReason::EmptyProviderId));
@@ -375,7 +428,7 @@ pub fn insert_model(
         Ok(resolved) => resolved,
         Err(reason) => return Err(refuse(config, reason)),
     };
-    let matches = provider_slugs(&root, model.id);
+    let matches = provider_slugs(&root, model.id, &settings.base_url);
     if let Some(existing) = matches.iter().find(|existing| existing.as_str() != resolved) {
         return Err(refuse(
             config,
@@ -388,7 +441,9 @@ pub fn insert_model(
     if !matches.is_empty() {
         return Ok(config.to_owned());
     }
-    if is_builtin(&resolved) || configured_models(&root).contains_key(&resolved) {
+    if is_builtin(&settings.builtins, &resolved)
+        || configured_models(&root).contains_key(&resolved)
+    {
         return Err(refuse(
             config,
             RefuseReason::SlugInUse {
@@ -396,7 +451,7 @@ pub fn insert_model(
             },
         ));
     }
-    let block = match render_block(&resolved, model) {
+    let block = match render_block(&resolved, model, &settings.base_url) {
         Ok(block) => block,
         Err(reason) => return Err(refuse(config, reason)),
     };
@@ -420,11 +475,12 @@ pub fn insert_model(
 ///
 /// Returns [`Refused`] and the original text when the slug is unknown or the document is unsafe to edit.
 pub fn set_default(config: &str, slug: &str) -> Result<String, Refused> {
+    let settings = require_settings(config)?;
     if let Err(reason) = check_slug(slug) {
         return Err(refuse(config, reason));
     }
     let root = read_config(config)?;
-    if !is_builtin(slug) && !configured_models(&root).contains_key(slug) {
+    if !is_builtin(&settings.builtins, slug) && !configured_models(&root).contains_key(slug) {
         return Err(refuse(
             config,
             RefuseReason::UnknownSlug {
@@ -454,6 +510,7 @@ pub fn set_default(config: &str, slug: &str) -> Result<String, Refused> {
 /// Returns [`Refused`] and the original text for a missing slug, a built-in, the saved default,
 /// or a document the splice will not rewrite.
 pub fn remove_model(config: &str, slug: &str) -> Result<String, Refused> {
+    let settings = require_settings(config)?;
     if let Err(reason) = check_slug(slug) {
         return Err(refuse(config, reason));
     }
@@ -466,7 +523,7 @@ pub fn remove_model(config: &str, slug: &str) -> Result<String, Refused> {
             },
         ));
     }
-    if is_builtin(slug) {
+    if is_builtin(&settings.builtins, slug) {
         return Err(refuse(
             config,
             RefuseReason::BuiltIn {
@@ -498,6 +555,9 @@ pub fn remove_model(config: &str, slug: &str) -> Result<String, Refused> {
 }
 
 /// Read the saved default and each configured slug with its provider id.
+///
+/// Does not read `[grok_router]`. A present or invalid settings table is not
+/// an error here.
 ///
 /// # Errors
 ///
@@ -598,6 +658,14 @@ fn refuse(config: &str, reason: RefuseReason) -> Refused {
     }
 }
 
+/// Resolve settings, or refuse with the original text before any splice.
+fn require_settings(config: &str) -> Result<RouterSettings, Refused> {
+    match router_settings(config) {
+        Ok(settings) => Ok(settings),
+        Err(reason) => Err(refuse(config, reason)),
+    }
+}
+
 /// Choose the explicit slug or derive one from `provider_id`.
 fn resolved_slug(provider_id: &str, slug: Option<&str>) -> Result<String, RefuseReason> {
     match slug {
@@ -627,9 +695,106 @@ fn check_slug(slug: &str) -> Result<(), RefuseReason> {
     }
 }
 
-/// Report whether `slug` is one of [`BUILTIN_SLUGS`].
-fn is_builtin(slug: &str) -> bool {
-    BUILTIN_SLUGS.contains(&slug)
+/// Report whether `slug` is a member of the resolved built-in list.
+fn is_builtin(builtins: &[String], slug: &str) -> bool {
+    builtins.iter().any(|candidate| candidate == slug)
+}
+
+/// Settings for a document with no `[grok_router]` table.
+fn compiled_settings() -> RouterSettings {
+    RouterSettings {
+        base_url: OPENROUTER_BASE_URL.to_owned(),
+        builtins: compiled_builtins(),
+    }
+}
+
+/// The four compiled slugs, in [`BUILTIN_SLUGS`] order.
+fn compiled_builtins() -> Vec<String> {
+    BUILTIN_SLUGS
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Read the base and built-ins from a parsed `[grok_router]` table.
+fn settings_from_root(root: &toml::Table) -> Result<RouterSettings, RefuseReason> {
+    let Some(value) = root.get("grok_router") else {
+        return Ok(compiled_settings());
+    };
+    let Some(table) = value.as_table() else {
+        return Err(invalid_setting(
+            "openrouter_base_url",
+            "[grok_router] must be a table",
+        ));
+    };
+    let base_url = match table.get("openrouter_base_url") {
+        None => OPENROUTER_BASE_URL.to_owned(),
+        Some(value) => http_base(value)?,
+    };
+    let builtins = match table.get("builtins") {
+        None => compiled_builtins(),
+        Some(value) => builtin_list(value)?,
+    };
+    Ok(RouterSettings { base_url, builtins })
+}
+
+/// Accept `openrouter_base_url` only when it matches `^https?://\S+$`.
+fn http_base(value: &toml::Value) -> Result<String, RefuseReason> {
+    let Some(text) = value.as_str() else {
+        return Err(invalid_setting(
+            "openrouter_base_url",
+            "must be a string matching ^https?://\\S+$",
+        ));
+    };
+    if !is_http_base(text) {
+        return Err(invalid_setting(
+            "openrouter_base_url",
+            &format!("must match ^https?://\\S+$ with no trim, got {text:?}"),
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+/// Report whether `text` is `http://` or `https://` plus at least one non-whitespace.
+fn is_http_base(text: &str) -> bool {
+    let rest = if let Some(rest) = text.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = text.strip_prefix("http://") {
+        rest
+    } else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|character| !character.is_whitespace())
+}
+
+/// Accept `builtins` only as an array of non-empty strings. An empty array is none.
+fn builtin_list(value: &toml::Value) -> Result<Vec<String>, RefuseReason> {
+    let Some(items) = value.as_array() else {
+        return Err(invalid_setting(
+            "builtins",
+            "must be an array of non-empty strings",
+        ));
+    };
+    let mut slugs = Vec::new();
+    for item in items {
+        let Some(slug) = item.as_str().filter(|slug| !slug.is_empty()) else {
+            return Err(invalid_setting(
+                "builtins",
+                "must be an array of non-empty strings",
+            ));
+        };
+        slugs.push(slug.to_owned());
+    }
+    Ok(slugs)
+}
+
+/// Build an [`RefuseReason::InvalidSetting`] for `key`.
+fn invalid_setting(key: &str, detail: &str) -> RefuseReason {
+    RefuseReason::InvalidSetting {
+        key: key.to_owned(),
+        detail: detail.to_owned(),
+    }
 }
 
 /// Turn every non-alphanumeric run into one hyphen, then trim and lowercase.
@@ -931,8 +1096,8 @@ fn configured_models(root: &toml::Table) -> BTreeMap<String, String> {
     found
 }
 
-/// Slugs whose provider id and base URL match this OpenRouter model.
-fn provider_slugs(root: &toml::Table, provider_id: &str) -> Vec<String> {
+/// Slugs whose provider id and base URL match `provider_id` and `base_url`.
+fn provider_slugs(root: &toml::Table, provider_id: &str, base_url: &str) -> Vec<String> {
     let mut slugs = Vec::new();
     let Some(model) = root.get("model").and_then(toml::Value::as_table) else {
         return slugs;
@@ -947,7 +1112,7 @@ fn provider_slugs(root: &toml::Table, provider_id: &str) -> Vec<String> {
         let Some(base) = entry.get("base_url").and_then(toml::Value::as_str) else {
             continue;
         };
-        if id == provider_id && base == OPENROUTER_BASE_URL {
+        if id == provider_id && base == base_url {
             slugs.push(slug.clone());
         }
     }
@@ -1346,7 +1511,11 @@ default_reasoning_effort = \"high\"
 
     #[test]
     fn insert_keeps_fixture_blocks_and_writes_catalog_context_only_on_the_new_block() {
-        let block = render_block("or-widget-v2", widget(Some(1_048_576), false))
+        let block = render_block(
+            "or-widget-v2",
+            widget(Some(1_048_576), false),
+            OPENROUTER_BASE_URL,
+        )
             .expect("a positive context window should render a block");
         assert_eq!(
             block,
@@ -1619,7 +1788,11 @@ context_window = 1048576
             head.ends_with("\n\n"),
             "the fixture should already separate [models] with a blank line"
         );
-        let block = render_block("or-widget-v2", widget(Some(8), false))
+        let block = render_block(
+            "or-widget-v2",
+            widget(Some(8), false),
+            OPENROUTER_BASE_URL,
+        )
             .expect("the widget block should render");
         let appended = insert_model(head, widget(Some(8), false), None)
             .expect("a document without [models] should append the block");
@@ -1795,6 +1968,376 @@ default = \"grok-4.7\"
             .expect_err("malformed toml should be refused");
         assert_eq!(parsed.text, malformed);
         assert!(matches!(parsed.reason, RefuseReason::Parse { .. }));
+    }
+
+    #[test]
+    fn missing_settings_table_uses_the_compiled_base_and_env_key() {
+        let updated = insert_model(FIXTURE, widget(Some(8), false), None)
+            .expect("a document with no settings table should still insert");
+        assert!(
+            updated.contains("base_url = \"https://openrouter.ai/api/v1\"\n"),
+            "the new block should use the compiled base, got:\n{updated}"
+        );
+        assert!(
+            updated.contains("env_key = \"OPENROUTER_API_KEY\"\n"),
+            "the new block should keep the OpenRouter env key, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("[grok_router]"),
+            "insert must not write [grok_router], got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("model_provider"),
+            "the splice must not write model_provider"
+        );
+        assert!(!updated.contains("api_key"), "the splice must not write api_key");
+        assert_fixture_blocks(&updated);
+    }
+
+    #[test]
+    fn custom_base_is_written_on_the_new_block_only() {
+        let base = "https://example.invalid/v1/";
+        let config = with_settings(&format!("openrouter_base_url = \"{base}\""));
+        let updated = insert_model(&config, widget(Some(8), false), None)
+            .expect("a custom base should still insert one block");
+        let block = "\
+[model.or-widget-v2]
+model = \"acme/widget.v2\"
+base_url = \"https://example.invalid/v1/\"
+name = \"Widget\"
+env_key = \"OPENROUTER_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 8
+";
+        assert!(
+            updated.contains(block),
+            "the new block should keep the trailing slash, got:\n{updated}"
+        );
+        assert_eq!(
+            updated
+                .matches("\nbase_url = \"https://example.invalid/v1/\"\n")
+                .count(),
+            1,
+            "the resolved base should appear on the new block only, got:\n{updated}"
+        );
+        assert_eq!(
+            updated.matches("[grok_router]").count(),
+            1,
+            "the edit must not insert another [grok_router]"
+        );
+        assert!(
+            updated.contains("openrouter_base_url = \"https://example.invalid/v1/\""),
+            "the settings line should stay byte-identical"
+        );
+        assert_fixture_blocks(&updated);
+        assert!(
+            !updated.contains("model_provider"),
+            "the splice must not write model_provider"
+        );
+        assert!(!updated.contains("api_key"), "the splice must not write api_key");
+    }
+
+    #[test]
+    fn duplicate_detection_uses_the_resolved_base() {
+        let base = "https://example.invalid/v1";
+        let settings = format!("[grok_router]\nopenrouter_base_url = \"{base}\"\n\n");
+        let same = format!(
+            "{settings}[model.or-glm-5-3]\nmodel = \"z-ai/glm-5.3\"\n"
+        );
+        let same = format!("{same}base_url = \"{base}\"\nname = \"GLM 5.3\"\n");
+        let unchanged = insert_model(
+            &same,
+            CatalogModel {
+                id: "z-ai/glm-5.3",
+                name: Some("replacement name"),
+                context_window: Some(9),
+                sees_image: true,
+            },
+            Some("or-glm-5-3"),
+        )
+        .expect("the same provider id and resolved base should be a no-op");
+        assert_eq!(
+            unchanged, same,
+            "the same provider id at the resolved base should return the original text"
+        );
+
+        let different = format!("{settings}{GLM}");
+        let updated = insert_model(
+            &different,
+            CatalogModel {
+                id: "z-ai/glm-5.3",
+                name: Some("GLM 5.3"),
+                context_window: Some(8),
+                sees_image: false,
+            },
+            Some("or-glm-elsewhere"),
+        )
+        .expect("the same provider id at a different base should not be a duplicate");
+        assert!(
+            updated.contains("[model.or-glm-elsewhere]\n"),
+            "a different base should insert a second block, got:\n{updated}"
+        );
+        assert!(
+            updated.contains(&format!("base_url = \"{base}\"\n")),
+            "the new block should use the resolved base, got:\n{updated}"
+        );
+        assert!(
+            updated.contains(GLM),
+            "the existing model span should stay byte-identical"
+        );
+        assert_eq!(
+            updated.matches("[grok_router]").count(),
+            1,
+            "duplicate detection must not insert [grok_router]"
+        );
+    }
+
+    #[test]
+    fn missing_builtins_key_keeps_the_four_compiled_slugs() {
+        let config = with_settings("openrouter_base_url = \"https://example.invalid/v1\"");
+        let (prefix, _) = config
+            .split_once("[models]\n")
+            .expect("the fixture should contain [models]");
+        for slug in BUILTIN_SLUGS {
+            let updated = set_default(&config, slug)
+                .expect("a compiled slug should stay a built-in when builtins is absent");
+            let (updated_prefix, rest) = updated
+                .split_once("[models]\n")
+                .expect("set-default should keep the [models] header");
+            assert_eq!(
+                updated_prefix, prefix,
+                "set-default of {slug} should leave every earlier byte unchanged"
+            );
+            assert!(
+                rest.contains(&format!("default = \"{slug}\"\n")),
+                "{slug} should become the default, got:\n{rest}"
+            );
+            assert!(
+                !rest.contains("[model."),
+                "set-default must not add a model table, got:\n{rest}"
+            );
+        }
+
+        for slug in ["grok-4.5", "grok-4.6", "grok-4.7-build-fast"] {
+            let removed = remove_model(&config, slug)
+                .expect_err("a compiled slug should still be a built-in");
+            assert_eq!(removed.text, config, "{slug} should leave the text unchanged");
+            assert!(
+                matches!(removed.reason, RefuseReason::BuiltIn { .. }),
+                "{slug} should be a built-in, got {}",
+                removed.reason
+            );
+        }
+    }
+
+    #[test]
+    fn builtins_list_replaces_the_compiled_slugs_and_adds_no_model_table() {
+        let config = "\
+[grok_router]
+builtins = [\"grok-4.8\"]
+
+[model.or-glm-5-3]
+model = \"z-ai/glm-5.3\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"GLM 5.3\"
+
+[models]
+default = \"or-glm-5-3\"
+";
+        let model = "\
+[model.or-glm-5-3]
+model = \"z-ai/glm-5.3\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"GLM 5.3\"
+";
+        let updated = set_default(config, "grok-4.8")
+            .expect("grok-4.8 should be a built-in when the list says so");
+        assert!(updated.contains("default = \"grok-4.8\"\n"));
+        assert!(
+            updated.contains(model),
+            "set-default should leave the existing model span byte-identical"
+        );
+        assert_eq!(
+            updated.matches("[model.").count(),
+            1,
+            "the built-in list must not add a [model.*] table, got:\n{updated}"
+        );
+
+        let not_builtin = set_default(config, "grok-4.7")
+            .expect_err("grok-4.7 should not be a built-in when it is absent from the list");
+        assert_eq!(not_builtin.text, config);
+        assert!(
+            matches!(not_builtin.reason, RefuseReason::UnknownSlug { .. }),
+            "grok-4.7 should be unknown, got {}",
+            not_builtin.reason
+        );
+
+        let builtin = remove_model(config, "grok-4.8")
+            .expect_err("grok-4.8 should be refused as a built-in");
+        assert_eq!(builtin.text, config);
+        assert!(
+            matches!(builtin.reason, RefuseReason::BuiltIn { .. }),
+            "grok-4.8 should be a built-in, got {}",
+            builtin.reason
+        );
+
+        let ordinary = remove_model(config, "grok-4.7")
+            .expect_err("grok-4.7 should not be treated as a built-in");
+        assert_eq!(ordinary.text, config);
+        assert!(
+            matches!(ordinary.reason, RefuseReason::NotConfigured { .. }),
+            "grok-4.7 should be missing, not built-in, got {}",
+            ordinary.reason
+        );
+
+        let in_use = insert_model(config, widget(Some(8), false), Some("grok-4.8"))
+            .expect_err("a listed built-in slug should be in use");
+        assert_eq!(in_use.text, config);
+        assert!(
+            matches!(in_use.reason, RefuseReason::SlugInUse { .. }),
+            "grok-4.8 should be in use, got {}",
+            in_use.reason
+        );
+    }
+
+    #[test]
+    fn empty_builtins_means_there_are_no_builtins() {
+        let config = "\
+[grok_router]
+builtins = []
+
+[model.or-glm-5-3]
+model = \"z-ai/glm-5.3\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"GLM 5.3\"
+
+[models]
+default = \"or-glm-5-3\"
+";
+        for slug in BUILTIN_SLUGS {
+            let defaulted = set_default(config, slug)
+                .expect_err("an empty builtins array should not keep the compiled slug");
+            assert_eq!(defaulted.text, config, "{slug} should leave the text unchanged");
+            assert!(
+                matches!(defaulted.reason, RefuseReason::UnknownSlug { .. }),
+                "{slug} should be unknown, got {}",
+                defaulted.reason
+            );
+            let removed = remove_model(config, slug)
+                .expect_err("an empty builtins array should not treat the slug as built-in");
+            assert_eq!(removed.text, config, "{slug} should leave the text unchanged");
+            assert!(
+                matches!(removed.reason, RefuseReason::NotConfigured { .. }),
+                "{slug} should be missing, not built-in, got {}",
+                removed.reason
+            );
+        }
+
+        let updated = set_default(config, "or-glm-5-3")
+            .expect("a configured slug should still be accepted");
+        assert_eq!(
+            updated.matches("[model.").count(),
+            1,
+            "set-default must not add a model table, got:\n{updated}"
+        );
+        assert!(updated.contains("default = \"or-glm-5-3\"\n"));
+    }
+
+    #[test]
+    fn invalid_settings_refuse_the_edit_and_return_the_original_text() {
+        let cases = [
+            ("openrouter_base_url = \"\"", "openrouter_base_url"),
+            ("openrouter_base_url = \"ftp://nope\"", "openrouter_base_url"),
+            (
+                "openrouter_base_url = \"https://ex ample.invalid/v1\"",
+                "openrouter_base_url",
+            ),
+            (
+                "openrouter_base_url = \"https://example.invalid/v1 \"",
+                "openrouter_base_url",
+            ),
+            ("openrouter_base_url = \"http://\"", "openrouter_base_url"),
+            ("builtins = \"grok-4.8\"", "builtins"),
+            ("builtins = [\"\"]", "builtins"),
+            ("builtins = [1]", "builtins"),
+            ("builtins = [\"grok-4.8\", \"\"]", "builtins"),
+        ];
+        for (body, key) in cases {
+            assert_invalid_setting(&with_settings(body), key);
+        }
+    }
+
+    #[test]
+    fn read_configured_ignores_an_invalid_grok_router_table() {
+        let config = with_settings("openrouter_base_url = \"\"\nbuiltins = [\"\"]");
+        let inventory = read_configured(&config)
+            .expect("an invalid settings table should not fail the model reader");
+        assert_eq!(inventory.saved_default.as_deref(), Some("grok-4.7"));
+        assert!(
+            inventory
+                .models
+                .iter()
+                .any(|model| model.slug == "or-glm-5-3"),
+            "the reader should still report configured models"
+        );
+        let refused = insert_model(&config, widget(Some(8), false), None)
+            .expect_err("the same text should still refuse an edit");
+        assert_eq!(refused.text, config, "the refused edit should return the original text");
+    }
+
+    /// Prefix `body` as a `[grok_router]` table in front of [`FIXTURE`].
+    fn with_settings(body: &str) -> String {
+        format!("[grok_router]\n{body}\n\n{FIXTURE}")
+    }
+
+    /// Refuse `config` from insert, set-default, and remove, and name `key`.
+    fn assert_invalid_setting(config: &str, key: &str) {
+        let inserted = insert_model(config, widget(Some(8), false), None)
+            .expect_err("insert should refuse an invalid setting");
+        assert_eq!(
+            inserted.text, config,
+            "insert should return the original text for {key}"
+        );
+        assert_setting(&inserted.reason, key);
+
+        let defaulted = set_default(config, "grok-4.6")
+            .expect_err("set-default should refuse an invalid setting");
+        assert_eq!(
+            defaulted.text, config,
+            "set-default should return the original text for {key}"
+        );
+        assert_setting(&defaulted.reason, key);
+
+        let removed = remove_model(config, "or-deepseek-pro")
+            .expect_err("remove should refuse an invalid setting");
+        assert_eq!(
+            removed.text, config,
+            "remove should return the original text for {key}"
+        );
+        assert_setting(&removed.reason, key);
+    }
+
+    /// The refusal names `key` and the display includes that key and the detail.
+    fn assert_setting(reason: &RefuseReason, key: &str) {
+        match reason {
+            RefuseReason::InvalidSetting { key: actual, detail } => {
+                assert_eq!(
+                    actual, key,
+                    "the refusal should name {key}, detail: {detail}"
+                );
+                assert!(!detail.is_empty(), "{key} should include a detail");
+                let rendered = reason.to_string();
+                assert!(
+                    rendered.contains(key),
+                    "display should name {key}, got {rendered}"
+                );
+                assert!(
+                    rendered.contains(detail),
+                    "display should include the detail, got {rendered}"
+                );
+            }
+            other => panic!("{key} should be an invalid setting, got {other}"),
+        }
     }
 
     #[test]

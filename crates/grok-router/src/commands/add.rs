@@ -328,7 +328,8 @@ fn next_step(reason: &RefuseReason) -> String {
         | RefuseReason::ChangedProvider { .. }
         | RefuseReason::AddMissing { .. }
         | RefuseReason::RemoveFailed { .. }
-        | RefuseReason::DefaultMismatch { .. } => {
+        | RefuseReason::DefaultMismatch { .. }
+        | RefuseReason::InvalidSetting { .. } => {
             "Retry with --dry-run after fixing the config. This command did not replace the file."
                 .to_owned()
         }
