@@ -173,7 +173,10 @@ fn read_config_text(path: &Path) -> Result<String, String> {
 
 /// What failed, why, and what to do next. The file was not written.
 fn edit_failure(reason: &RefuseReason) -> String {
-    format!("{reason}. Nothing was deleted. {}", next_step(reason))
+    format!(
+        "{reason}. The file was left unchanged. {}",
+        next_step(reason)
+    )
 }
 
 /// The next action for a refused removal.

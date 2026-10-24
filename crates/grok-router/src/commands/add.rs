@@ -287,7 +287,10 @@ fn edited_config(
 
 /// What failed, why, and what to do next. The file was not written.
 fn edit_failure(reason: &RefuseReason) -> String {
-    format!("{reason}. Nothing was written. {}", next_step(reason))
+    format!(
+        "{reason}. The file was left unchanged. {}",
+        next_step(reason)
+    )
 }
 
 /// The next action for a refused edit.

@@ -165,7 +165,7 @@ fn api_key_or_empty() -> Result<String, String> {
 /// What failed, why, and what to do next. The file was not written.
 fn edit_failure(reason: &RefuseReason) -> String {
     format!(
-        "{reason}. The saved default was not changed. {}",
+        "{reason}. The file was left unchanged. {}",
         next_step(reason)
     )
 }

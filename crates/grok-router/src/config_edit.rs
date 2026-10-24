@@ -1149,7 +1149,11 @@ fn append_models_table(text: &str, slug: &str) -> String {
     body
 }
 
-/// Delete the table span for `slug`, keeping neighboring blank-line separation to one line.
+/// Delete the header span for `slug`.
+///
+/// The span runs from its header through the line before the next header,
+/// including blank lines that sit in that span. Bytes outside the span are
+/// copied unchanged. Other gaps are not restyled.
 fn delete_span(text: &str, slug: &str) -> Result<String, RefuseReason> {
     let lines_ref = split_keepends(text);
     let spans = table_spans(&lines_ref);
@@ -1161,7 +1165,7 @@ fn delete_span(text: &str, slug: &str) -> Result<String, RefuseReason> {
             }
         }
     }
-    let (start, mut end) = match found.as_slice() {
+    let (start, end) = match found.as_slice() {
         [] => {
             return Err(RefuseReason::NotConfigured {
                 slug: slug.to_owned(),
@@ -1174,22 +1178,13 @@ fn delete_span(text: &str, slug: &str) -> Result<String, RefuseReason> {
             });
         }
     };
-    while end > start {
-        let blank = lines_ref
-            .get(end.saturating_sub(1))
-            .is_some_and(|line| line.trim().is_empty());
-        if !blank {
-            break;
-        }
-        end = end.saturating_sub(1);
-    }
-    let mut kept = Vec::new();
+    let mut kept = String::new();
     for (index, line) in lines_ref.iter().enumerate() {
         if index < start || index >= end {
-            kept.push((*line).to_owned());
+            kept.push_str(line);
         }
     }
-    Ok(collapse_blank_runs(&join_lines(&kept)))
+    Ok(kept)
 }
 
 /// Join keepends lines without adding separators of our own.
@@ -1199,24 +1194,6 @@ fn join_lines(lines: &[String]) -> String {
         joined.push_str(line);
     }
     joined
-}
-
-/// Collapse runs of three or more `\n` characters to one blank line.
-fn collapse_blank_runs(text: &str) -> String {
-    let mut collapsed = String::with_capacity(text.len());
-    let mut newlines = 0usize;
-    for ch in text.chars() {
-        if ch == '\n' {
-            newlines = newlines.saturating_add(1);
-            if newlines <= 2 {
-                collapsed.push('\n');
-            }
-        } else {
-            newlines = 0;
-            collapsed.push(ch);
-        }
-    }
-    collapsed
 }
 
 /// Report whether `secret` occurs in `bytes`. An empty secret never matches.
