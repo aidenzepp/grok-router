@@ -1,4 +1,4 @@
-//! OpenRouter catalog rows, matching, and cache decisions.
+//! Catalog rows, matching, cache decisions, and two catalog cartridges.
 //!
 //! Search reads. It never writes the config. The only write helper here stores
 //! non-empty catalog bytes under a caller-supplied cache directory.
@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::config_edit::CatalogModel;
+use crate::config_edit::{CatalogModel, RefuseReason, derive_slug, require_slug};
 
 /// Default OpenRouter models URL. A derived URL equal to this caches as `models.json`.
 pub const MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
@@ -154,6 +154,16 @@ pub enum CatalogError {
     },
     /// A caller asked to store an empty body. No file was written.
     EmptyCacheWrite,
+    /// Direct-catalog bytes were not JSON. This is not an OpenRouter document error.
+    DirectJson {
+        /// Parser detail.
+        detail: String,
+    },
+    /// Direct-catalog JSON was not a `data` array of model objects.
+    DirectShape {
+        /// What was missing.
+        detail: String,
+    },
 }
 
 impl CatalogError {
@@ -208,6 +218,14 @@ impl fmt::Display for CatalogError {
             Self::EmptyCacheWrite => write!(
                 formatter,
                 "refusing to write an empty catalog cache. 0 bytes. Pass --catalog-file or retry the download."
+            ),
+            Self::DirectJson { detail } => write!(
+                formatter,
+                "the catalog JSON could not be parsed: {detail}. Pass a deepseek-list-models document. Nothing was written."
+            ),
+            Self::DirectShape { detail } => write!(
+                formatter,
+                "{detail}. Pass a deepseek-list-models document. Nothing was written."
             ),
         }
     }
@@ -387,6 +405,116 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<Vec<CatalogRow>, CatalogError> {
     Ok(rows)
 }
 
+/// One catalog cartridge. Variant methods dispatch on `self` and do not match a catalog id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cartridge {
+    /// `openrouter-models`. [`CatalogCartridge::parse`] calls [`parse_catalog`].
+    OpenRouter,
+    /// `deepseek-list-models`. Reads `id`, `name`, `context_window`, and `input_modalities`.
+    DeepSeek,
+}
+
+/// Why [`cartridge`] did not return a cartridge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CartridgeError {
+    /// The catalog id was absent or empty.
+    Missing,
+    /// `id` is not a known cartridge. OpenRouter was not selected.
+    Unknown {
+        /// Catalog id that was refused.
+        id: String,
+    },
+}
+
+impl fmt::Display for CartridgeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => write!(
+                formatter,
+                "the catalog id is missing. Pass openrouter-models or deepseek-list-models. No cartridge was selected and nothing was written."
+            ),
+            Self::Unknown { id } => write!(
+                formatter,
+                "catalog id {id:?} is not a cartridge, so openrouter-models was not selected. Pass openrouter-models or deepseek-list-models. Nothing was written."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CartridgeError {}
+
+/// Parse catalog bytes and choose a config slug.
+///
+/// `slug`'s second argument is `--as`. OpenRouter derives `or-` plus the leaf
+/// when it is absent. DeepSeek uses the model id itself and does not invent a leaf.
+pub trait CatalogCartridge {
+    /// Parse `bytes` into rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CatalogError`] when `bytes` are not this cartridge's document.
+    fn parse(&self, bytes: &[u8]) -> Result<Vec<CatalogRow>, CatalogError>;
+
+    /// Choose the config slug for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RefuseReason`] when `model_id` or `explicit` is not a usable slug.
+    fn slug(&self, model_id: &str, explicit: Option<&str>) -> Result<String, RefuseReason>;
+}
+
+impl CatalogCartridge for Cartridge {
+    fn parse(&self, bytes: &[u8]) -> Result<Vec<CatalogRow>, CatalogError> {
+        match self {
+            Self::OpenRouter => parse_catalog(bytes),
+            Self::DeepSeek => parse_direct(bytes),
+        }
+    }
+
+    fn slug(&self, model_id: &str, explicit: Option<&str>) -> Result<String, RefuseReason> {
+        match self {
+            Self::OpenRouter => openrouter_slug(model_id, explicit),
+            Self::DeepSeek => deepseek_slug(model_id, explicit),
+        }
+    }
+}
+
+/// Select the cartridge named by `catalog_id`.
+///
+/// `None` and `Some("")` are missing. Any other string is unknown and does not
+/// select OpenRouter. This is the only match on the catalog id strings.
+///
+/// # Errors
+///
+/// Returns [`CartridgeError::Missing`] or [`CartridgeError::Unknown`].
+#[must_use = "the cartridge is the caller's only copy of the selected parser"]
+pub fn cartridge(catalog_id: Option<&str>) -> Result<Cartridge, CartridgeError> {
+    match catalog_id {
+        None | Some("") => Err(CartridgeError::Missing),
+        Some("openrouter-models") => Ok(Cartridge::OpenRouter),
+        Some("deepseek-list-models") => Ok(Cartridge::DeepSeek),
+        Some(id) => Err(CartridgeError::Unknown { id: id.to_owned() }),
+    }
+}
+
+/// OpenRouter slug: derive `or-` plus the leaf, or require `--as` as given.
+fn openrouter_slug(model_id: &str, explicit: Option<&str>) -> Result<String, RefuseReason> {
+    match explicit {
+        Some(slug) => {
+            require_slug(slug)?;
+            Ok(slug.to_owned())
+        }
+        None => derive_slug(model_id),
+    }
+}
+
+/// DeepSeek slug: the id itself, or `--as` when present. Never a derived leaf.
+fn deepseek_slug(model_id: &str, explicit: Option<&str>) -> Result<String, RefuseReason> {
+    let slug = explicit.unwrap_or(model_id);
+    require_slug(slug)?;
+    Ok(slug.to_owned())
+}
+
 /// Rows in which every term appears in the id, the name, or the description.
 ///
 /// Matching is case-insensitive. An empty term list returns every row.
@@ -456,21 +584,81 @@ pub fn prepare_cached_load(
     api_key: &str,
     base_url: &str,
 ) -> Result<CachedOrFetch, CatalogError> {
+    match fresh_bytes_or_fetch(cache_dir, now, refresh, api_key, base_url)? {
+        FreshBytesOrFetch::Fresh { path, bytes } => parse_catalog(&bytes)
+            .map(CachedOrFetch::Cached)
+            .map_err(|err| CatalogError::CacheInvalid {
+                path: path.display().to_string(),
+                detail: err.to_string(),
+            }),
+        FreshBytesOrFetch::Fetch(request) => Ok(CachedOrFetch::Fetch(request)),
+    }
+}
+
+/// Fresh cache bytes, or a request the caller still has to send.
+///
+/// The bytes are not parsed.
+#[derive(Debug)]
+pub enum CachedBodyOrFetch {
+    /// Bytes from a cache younger than one hour.
+    Cached(Vec<u8>),
+    /// GET the caller should perform. Write the body only after it is non-empty.
+    Fetch(CatalogRequest),
+}
+
+/// Read a fresh cache body for `base_url`, or build the GET that should replace it.
+///
+/// The path is [`cache_file_for`] of [`models_url`]. Does not parse, does not
+/// write, does not call the network, and does not read the clock. `now` is
+/// the caller's instant. A cache whose modification time is in the future is
+/// not used. `base_url` is a base URL, not a provider name or a catalog id.
+///
+/// # Errors
+///
+/// Returns [`CatalogError::MissingKey`] when a download is required and `api_key` is blank.
+/// Returns [`CatalogError::CacheIo`] when an existing cache file cannot be read.
+pub fn prepare_cached_body(
+    cache_dir: &Path,
+    now: SystemTime,
+    refresh: bool,
+    api_key: &str,
+    base_url: &str,
+) -> Result<CachedBodyOrFetch, CatalogError> {
+    match fresh_bytes_or_fetch(cache_dir, now, refresh, api_key, base_url)? {
+        FreshBytesOrFetch::Fresh { bytes, .. } => Ok(CachedBodyOrFetch::Cached(bytes)),
+        FreshBytesOrFetch::Fetch(request) => Ok(CachedBodyOrFetch::Fetch(request)),
+    }
+}
+
+/// A fresh non-empty cache body, or the GET that should replace it.
+enum FreshBytesOrFetch {
+    /// Bytes at `path`, younger than one hour. Not parsed.
+    Fresh { path: PathBuf, bytes: Vec<u8> },
+    /// GET the caller should perform.
+    Fetch(CatalogRequest),
+}
+
+/// Load a fresh cache body for `base_url`, or build its models GET.
+///
+/// Does not parse. An empty cache and a cache at least one hour old both fall
+/// through to the request. `refresh` skips the cache.
+fn fresh_bytes_or_fetch(
+    cache_dir: &Path,
+    now: SystemTime,
+    refresh: bool,
+    api_key: &str,
+    base_url: &str,
+) -> Result<FreshBytesOrFetch, CatalogError> {
     let url = models_url(base_url);
     let path = cache_file_for(cache_dir, &url);
     if !refresh {
         if let Some((bytes, age)) = read_cache_age(&path, now)? {
             if !bytes.is_empty() && cache_choice(age, false) == CacheChoice::Use {
-                return parse_catalog(&bytes)
-                    .map(CachedOrFetch::Cached)
-                    .map_err(|err| CatalogError::CacheInvalid {
-                        path: path.display().to_string(),
-                        detail: err.to_string(),
-                    });
+                return Ok(FreshBytesOrFetch::Fresh { path, bytes });
             }
         }
     }
-    catalog_request(api_key, &url).map(CachedOrFetch::Fetch)
+    catalog_request(api_key, &url).map(FreshBytesOrFetch::Fetch)
 }
 
 /// Download the catalog body. Does not write the cache or the config.
@@ -618,6 +806,103 @@ fn parse_row(index: usize, item: &Value) -> Result<CatalogRow, CatalogError> {
         context_length: optional_context_length(object.get("context_length"), index)?,
         sees_image: sees_image(object.get("architecture"), index)?,
     })
+}
+
+/// Parse a direct list-models document.
+///
+/// Reads `id`, `name`, `context_window`, and `input_modalities` from each
+/// `data` element. Does not read `description`, `context_length`,
+/// `architecture`, or any other field. Does not write a file.
+fn parse_direct(bytes: &[u8]) -> Result<Vec<CatalogRow>, CatalogError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|err| CatalogError::DirectJson {
+        detail: err.to_string(),
+    })?;
+    let Some(data) = value.get("data").and_then(Value::as_array) else {
+        return Err(CatalogError::DirectShape {
+            detail: "the catalog JSON has no data array".to_owned(),
+        });
+    };
+    let mut rows = Vec::with_capacity(data.len());
+    for (index, item) in data.iter().enumerate() {
+        rows.push(parse_direct_row(index, item)?);
+    }
+    Ok(rows)
+}
+
+/// Parse one direct `data` element. Other fields on the object are ignored.
+fn parse_direct_row(index: usize, item: &Value) -> Result<CatalogRow, CatalogError> {
+    let Some(object) = item.as_object() else {
+        return Err(CatalogError::Row {
+            index,
+            detail: "is not an object".to_owned(),
+        });
+    };
+    let id = required_string(object.get("id"), index, "id")?;
+    if id.is_empty() {
+        return Err(CatalogError::Row {
+            index,
+            detail: "has no id".to_owned(),
+        });
+    }
+    let name = match optional_string(object.get("name"), index, "name")? {
+        Some(text) => text.trim().to_owned(),
+        None => String::new(),
+    };
+    Ok(CatalogRow {
+        id,
+        name,
+        description: String::new(),
+        context_length: optional_context_window(object.get("context_window"), index)?,
+        sees_image: direct_sees_image(object.get("input_modalities"), index)?,
+    })
+}
+
+/// Read `context_window` when it is an integer, null, or absent.
+///
+/// Zero and other non-positive integers are kept. A present non-integer fails the row.
+fn optional_context_window(
+    value: Option<&Value>,
+    index: usize,
+) -> Result<Option<i64>, CatalogError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => {
+            if let Some(integer) = number.as_i64() {
+                return Ok(Some(integer));
+            }
+            if let Some(unsigned) = number.as_u64() {
+                return i64::try_from(unsigned).map(Some).map_err(|_| CatalogError::Row {
+                    index,
+                    detail: "context_window does not fit in an i64".to_owned(),
+                });
+            }
+            Err(CatalogError::Row {
+                index,
+                detail: "context_window is not an integer".to_owned(),
+            })
+        }
+        Some(_) => Err(CatalogError::Row {
+            index,
+            detail: "context_window is not an integer".to_owned(),
+        }),
+    }
+}
+
+/// Whether top-level `input_modalities` contains `image`.
+///
+/// Absence and null are no image. A present non-array fails the row.
+fn direct_sees_image(value: Option<&Value>, index: usize) -> Result<bool, CatalogError> {
+    match value {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Array(list)) => Ok(list.iter().any(|item| {
+            item.as_str()
+                .is_some_and(|modality| modality.eq_ignore_ascii_case("image"))
+        })),
+        Some(_) => Err(CatalogError::Row {
+            index,
+            detail: "input_modalities is not an array".to_owned(),
+        }),
+    }
 }
 
 /// Read a required string field.
@@ -1403,6 +1688,429 @@ mod tests {
         assert_eq!(request.method(), "GET");
         assert_eq!(request.url(), url);
         assert_eq!(request.url(), "https://example.invalid/v1/models");
+    }
+
+    const DIRECT_FIXTURE: &str = r#"{
+        "object": "list",
+        "data": [
+            {
+                "id": "acme-vision",
+                "object": "model",
+                "owned_by": "acme",
+                "name": "Acme Vision",
+                "description": "marker-not-read",
+                "context_window": 32768,
+                "context_length": 1,
+                "max_output_tokens": 8192,
+                "input_modalities": ["text", "Image"],
+                "output_modalities": ["text"],
+                "architecture": { "input_modalities": ["text"] },
+                "effort": "high",
+                "api_capabilities": ["chat"]
+            },
+            {
+                "id": "acme-text",
+                "name": "   ",
+                "context_window": 4096,
+                "input_modalities": ["text"]
+            },
+            {
+                "id": "acme-windowless",
+                "context_length": 128000,
+                "architecture": { "input_modalities": ["image"] }
+            },
+            {
+                "id": "acme-zero",
+                "name": "",
+                "context_window": 0
+            },
+            {
+                "id": "acme-null",
+                "context_window": null,
+                "input_modalities": null
+            }
+        ]
+    }"#;
+
+    fn selected(catalog_id: &str) -> Cartridge {
+        cartridge(Some(catalog_id)).expect("the named catalog id should select a cartridge")
+    }
+
+    fn message_has_no_openrouter_request(error: &CatalogError) -> String {
+        let message = error.to_string();
+        assert!(
+            !message.to_ascii_lowercase().contains("openrouter"),
+            "a direct catalog error must not ask for an OpenRouter document; message: {message}"
+        );
+        message
+    }
+
+    #[test]
+    fn cartridge_selects_only_the_two_catalog_ids() {
+        assert_eq!(
+            selected("openrouter-models"),
+            Cartridge::OpenRouter,
+            "openrouter-models is the OpenRouter cartridge"
+        );
+        assert_eq!(
+            selected("deepseek-list-models"),
+            Cartridge::DeepSeek,
+            "deepseek-list-models is the direct cartridge"
+        );
+    }
+
+    #[test]
+    fn cartridge_refuses_a_missing_blank_or_unknown_id_and_does_not_select_openrouter() {
+        let missing = cartridge(None).expect_err("a missing catalog id should refuse");
+        assert_eq!(missing, CartridgeError::Missing);
+        assert!(
+            missing.to_string().contains("missing"),
+            "the missing-id error should say the id is missing; message: {missing}"
+        );
+
+        let blank = cartridge(Some("")).expect_err("a blank catalog id should refuse");
+        assert_eq!(blank, CartridgeError::Missing);
+
+        let unknown =
+            cartridge(Some("not-a-cartridge")).expect_err("an unknown catalog id should refuse");
+        assert_eq!(
+            unknown,
+            CartridgeError::Unknown {
+                id: "not-a-cartridge".to_owned(),
+            }
+        );
+        assert!(
+            !matches!(
+                cartridge(Some("not-a-cartridge")),
+                Ok(Cartridge::OpenRouter)
+            ),
+            "not-a-cartridge must not select openrouter-models"
+        );
+        let message = unknown.to_string();
+        assert!(
+            message.contains("not-a-cartridge"),
+            "the unknown-id error should name that id; message: {message}"
+        );
+        assert!(
+            message.contains("not selected"),
+            "the unknown-id error should say OpenRouter was not selected; message: {message}"
+        );
+    }
+
+    #[test]
+    fn direct_document_keeps_id_name_window_and_image_and_ignores_openrouter_fields() {
+        let rows = selected("deepseek-list-models")
+            .parse(DIRECT_FIXTURE.as_bytes())
+            .expect("the direct fixture should parse");
+        assert_eq!(rows.len(), 5, "a window-less row is still a row");
+
+        let vision = row(&rows, "acme-vision");
+        assert_eq!(vision.name(), "Acme Vision");
+        assert_eq!(vision.display_name(), "Acme Vision");
+        assert_eq!(vision.description(), "");
+        assert_eq!(vision.context_length(), Some(32768));
+        assert!(
+            vision.sees_image(),
+            "Image in input_modalities should count, regardless of case"
+        );
+        assert_eq!(vision.as_catalog_model().context_window, Some(32768));
+        assert!(vision.as_catalog_model().sees_image);
+
+        let text = row(&rows, "acme-text");
+        assert_eq!(text.name(), "");
+        assert_eq!(text.display_name(), "acme-text");
+        assert_eq!(text.as_catalog_model().name, None);
+        assert_eq!(text.context_length(), Some(4096));
+        assert!(!text.sees_image());
+
+        let windowless = row(&rows, "acme-windowless");
+        assert!(
+            windowless.context_length().is_none_or(|window| window <= 0),
+            "context_length without context_window is not a positive window; got {:?}",
+            windowless.context_length()
+        );
+        assert!(
+            !windowless.sees_image(),
+            "architecture.input_modalities must not set sees_image"
+        );
+
+        let zero = row(&rows, "acme-zero");
+        assert_eq!(zero.name(), "");
+        assert_eq!(
+            zero.context_length(),
+            Some(0),
+            "zero stays a non-positive window"
+        );
+        assert!(zero.context_length().is_none_or(|window| window <= 0));
+
+        let absent = row(&rows, "acme-null");
+        assert_eq!(absent.context_length(), None);
+        assert!(!absent.sees_image());
+    }
+
+    #[test]
+    fn openrouter_cartridge_ignores_context_window_and_top_level_input_modalities() {
+        let bytes = br#"{
+            "data": [{
+                "id": "acme-vision",
+                "name": "Acme Vision",
+                "context_window": 32768,
+                "input_modalities": ["image"]
+            }]
+        }"#;
+        let openrouter = selected("openrouter-models");
+        let rows = openrouter
+            .parse(bytes)
+            .expect("a data array should still parse as OpenRouter");
+        let direct = parse_catalog(bytes).expect("parse_catalog should accept the same bytes");
+        assert_eq!(
+            rows, direct,
+            "the OpenRouter cartridge should return parse_catalog rows"
+        );
+        let only = rows.first().expect("the document should contain one row");
+        assert_eq!(only.id(), "acme-vision");
+        assert!(
+            only.context_length().is_none_or(|window| window <= 0),
+            "context_window must not become a positive OpenRouter window; got {:?}",
+            only.context_length()
+        );
+        assert!(
+            !only.sees_image(),
+            "top-level input_modalities must not set sees_image"
+        );
+    }
+
+    #[test]
+    fn deepseek_cartridge_ignores_context_length_and_architecture_on_an_openrouter_document() {
+        let rows = selected("deepseek-list-models")
+            .parse(FIXTURE.as_bytes())
+            .expect("an OpenRouter data array should parse as a direct catalog");
+        let turbo = row(&rows, "gpt-4-turbo");
+        assert_eq!(turbo.id(), "gpt-4-turbo");
+        assert_eq!(turbo.name(), "GPT-4 Turbo");
+        assert_eq!(
+            turbo.description(),
+            "",
+            "description is not a direct-catalog field"
+        );
+        assert!(
+            turbo.context_length().is_none_or(|window| window <= 0),
+            "context_length 128000 must not become a positive window; got {:?}",
+            turbo.context_length()
+        );
+        assert!(
+            !turbo.sees_image(),
+            "architecture.input_modalities must not set sees_image"
+        );
+    }
+
+    #[test]
+    fn a_non_integer_context_window_fails_that_direct_row() {
+        let parser = selected("deepseek-list-models");
+        let bytes = br#"{
+            "data": [
+                {"id": "acme-ok", "context_window": 8},
+                {"id": "acme-bad", "context_window": "32768"}
+            ]
+        }"#;
+        let error = parser
+            .parse(bytes)
+            .expect_err("a string context_window should fail that row");
+        let message = message_has_no_openrouter_request(&error);
+        assert!(
+            message.contains("data[1]"),
+            "the error should name the failing row; message: {message}"
+        );
+        assert!(
+            message.contains("context_window"),
+            "the error should name context_window; message: {message}"
+        );
+
+        let fraction = parser
+            .parse(br#"{"data":[{"id":"acme","context_window":1.5}]}"#)
+            .expect_err("a fractional context_window should fail that row");
+        let fraction_message = message_has_no_openrouter_request(&fraction);
+        assert!(
+            fraction_message.contains("not an integer"),
+            "a fraction is not an integer window; message: {fraction_message}"
+        );
+    }
+
+    #[test]
+    fn direct_catalog_errors_do_not_ask_for_an_openrouter_document() {
+        let parser = selected("deepseek-list-models");
+        let cases: [(&[u8], &str); 3] = [
+            (b"{", "could not be parsed"),
+            (br#"{"models":[]}"#, "data array"),
+            (br#"{"data":[{}]}"#, "no id"),
+        ];
+        for (bytes, needle) in cases {
+            let error = parser
+                .parse(bytes)
+                .expect_err("this direct document should fail");
+            let message = message_has_no_openrouter_request(&error);
+            assert!(
+                message.contains(needle),
+                "the error should name the failure; needle {needle}; message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_slug_derives_or_leaf_unless_as_is_present() {
+        let openrouter = selected("openrouter-models");
+        assert_eq!(
+            openrouter
+                .slug("z-ai/glm-5.3", None)
+                .expect("an OpenRouter id should derive a slug"),
+            "or-glm-5-3"
+        );
+        assert_eq!(
+            openrouter
+                .slug("z-ai/glm-5.3", Some("chosen"))
+                .expect("a grammatical --as slug should be kept"),
+            "chosen"
+        );
+        let error = openrouter
+            .slug("z-ai/glm-5.3", Some("bad slug"))
+            .expect_err("a space is not a slug");
+        assert!(
+            matches!(error, RefuseReason::InvalidSlug { ref slug } if slug == "bad slug"),
+            "an explicit slug should be refused as itself; got {error}"
+        );
+    }
+
+    #[test]
+    fn deepseek_slug_uses_the_id_and_a_slash_requires_as_without_a_leaf() {
+        let deepseek = selected("deepseek-list-models");
+        assert_eq!(
+            deepseek
+                .slug("deepseek-v4-pro", None)
+                .expect("a grammatical id should be the slug"),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            deepseek
+                .slug("AcmeText", None)
+                .expect("letters should be a slug and should keep their case"),
+            "AcmeText"
+        );
+        assert_eq!(
+            deepseek
+                .slug("vendor/model", Some("direct-slug"))
+                .expect("--as should replace a slash id"),
+            "direct-slug"
+        );
+        for id in ["vendor/model", "z-ai/glm-5.3", "has space", "-leading", ""] {
+            let error = deepseek
+                .slug(id, None)
+                .expect_err("this id is not a slug and must not grow a leaf");
+            assert!(
+                matches!(error, RefuseReason::InvalidSlug { ref slug } if slug == id),
+                "id {id:?} should be InvalidSlug of itself, not a derived leaf; got {error}"
+            );
+        }
+        let explicit = deepseek
+            .slug("deepseek-v4-pro", Some("bad slug"))
+            .expect_err("a space in --as is not a slug");
+        assert!(
+            matches!(explicit, RefuseReason::InvalidSlug { ref slug } if slug == "bad slug"),
+            "--as should be refused as itself; got {explicit}"
+        );
+    }
+
+    #[test]
+    fn deepseek_base_url_does_not_cache_as_models_json() {
+        let dir = Path::new("cache");
+        let with_slash = models_url("https://api.deepseek.com/");
+        let without_slash = models_url("https://api.deepseek.com");
+        assert_eq!(
+            with_slash, without_slash,
+            "one trailing slash is the same models URL"
+        );
+        let path = cache_file_for(dir, &without_slash);
+        let name = path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .expect("the cache file name should be Unicode");
+        let computed = format!("models-{}.json", lowercase_hex(&without_slash));
+        assert_eq!(
+            name, computed,
+            "the other cache name is computed from the URL bytes and is not a hardcoded hex"
+        );
+        assert_ne!(name, "models.json");
+        assert_ne!(path, cache_file(dir));
+        let openrouter = models_url(COMPILED_BASE);
+        assert_eq!(openrouter, MODELS_URL);
+        assert_eq!(
+            cache_file_for(dir, &openrouter),
+            cache_file(dir),
+            "the OpenRouter base caches as models.json because the URL equals MODELS_URL"
+        );
+    }
+
+    #[test]
+    fn prepare_cached_body_returns_fresh_bytes_without_parsing() {
+        let dir = temp_cache("body");
+        let base = "https://api.deepseek.com";
+        let path = cache_file_for(&dir, &models_url("https://api.deepseek.com/"));
+        let bytes = b"not-json-but-fresh";
+        fs::write(&path, bytes).expect("the fresh body fixture should be written");
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        set_cache_mtime(&path, modified);
+        let now = modified + Duration::from_secs(30 * 60);
+        let prepared = prepare_cached_body(&dir, now, false, "", base)
+            .expect("a fresh cache body should load without an API key");
+        match prepared {
+            CachedBodyOrFetch::Cached(got) => assert_eq!(got, bytes),
+            CachedBodyOrFetch::Fetch(request) => {
+                panic!(
+                    "a fresh cache body must not build a download; request url {}",
+                    request.url()
+                );
+            }
+        }
+        assert!(
+            !cache_file(&dir).exists(),
+            "a DeepSeek base must not read or create models.json"
+        );
+        let load = prepare_cached_load(&dir, now, false, "", base)
+            .expect_err("the same fresh bytes are not catalog JSON, so the parser should refuse");
+        assert!(
+            matches!(load, CatalogError::CacheInvalid { .. }),
+            "prepare_cached_load still parses; got {load}"
+        );
+        remove_temp(&dir);
+    }
+
+    #[test]
+    fn prepare_cached_body_plans_the_same_fetch_when_the_cache_is_stale() {
+        let dir = temp_cache("body-stale");
+        let base = "https://api.deepseek.com/";
+        let url = models_url(base);
+        let path = cache_file_for(&dir, &url);
+        fs::write(&path, b"stale").expect("the stale body fixture should be written");
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        set_cache_mtime(&path, modified);
+        let now = modified + CACHE_FRESH;
+        let prepared = prepare_cached_body(&dir, now, false, "test-key", base)
+            .expect("a stale cache with a key should plan a download");
+        match prepared {
+            CachedBodyOrFetch::Fetch(request) => {
+                assert_eq!(request.method(), "GET");
+                assert_eq!(request.url(), url);
+                assert_eq!(request.authorization(), "Bearer test-key");
+                assert_ne!(
+                    cache_file_for(&dir, request.url()),
+                    cache_file(&dir),
+                    "the fetch URL must not be the models.json cache"
+                );
+            }
+            CachedBodyOrFetch::Cached(bytes) => {
+                panic!("a one-hour-old body must not be the answer; bytes {bytes:?}")
+            }
+        }
+        remove_temp(&dir);
     }
 
     fn lowercase_hex(text: &str) -> String {

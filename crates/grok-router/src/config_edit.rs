@@ -346,7 +346,7 @@ pub fn derive_slug(provider_id: &str) -> Result<String, RefuseReason> {
         });
     }
     let slug = format!("or-{normalized}");
-    check_slug(&slug)?;
+    require_slug(&slug)?;
     Ok(slug)
 }
 
@@ -417,7 +417,7 @@ pub fn render_block(
     model: CatalogModel<'_>,
     base_url: &str,
 ) -> Result<String, RefuseReason> {
-    check_slug(slug)?;
+    require_slug(slug)?;
     if model.id.is_empty() {
         return Err(RefuseReason::EmptyProviderId);
     }
@@ -521,7 +521,7 @@ pub fn insert_model(
 /// Returns [`Refused`] and the original text when the slug is unknown or the document is unsafe to edit.
 pub fn set_default(config: &str, slug: &str) -> Result<String, Refused> {
     let settings = require_settings(config)?;
-    if let Err(reason) = check_slug(slug) {
+    if let Err(reason) = require_slug(slug) {
         return Err(refuse(config, reason));
     }
     let root = read_config(config)?;
@@ -556,7 +556,7 @@ pub fn set_default(config: &str, slug: &str) -> Result<String, Refused> {
 /// or a document the splice will not rewrite.
 pub fn remove_model(config: &str, slug: &str) -> Result<String, Refused> {
     let settings = require_settings(config)?;
-    if let Err(reason) = check_slug(slug) {
+    if let Err(reason) = require_slug(slug) {
         return Err(refuse(config, reason));
     }
     let root = read_config(config)?;
@@ -715,7 +715,7 @@ fn require_settings(config: &str) -> Result<RouterSettings, Refused> {
 fn resolved_slug(provider_id: &str, slug: Option<&str>) -> Result<String, RefuseReason> {
     match slug {
         Some(explicit) => {
-            check_slug(explicit)?;
+            require_slug(explicit)?;
             Ok(explicit.to_owned())
         }
         None => derive_slug(provider_id),
@@ -723,7 +723,14 @@ fn resolved_slug(provider_id: &str, slug: Option<&str>) -> Result<String, Refuse
 }
 
 /// Require the slug shape shared by headers, defaults, and `--as`.
-fn check_slug(slug: &str) -> Result<(), RefuseReason> {
+///
+/// The slug must start with an ASCII letter or digit. The rest may contain
+/// only ASCII letters, digits, dots, underscores, and hyphens.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSlug`] when `slug` does not match that grammar.
+pub fn require_slug(slug: &str) -> Result<(), RefuseReason> {
     let mut chars = slug.chars();
     let Some(first) = chars.next() else {
         return Err(RefuseReason::InvalidSlug {
@@ -997,7 +1004,7 @@ fn display_name<'a>(model: CatalogModel<'a>) -> &'a str {
 
 /// Header for `slug`. Dotted and other non-bare slugs are quoted so they stay one key.
 fn model_header(slug: &str) -> Result<String, RefuseReason> {
-    check_slug(slug)?;
+    require_slug(slug)?;
     if is_bare_slug(slug) {
         Ok(format!("[model.{slug}]"))
     } else {
@@ -1090,7 +1097,7 @@ fn model_slug_from_header(name: &str) -> Result<Option<String>, RefuseReason> {
     };
     if rest.starts_with('"') {
         let slug = toml_unquote(rest)?;
-        check_slug(&slug)?;
+        require_slug(&slug)?;
         return Ok(Some(slug));
     }
     if is_bare_slug(rest) {
