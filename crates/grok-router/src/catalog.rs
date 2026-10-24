@@ -280,15 +280,6 @@ pub enum CacheChoice {
     Fetch,
 }
 
-/// A fresh parsed cache, or a request the caller still has to send.
-#[derive(Debug)]
-pub enum CachedOrFetch {
-    /// Rows from a cache younger than one hour.
-    Cached(Vec<CatalogRow>),
-    /// GET the caller should perform. Write the body only after it is non-empty.
-    Fetch(CatalogRequest),
-}
-
 /// Zero matches, or more than one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
@@ -521,9 +512,7 @@ fn deepseek_slug(model_id: &str, explicit: Option<&str>) -> Result<String, Refus
 /// Each term is tested on its own; a term does not have to sit in all three fields.
 #[must_use]
 pub fn matching<'a>(rows: &'a [CatalogRow], terms: &[&str]) -> Vec<&'a CatalogRow> {
-    rows.iter()
-        .filter(|row| row.matches_all(terms))
-        .collect()
+    rows.iter().filter(|row| row.matches_all(terms)).collect()
 }
 
 /// One exact id, or one unique term match.
@@ -566,35 +555,6 @@ pub fn resolve<'a>(rows: &'a [CatalogRow], terms: &[&str]) -> Result<&'a Catalog
     }
 }
 
-/// Read a fresh cache for `base_url`, or build the GET that should replace it.
-///
-/// The path is [`cache_file_for`] of [`models_url`]. Does not write, does not
-/// call the network, and does not read the clock. `now` is the caller's instant.
-/// A cache whose modification time is in the future is not used.
-///
-/// # Errors
-///
-/// Returns [`CatalogError::MissingKey`] when a download is required and `api_key` is blank.
-/// Returns [`CatalogError::CacheInvalid`] when a fresh cache is not catalog JSON.
-/// Returns [`CatalogError::CacheIo`] when an existing cache file cannot be read.
-pub fn prepare_cached_load(
-    cache_dir: &Path,
-    now: SystemTime,
-    refresh: bool,
-    api_key: &str,
-    base_url: &str,
-) -> Result<CachedOrFetch, CatalogError> {
-    match fresh_bytes_or_fetch(cache_dir, now, refresh, api_key, base_url)? {
-        FreshBytesOrFetch::Fresh { path, bytes } => parse_catalog(&bytes)
-            .map(CachedOrFetch::Cached)
-            .map_err(|err| CatalogError::CacheInvalid {
-                path: path.display().to_string(),
-                detail: err.to_string(),
-            }),
-        FreshBytesOrFetch::Fetch(request) => Ok(CachedOrFetch::Fetch(request)),
-    }
-}
-
 /// Fresh cache bytes, or a request the caller still has to send.
 ///
 /// The bytes are not parsed.
@@ -625,15 +585,15 @@ pub fn prepare_cached_body(
     base_url: &str,
 ) -> Result<CachedBodyOrFetch, CatalogError> {
     match fresh_bytes_or_fetch(cache_dir, now, refresh, api_key, base_url)? {
-        FreshBytesOrFetch::Fresh { bytes, .. } => Ok(CachedBodyOrFetch::Cached(bytes)),
+        FreshBytesOrFetch::Fresh { bytes } => Ok(CachedBodyOrFetch::Cached(bytes)),
         FreshBytesOrFetch::Fetch(request) => Ok(CachedBodyOrFetch::Fetch(request)),
     }
 }
 
 /// A fresh non-empty cache body, or the GET that should replace it.
 enum FreshBytesOrFetch {
-    /// Bytes at `path`, younger than one hour. Not parsed.
-    Fresh { path: PathBuf, bytes: Vec<u8> },
+    /// Bytes younger than one hour. Not parsed.
+    Fresh { bytes: Vec<u8> },
     /// GET the caller should perform.
     Fetch(CatalogRequest),
 }
@@ -654,7 +614,7 @@ fn fresh_bytes_or_fetch(
     if !refresh {
         if let Some((bytes, age)) = read_cache_age(&path, now)? {
             if !bytes.is_empty() && cache_choice(age, false) == CacheChoice::Use {
-                return Ok(FreshBytesOrFetch::Fresh { path, bytes });
+                return Ok(FreshBytesOrFetch::Fresh { bytes });
             }
         }
     }
@@ -752,7 +712,11 @@ fn encode_hex(bytes: &[u8]) -> String {
 /// # Errors
 ///
 /// Returns [`CatalogError::EmptyCacheWrite`] or [`CatalogError::CacheIo`].
-pub fn write_cache(cache_dir: &Path, base_url: &str, bytes: &[u8]) -> Result<PathBuf, CatalogError> {
+pub fn write_cache(
+    cache_dir: &Path,
+    base_url: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, CatalogError> {
     if bytes.is_empty() {
         return Err(CatalogError::EmptyCacheWrite);
     }
@@ -767,9 +731,7 @@ pub fn write_cache(cache_dir: &Path, base_url: &str, bytes: &[u8]) -> Result<Pat
             Ok(()) => Err(rename),
             Err(remove_err) => Err(CatalogError::CacheIo {
                 path: temporary.display().to_string(),
-                detail: format!(
-                    "{rename}; also failed to remove the temporary file: {remove_err}"
-                ),
+                detail: format!("{rename}; also failed to remove the temporary file: {remove_err}"),
             }),
         };
     }
@@ -871,10 +833,12 @@ fn optional_context_window(
                 return Ok(Some(integer));
             }
             if let Some(unsigned) = number.as_u64() {
-                return i64::try_from(unsigned).map(Some).map_err(|_| CatalogError::Row {
-                    index,
-                    detail: "context_window does not fit in an i64".to_owned(),
-                });
+                return i64::try_from(unsigned)
+                    .map(Some)
+                    .map_err(|_| CatalogError::Row {
+                        index,
+                        detail: "context_window does not fit in an i64".to_owned(),
+                    });
             }
             Err(CatalogError::Row {
                 index,
@@ -952,10 +916,12 @@ fn optional_context_length(
                 return Ok(Some(integer));
             }
             if let Some(unsigned) = number.as_u64() {
-                return i64::try_from(unsigned).map(Some).map_err(|_| CatalogError::Row {
-                    index,
-                    detail: "context_length does not fit in an i64".to_owned(),
-                });
+                return i64::try_from(unsigned)
+                    .map(Some)
+                    .map_err(|_| CatalogError::Row {
+                        index,
+                        detail: "context_length does not fit in an i64".to_owned(),
+                    });
             }
             Err(CatalogError::Row {
                 index,
@@ -1283,15 +1249,14 @@ mod tests {
             }]
         }"#;
         let rows = parse_catalog(bytes).expect("the text-only fixture should parse");
-        let only = rows
-            .first()
-            .expect("the fixture should contain one row");
+        let only = rows.first().expect("the fixture should contain one row");
         assert!(!only.sees_image());
     }
 
     #[test]
     fn parse_rejects_a_document_without_a_data_array() {
-        let error = parse_catalog(br#"{"models":[]}"#).expect_err("a missing data array should fail");
+        let error =
+            parse_catalog(br#"{"models":[]}"#).expect_err("a missing data array should fail");
         let message = error.to_string();
         assert!(
             message.contains("data array"),
@@ -1305,7 +1270,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_a_row_without_an_id_and_names_the_index() {
-        let error = parse_catalog(br#"{"data":[{}]}"#).expect_err("a row without an id should fail");
+        let error =
+            parse_catalog(br#"{"data":[{}]}"#).expect_err("a row without an id should fail");
         let message = error.to_string();
         assert!(
             message.contains("data[0]"),
@@ -1333,8 +1299,8 @@ mod tests {
 
     #[test]
     fn an_empty_key_refuses_the_request_and_names_the_next_step() {
-        let error = catalog_request("  ", MODELS_URL)
-            .expect_err("a blank key must not build a request");
+        let error =
+            catalog_request("  ", MODELS_URL).expect_err("a blank key must not build a request");
         assert_eq!(error, CatalogError::MissingKey);
         let message = error.to_string();
         assert!(
@@ -1394,11 +1360,15 @@ mod tests {
             .expect("the test should set the cache mtime");
         let before = fs::read(&path).expect("the cache fixture should still be readable");
         let now = modified + Duration::from_secs(30 * 60);
-        let prepared = prepare_cached_load(&dir, now, false, "", COMPILED_BASE)
+        let prepared = prepare_cached_body(&dir, now, false, "", COMPILED_BASE)
             .expect("a fresh cache should load without an API key");
         match prepared {
-            CachedOrFetch::Cached(rows) => assert_eq!(rows.len(), 3),
-            CachedOrFetch::Fetch(request) => {
+            CachedBodyOrFetch::Cached(bytes) => {
+                let rows = parse_catalog(&bytes)
+                    .expect("fresh OpenRouter cache bytes should parse as a catalog");
+                assert_eq!(rows.len(), 3);
+            }
+            CachedBodyOrFetch::Fetch(request) => {
                 panic!("a fresh cache must not build a download; request {request:?}")
             }
         }
@@ -1420,15 +1390,17 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let now = modified + CACHE_FRESH;
-        let prepared = prepare_cached_load(&dir, now, false, "test-key", COMPILED_BASE)
+        let prepared = prepare_cached_body(&dir, now, false, "test-key", COMPILED_BASE)
             .expect("a stale cache with a key should plan a download");
         match prepared {
-            CachedOrFetch::Fetch(request) => {
+            CachedBodyOrFetch::Fetch(request) => {
                 assert_eq!(request.method(), "GET");
                 assert_eq!(request.url(), "https://openrouter.ai/api/v1/models");
                 assert_eq!(request.authorization(), "Bearer test-key");
             }
-            CachedOrFetch::Cached(_) => panic!("a one-hour-old cache must not be the answer"),
+            CachedBodyOrFetch::Cached(bytes) => {
+                panic!("a one-hour-old cache must not be the answer; bytes {bytes:?}")
+            }
         }
         remove_temp(&dir);
     }
@@ -1446,10 +1418,10 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let now = modified + Duration::from_secs(1);
-        let prepared = prepare_cached_load(&dir, now, true, "test-key", COMPILED_BASE)
+        let prepared = prepare_cached_body(&dir, now, true, "test-key", COMPILED_BASE)
             .expect("refresh with a key should plan a download");
         assert!(
-            matches!(prepared, CachedOrFetch::Fetch(_)),
+            matches!(prepared, CachedBodyOrFetch::Fetch(_)),
             "refresh must ignore a fresh cache"
         );
         remove_temp(&dir);
@@ -1469,7 +1441,7 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let now = modified + CACHE_FRESH + Duration::from_secs(5);
-        let error = prepare_cached_load(&dir, now, false, "", COMPILED_BASE)
+        let error = prepare_cached_body(&dir, now, false, "", COMPILED_BASE)
             .expect_err("a stale cache without a key must not download");
         assert_eq!(error, CatalogError::MissingKey);
         let after = fs::read(&path).expect("the stale cache should still exist");
@@ -1481,7 +1453,7 @@ mod tests {
     fn a_missing_cache_without_a_key_does_not_create_a_file() {
         let dir = temp_cache("absent");
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let error = prepare_cached_load(&dir, now, false, "", COMPILED_BASE)
+        let error = prepare_cached_body(&dir, now, false, "", COMPILED_BASE)
             .expect_err("a missing cache without a key must fail");
         assert_eq!(error, CatalogError::MissingKey);
         assert!(
@@ -1494,8 +1466,8 @@ mod tests {
     #[test]
     fn empty_cache_bytes_are_not_written() {
         let dir = temp_cache("empty");
-        let error = write_cache(&dir, COMPILED_BASE, b"")
-            .expect_err("an empty body must not be stored");
+        let error =
+            write_cache(&dir, COMPILED_BASE, b"").expect_err("an empty body must not be stored");
         assert_eq!(error, CatalogError::EmptyCacheWrite);
         assert!(
             !cache_file(&dir).exists(),
@@ -1604,10 +1576,12 @@ mod tests {
         set_cache_mtime(&custom, modified);
         set_cache_mtime(&decoy, modified);
         let now = modified + Duration::from_secs(30 * 60);
-        let prepared = prepare_cached_load(&dir, now, false, "", "https://example.invalid/v1/")
+        let prepared = prepare_cached_body(&dir, now, false, "", "https://example.invalid/v1/")
             .expect("a fresh cache for the derived custom URL should load");
         match prepared {
-            CachedOrFetch::Cached(rows) => {
+            CachedBodyOrFetch::Cached(bytes) => {
+                let rows = parse_catalog(&bytes)
+                    .expect("the custom cache bytes should parse as an OpenRouter catalog");
                 assert!(
                     rows.iter().any(|row| row.id() == "gpt-4"),
                     "the custom cache should supply its own rows"
@@ -1617,7 +1591,7 @@ mod tests {
                     "models.json must not answer a different models URL"
                 );
             }
-            CachedOrFetch::Fetch(request) => {
+            CachedBodyOrFetch::Fetch(request) => {
                 panic!(
                     "a fresh custom cache must not build a download; request url {}",
                     request.url()
@@ -2074,11 +2048,10 @@ mod tests {
             !cache_file(&dir).exists(),
             "a DeepSeek base must not read or create models.json"
         );
-        let load = prepare_cached_load(&dir, now, false, "", base)
-            .expect_err("the same fresh bytes are not catalog JSON, so the parser should refuse");
+        let parsed = parse_catalog(bytes);
         assert!(
-            matches!(load, CatalogError::CacheInvalid { .. }),
-            "prepare_cached_load still parses; got {load}"
+            parsed.is_err(),
+            "the fresh bytes are not catalog JSON, so parse_catalog should refuse; got {parsed:?}"
         );
         remove_temp(&dir);
     }

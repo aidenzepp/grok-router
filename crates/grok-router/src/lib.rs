@@ -47,7 +47,7 @@ pub enum Commands {
     /// List configured models and the saved default. This command does not modify the config.
     #[command(verbatim_doc_comment)]
     List(commands::list::ListArgs),
-    /// Search the OpenRouter catalog. This command does not modify the config.
+    /// Search the selected provider catalog. This command does not modify the config.
     #[command(verbatim_doc_comment)]
     Search(commands::search::SearchArgs),
     /// Add one model from the selected provider record. This command writes unless --dry-run is set.

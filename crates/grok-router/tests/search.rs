@@ -7,16 +7,19 @@
     )
 )]
 
-//! `grok-router search` reads a catalog fixture or the cache for a resolved base.
+//! `grok-router search` resolves one `[router]` provider record, selects its
+//! cartridge, and then reads a catalog fixture or that record's cache.
 //!
-//! `--catalog-file` returns before the config is read. Without it, search reads
-//! `--config` or `${GROK_HOME:-$HOME/.grok}/config.toml` and does not create
-//! that file. These tests do not call the network and do not read
-//! `OPENROUTER_API_KEY`. Cache and config paths point at a temp directory.
+//! `--catalog-file` does not skip resolution and does not GET. A missing
+//! config file is not created and is not the compiled OpenRouter base. These
+//! tests do not call the network and do not read provider env vars. Cache and
+//! config paths point at a temp directory.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const COMPILED_URL: &str = "https://openrouter.ai/api/v1";
 
 const FIXTURE: &str = r#"{
     "data": [
@@ -37,7 +40,30 @@ const FIXTURE: &str = r#"{
     ]
 }"#;
 
-fn remove_temp(path: &std::path::Path) {
+const DEEPSEEK_DOC: &str = r#"{
+    "data": [
+        {
+            "id": "deepseek-v4-pro",
+            "name": "DeepSeek V4 Pro",
+            "context_window": 128000,
+            "input_modalities": ["text"]
+        }
+    ]
+}"#;
+
+const HEX_CATALOG: &str = r#"{
+    "data": [
+        {
+            "id": "hex-cache/only",
+            "name": "Hex Cache",
+            "description": "row stored for the custom base",
+            "context_length": 1024,
+            "architecture": { "input_modalities": ["text"] }
+        }
+    ]
+}"#;
+
+fn remove_temp(path: &Path) {
     match fs::remove_dir_all(path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -49,28 +75,24 @@ fn remove_temp(path: &std::path::Path) {
 }
 
 fn temp_root(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "grok-router-search-{label}-{}",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("grok-router-search-{label}-{}", std::process::id()));
     remove_temp(&path);
     fs::create_dir_all(&path).expect("the temp search directory should be created");
     path
 }
 
-fn write_fixture(dir: &std::path::Path) -> PathBuf {
-    let path = dir.join("models.json");
-    fs::write(&path, FIXTURE).expect("the catalog fixture should be written");
+fn write_named(dir: &Path, name: &str, text: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, text).expect("the named fixture should be written");
     path
 }
 
-fn write_config(dir: &std::path::Path, text: &str) -> PathBuf {
-    let path = dir.join("config.toml");
-    fs::write(&path, text).expect("the config fixture should be written");
-    path
+fn write_config(dir: &Path, text: &str) -> PathBuf {
+    write_named(dir, "config.toml", text)
 }
 
-fn mark_fresh(path: &std::path::Path) {
+fn mark_fresh(path: &Path) {
     let file = fs::File::options()
         .write(true)
         .open(path)
@@ -82,7 +104,7 @@ fn mark_fresh(path: &std::path::Path) {
         .expect("the cache fixture should be marked younger than one hour");
 }
 
-fn assert_dir_empty(path: &std::path::Path) {
+fn assert_dir_empty(path: &Path) {
     let mut entries = fs::read_dir(path).expect("the cache directory should be readable");
     assert!(
         entries.next().is_none(),
@@ -91,11 +113,43 @@ fn assert_dir_empty(path: &std::path::Path) {
     );
 }
 
-fn run(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+fn utf8_arg(path: &Path, why: &str) -> String {
+    path.to_str().expect(why).to_owned()
+}
+
+fn provider_record(
+    default_line: &str,
+    name: &str,
+    base: &str,
+    env_key: &str,
+    catalog: Option<&str>,
+) -> String {
+    let catalog_line = match catalog {
+        Some(id) => format!("catalog = \"{id}\"\n"),
+        None => String::new(),
+    };
+    format!(
+        "[router]\n{default_line}\n[router.provider.{name}]\nbase_url = \"{base}\"\nenv_key = \"{env_key}\"\n{catalog_line}"
+    )
+}
+
+fn openrouter_config() -> String {
+    provider_record(
+        "default_provider = \"openrouter\"\n",
+        "openrouter",
+        COMPILED_URL,
+        "OPENROUTER_API_KEY",
+        Some("openrouter-models"),
+    )
+}
+
+fn run(dir: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_grok-router"));
     command
         .args(args)
         .env_remove("OPENROUTER_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env_remove("ZAI_API_KEY")
         .env("HOME", dir)
         .env("NO_COLOR", "1")
         .env("GROK_HOME", dir)
@@ -109,6 +163,25 @@ fn stdout_text(output: &std::process::Output) -> String {
 
 fn stderr_text(output: &std::process::Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("search stderr should be UTF-8")
+}
+
+fn assert_missing_router(stderr: &str, situation: &str) {
+    assert!(
+        stderr.contains("[router]"),
+        "{situation} should name the missing [router] data; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("must write that record"),
+        "{situation} should say the operator must write that record; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(COMPILED_URL),
+        "{situation} must not choose the compiled OpenRouter URL; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("json"),
+        "{situation} must not report a JSON parse; stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -126,8 +199,16 @@ fn search_help_contains_an_example_and_says_it_does_not_modify_the_config() {
         "search --help should contain an example; help: {help}"
     );
     assert!(
-        help.contains("grok-router search --catalog-file models.json glm"),
-        "search --help should contain a concrete example; help: {help}"
+        help.contains("grok-router search --catalog-file models.json --config config.toml glm"),
+        "search --help should contain the config example; help: {help}"
+    );
+    assert!(
+        help.contains("grok-router search --provider deepseek --catalog-file deepseek.json --config config.toml deepseek"),
+        "search --help should contain the provider example; help: {help}"
+    );
+    assert!(
+        help.contains("--provider"),
+        "search --help should document --provider; help: {help}"
     );
     assert!(
         help.contains("does not modify the config"),
@@ -139,21 +220,21 @@ fn search_help_contains_an_example_and_says_it_does_not_modify_the_config() {
 #[test]
 fn search_json_parses_and_uses_the_fixture_without_a_key_or_a_network() {
     let dir = temp_root("json");
-    let fixture = write_fixture(&dir);
-    let config = dir.join("config.toml");
-    fs::write(&config, "untouched = true\n").expect("the config fixture should be written");
+    let fixture = write_named(&dir, "models.json", FIXTURE);
+    let config = write_config(&dir, &openrouter_config());
+    let before = fs::read(&config).expect("the config fixture should be readable");
     let cache = dir.join("cache");
     fs::create_dir_all(&cache).expect("the empty cache directory should be created");
     let output = run(
         &dir,
         &[
             "--config",
-            config.to_str().expect("the config path should be UTF-8"),
+            &utf8_arg(&config, "the config path should be UTF-8"),
             "search",
             "--catalog-file",
-            fixture.to_str().expect("the fixture path should be UTF-8"),
+            &utf8_arg(&fixture, "the fixture path should be UTF-8"),
             "--cache-dir",
-            cache.to_str().expect("the cache path should be UTF-8"),
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
             "--json",
             "gpt",
             "turbo",
@@ -178,35 +259,35 @@ fn search_json_parses_and_uses_the_fixture_without_a_key_or_a_network() {
             "name": "GPT-4 Turbo",
             "context_length": 128000
         }]),
-        "json output should be the matched row and nothing else"
+        "json output should keep the context_length key; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("context_window"),
+        "json output must not rename context_length; stdout: {stdout}"
     );
     assert!(
         !stdout.contains('\u{1b}'),
         "json output must not contain color escapes; stdout: {stdout}"
     );
     let config_after = fs::read(&config).expect("the config fixture should still exist");
-    assert_eq!(
-        config_after,
-        b"untouched = true\n",
-        "search must not write the config"
-    );
-    assert!(
-        cache.read_dir().expect("the cache dir should be readable").next().is_none(),
-        "a --catalog-file search must not write the cache"
-    );
+    assert_eq!(config_after, before, "search must not write the config");
+    assert_dir_empty(&cache);
     remove_temp(&dir);
 }
 
 #[test]
 fn search_table_lists_id_name_and_context_length() {
     let dir = temp_root("table");
-    let fixture = write_fixture(&dir);
+    let fixture = write_named(&dir, "models.json", FIXTURE);
+    let config = write_config(&dir, &openrouter_config());
     let output = run(
         &dir,
         &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
             "search",
             "--catalog-file",
-            fixture.to_str().expect("the fixture path should be UTF-8"),
+            &utf8_arg(&fixture, "the fixture path should be UTF-8"),
             "gpt",
         ],
     );
@@ -234,14 +315,17 @@ fn search_table_lists_id_name_and_context_length() {
 #[test]
 fn search_quiet_prints_one_id_per_line_without_a_header() {
     let dir = temp_root("quiet");
-    let fixture = write_fixture(&dir);
+    let fixture = write_named(&dir, "models.json", FIXTURE);
+    let config = write_config(&dir, &openrouter_config());
     let output = run(
         &dir,
         &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
             "search",
             "--quiet",
             "--catalog-file",
-            fixture.to_str().expect("the fixture path should be UTF-8"),
+            &utf8_arg(&fixture, "the fixture path should be UTF-8"),
             "gpt",
         ],
     );
@@ -262,15 +346,18 @@ fn search_quiet_prints_one_id_per_line_without_a_header() {
 #[test]
 fn search_limit_caps_the_table() {
     let dir = temp_root("limit");
-    let fixture = write_fixture(&dir);
+    let fixture = write_named(&dir, "models.json", FIXTURE);
+    let config = write_config(&dir, &openrouter_config());
     let output = run(
         &dir,
         &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
             "search",
             "--limit",
             "1",
             "--catalog-file",
-            fixture.to_str().expect("the fixture path should be UTF-8"),
+            &utf8_arg(&fixture, "the fixture path should be UTF-8"),
             "--json",
             "gpt",
         ],
@@ -286,24 +373,28 @@ fn search_limit_caps_the_table() {
     let rows = parsed
         .as_array()
         .expect("limited --json should be an array");
-    assert_eq!(rows.len(), 1, "limit 1 should print one row; stdout: {stdout}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "limit 1 should print one row; stdout: {stdout}"
+    );
     remove_temp(&dir);
 }
 
 #[test]
 fn an_empty_search_fails_and_names_the_count_and_the_next_step() {
     let dir = temp_root("empty");
-    let fixture = write_fixture(&dir);
-    let config = dir.join("config.toml");
-    fs::write(&config, "untouched = true\n").expect("the config fixture should be written");
+    let fixture = write_named(&dir, "models.json", FIXTURE);
+    let config = write_config(&dir, &openrouter_config());
+    let before = fs::read(&config).expect("the config fixture should be readable");
     let output = run(
         &dir,
         &[
             "--config",
-            config.to_str().expect("the config path should be UTF-8"),
+            &utf8_arg(&config, "the config path should be UTF-8"),
             "search",
             "--catalog-file",
-            fixture.to_str().expect("the fixture path should be UTF-8"),
+            &utf8_arg(&fixture, "the fixture path should be UTF-8"),
             "missing-model",
         ],
     );
@@ -322,28 +413,15 @@ fn an_empty_search_fails_and_names_the_count_and_the_next_step() {
         "the failure should name the next step; stderr: {stderr}"
     );
     let config_after = fs::read(&config).expect("the config fixture should still exist");
-    assert_eq!(config_after, b"untouched = true\n");
+    assert_eq!(
+        config_after, before,
+        "an empty search must not write the config"
+    );
     remove_temp(&dir);
 }
 
-const BAD_BASE: &str = "[grok_router]\nopenrouter_base_url = \"ftp://nope\"\n";
-
-const CUSTOM_BASE: &str = "[grok_router]\nopenrouter_base_url = \"https://example.invalid/v1\"\n";
-
-const HEX_CATALOG: &str = r#"{
-    "data": [
-        {
-            "id": "hex-cache/only",
-            "name": "Hex Cache",
-            "description": "row stored for the custom base",
-            "context_length": 1024,
-            "architecture": { "input_modalities": ["text"] }
-        }
-    ]
-}"#;
-
 #[test]
-fn a_missing_config_reads_fresh_models_json_and_does_not_create_the_file() {
+fn a_missing_config_file_refuses_and_is_not_created() {
     let dir = temp_root("missing-config");
     let cache = dir.join("cache");
     fs::create_dir_all(&cache).expect("the cache directory should be created");
@@ -351,130 +429,419 @@ fn a_missing_config_reads_fresh_models_json_and_does_not_create_the_file() {
     fs::write(&models, FIXTURE).expect("the fresh models.json should be written");
     mark_fresh(&models);
     let before = fs::read(&models).expect("models.json should be readable before search");
-    let output = run(
+    let omitted = run(
         &dir,
         &[
             "search",
             "--cache-dir",
-            cache.to_str().expect("the cache path should be UTF-8"),
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
             "--json",
             "turbo",
         ],
     );
-    let stdout = stdout_text(&output);
-    let stderr = stderr_text(&output);
+    let omitted_err = stderr_text(&omitted);
     assert!(
-        output.status.success(),
-        "a missing config should still search the fresh default cache; stderr: {stderr}"
+        !omitted.status.success(),
+        "a missing default config should refuse; stdout: {}",
+        stdout_text(&omitted)
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("search --json should parse as JSON");
-    assert_eq!(
-        parsed,
-        serde_json::json!([{
-            "id": "gpt-4-turbo",
-            "name": "GPT-4 Turbo",
-            "context_length": 128000
-        }]),
-        "the fresh models.json should supply the row; stdout: {stdout}"
+    assert_missing_router(&omitted_err, "a missing default config");
+    assert!(
+        !stdout_text(&omitted).contains("gpt-4"),
+        "a missing config must not print a cache row; stdout: {}",
+        stdout_text(&omitted)
     );
+    let explicit_path = dir.join("absent.toml");
+    let explicit = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&explicit_path, "the missing config path should be UTF-8"),
+            "search",
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "turbo",
+        ],
+    );
+    assert!(
+        !explicit.status.success(),
+        "a missing --config path should refuse; stdout: {}",
+        stdout_text(&explicit)
+    );
+    assert_missing_router(&stderr_text(&explicit), "a missing --config path");
     assert!(
         !dir.join("config.toml").exists(),
-        "search must not create the default config at {}",
-        dir.join("config.toml").display()
+        "search must not create the default config"
+    );
+    assert!(
+        !explicit_path.exists(),
+        "search must not create the named missing config"
     );
     assert!(
         !dir.join(".grok").join("config.toml").exists(),
         "search must not create a home config when GROK_HOME is set"
     );
     let after = fs::read(&models).expect("models.json should still exist");
-    assert_eq!(before, after, "a cache hit must not rewrite models.json");
+    assert_eq!(before, after, "a refusal must not rewrite models.json");
     remove_temp(&dir);
 }
 
 #[test]
-fn an_invalid_base_url_fails_and_leaves_the_empty_cache_untouched() {
-    let dir = temp_root("bad-base");
-    let config = write_config(&dir, BAD_BASE);
-    let before = fs::read(&config).expect("the bad config should be readable");
+fn a_config_without_router_refuses_before_parsing_the_catalog_file() {
+    let dir = temp_root("no-router");
+    let config = write_config(&dir, "untouched = true\n");
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", "this is not json");
     let cache = dir.join("cache");
     fs::create_dir_all(&cache).expect("the empty cache directory should be created");
     let output = run(
         &dir,
         &[
             "--config",
-            config.to_str().expect("the config path should be UTF-8"),
+            &utf8_arg(&config, "the config path should be UTF-8"),
             "search",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
             "--cache-dir",
-            cache.to_str().expect("the cache path should be UTF-8"),
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "--json",
             "gpt",
         ],
     );
     let stderr = stderr_text(&output);
     assert!(
         !output.status.success(),
-        "an invalid openrouter_base_url should fail before a download; stdout: {}",
+        "a config with no [router] should refuse; stdout: {}",
         stdout_text(&output)
     );
+    assert_missing_router(&stderr, "a config with no [router]");
     assert!(
-        stderr.contains("openrouter_base_url"),
-        "the failure should name openrouter_base_url; stderr: {stderr}"
+        stdout_text(&output).trim().is_empty(),
+        "a refused search should not print a row; stdout: {}",
+        stdout_text(&output)
     );
     assert_dir_empty(&cache);
-    let after = fs::read(&config).expect("the bad config should still exist");
-    assert_eq!(before, after, "search must not write the config");
+    assert_eq!(
+        fs::read(&config).expect("the config should still exist"),
+        before,
+        "search must not write the config"
+    );
     remove_temp(&dir);
 }
 
 #[test]
-fn catalog_file_still_succeeds_when_the_config_base_url_is_invalid() {
-    let dir = temp_root("bad-base-fixture");
-    let config = write_config(&dir, BAD_BASE);
-    let before = fs::read(&config).expect("the bad config should be readable");
-    let fixture = write_fixture(&dir);
+fn only_a_grok_router_table_refuses_and_does_not_use_the_compiled_url() {
+    let dir = temp_root("grok-router-only");
+    let config = write_config(
+        &dir,
+        "[grok_router]\nopenrouter_base_url = \"https://openrouter.ai/api/v1\"\n",
+    );
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", "this is not json");
     let cache = dir.join("cache");
     fs::create_dir_all(&cache).expect("the empty cache directory should be created");
     let output = run(
         &dir,
         &[
             "--config",
-            config.to_str().expect("the config path should be UTF-8"),
+            &utf8_arg(&config, "the config path should be UTF-8"),
             "search",
             "--catalog-file",
-            fixture.to_str().expect("the fixture path should be UTF-8"),
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
             "--cache-dir",
-            cache.to_str().expect("the cache path should be UTF-8"),
-            "--json",
-            "turbo",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "gpt",
         ],
     );
-    let stdout = stdout_text(&output);
     let stderr = stderr_text(&output);
     assert!(
-        output.status.success(),
-        "--catalog-file should ignore an invalid base and read the fixture; stderr: {stderr}"
+        !output.status.success(),
+        "only [grok_router] should refuse; stdout: {}",
+        stdout_text(&output)
+    );
+    assert_missing_router(&stderr, "only [grok_router]");
+    assert_dir_empty(&cache);
+    assert_eq!(
+        fs::read(&config).expect("the config should still exist"),
+        before
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn explicit_provider_does_not_need_default_provider() {
+    let dir = temp_root("explicit-provider");
+    let source = provider_record(
+        "",
+        "deepseek",
+        "https://api.deepseek.com",
+        "DEEPSEEK_API_KEY",
+        Some("deepseek-list-models"),
+    );
+    let config = write_config(&dir, &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "deepseek.json", DEEPSEEK_DOC);
+    let cache = dir.join("cache");
+    fs::create_dir_all(&cache).expect("the empty cache directory should be created");
+    let added = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--provider",
+            "deepseek",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "--quiet",
+            "deepseek-v4-pro",
+        ],
+    );
+    assert!(
+        added.status.success(),
+        "--provider deepseek should search without default_provider; stderr: {}",
+        stderr_text(&added)
+    );
+    assert_eq!(stdout_text(&added), "deepseek-v4-pro\n");
+    assert_dir_empty(&cache);
+    let omitted = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "--quiet",
+            "deepseek-v4-pro",
+        ],
+    );
+    let stderr = stderr_text(&omitted);
+    assert!(
+        !omitted.status.success(),
+        "omitted --provider should not pick a record; stdout: {}",
+        stdout_text(&omitted)
+    );
+    assert!(
+        stderr.contains("default_provider"),
+        "the refusal should name default_provider; stderr: {stderr}"
+    );
+    assert!(
+        !stdout_text(&omitted).contains("deepseek-v4-pro"),
+        "the omitted provider must not print the fixture id; stdout: {}",
+        stdout_text(&omitted)
+    );
+    assert_eq!(
+        fs::read(&config).expect("the config should still exist"),
+        before,
+        "search must not write the config"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn blank_default_provider_still_honors_an_explicit_provider() {
+    let dir = temp_root("blank-default");
+    let source = provider_record(
+        "default_provider = \"\"\n",
+        "deepseek",
+        "https://api.deepseek.com",
+        "DEEPSEEK_API_KEY",
+        Some("deepseek-list-models"),
+    );
+    let config = write_config(&dir, &source);
+    let catalog = write_named(&dir, "deepseek.json", DEEPSEEK_DOC);
+    let omitted = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "deepseek-v4-pro",
+        ],
+    );
+    let omitted_err = stderr_text(&omitted);
+    assert!(
+        !omitted.status.success(),
+        "a blank default should refuse; stderr: {omitted_err}"
+    );
+    assert!(
+        omitted_err.contains("default_provider"),
+        "the refusal should name the blank default; stderr: {omitted_err}"
+    );
+    assert!(
+        !stdout_text(&omitted).contains("deepseek-v4-pro"),
+        "a blank default must not print the fixture id"
+    );
+    let added = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--provider",
+            "deepseek",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "--json",
+            "deepseek-v4-pro",
+        ],
+    );
+    let stdout = stdout_text(&added);
+    assert!(
+        added.status.success(),
+        "--provider should ignore a blank default; stderr: {}",
+        stderr_text(&added)
     );
     let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("search --json should parse as JSON");
+        serde_json::from_str(stdout.trim()).expect("search --json should parse");
     assert_eq!(
         parsed,
         serde_json::json!([{
-            "id": "gpt-4-turbo",
-            "name": "GPT-4 Turbo",
+            "id": "deepseek-v4-pro",
+            "name": "DeepSeek V4 Pro",
             "context_length": 128000
         }]),
-        "the fixture row should be returned, not a cache or a download; stdout: {stdout}"
+        "the deepseek fixture should keep the context_length key; stdout: {stdout}"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn zai_without_a_cartridge_does_not_parse_or_get() {
+    let dir = temp_root("zai");
+    let source = provider_record(
+        "default_provider = \"zai\"\n",
+        "zai",
+        "https://api.z.ai/api/paas/v4",
+        "ZAI_API_KEY",
+        None,
+    );
+    let config = write_config(&dir, &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", "this is not json");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&cache).expect("the empty cache directory should be created");
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--provider",
+            "zai",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "glm",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert!(
+        !output.status.success(),
+        "zai should refuse; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("zai"),
+        "stderr should name zai; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no catalog cartridge"),
+        "stderr should say no catalog cartridge is configured; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Nothing was downloaded") && stderr.contains("Nothing was written"),
+        "stderr should say nothing was downloaded and nothing was written; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("openrouter-models") && stderr.contains("deepseek-list-models"),
+        "stderr should name the two catalog ids; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("json"),
+        "a non-JSON catalog must not be parsed; stderr: {stderr}"
     );
     assert_dir_empty(&cache);
-    let after = fs::read(&config).expect("the bad config should still exist");
-    assert_eq!(before, after, "search must not write the config");
+    assert_eq!(
+        fs::read(&config).expect("the config should still exist"),
+        before,
+        "zai should write nothing"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn an_unknown_catalog_id_is_named_and_does_not_select_openrouter() {
+    let dir = temp_root("unknown-catalog");
+    let source = provider_record(
+        "default_provider = \"mirror\"\n",
+        "mirror",
+        "https://example.invalid/v1",
+        "OPENROUTER_API_KEY",
+        Some("not-a-cartridge"),
+    );
+    let config = write_config(&dir, &source);
+    let before = fs::read(&config).expect("the config should be readable");
+    let catalog = write_named(&dir, "models.json", FIXTURE);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--catalog-file",
+            &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+            "--json",
+            "gpt",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert!(
+        !output.status.success(),
+        "not-a-cartridge should refuse; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("not-a-cartridge"),
+        "stderr should name that catalog id; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no catalog cartridge"),
+        "stderr should say no catalog cartridge is configured; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("json"),
+        "the fixture must not be parsed as OpenRouter; stderr: {stderr}"
+    );
+    assert!(
+        !stdout_text(&output).contains("gpt-4"),
+        "the OpenRouter fixture must not be printed; stdout: {}",
+        stdout_text(&output)
+    );
+    assert_eq!(
+        fs::read(&config).expect("the config should still exist"),
+        before
+    );
     remove_temp(&dir);
 }
 
 #[test]
 fn a_custom_base_returns_the_hex_cache_row_and_not_a_decoy() {
     let dir = temp_root("custom-base");
-    let config = write_config(&dir, CUSTOM_BASE);
+    let source = provider_record(
+        "default_provider = \"mirror\"\n",
+        "mirror",
+        "https://example.invalid/v1",
+        "OPENROUTER_API_KEY",
+        Some("openrouter-models"),
+    );
+    let config = write_config(&dir, &source);
     let config_before = fs::read(&config).expect("the custom-base config should be readable");
     let cache = dir.join("cache");
     fs::create_dir_all(&cache).expect("the cache directory should be created");
@@ -492,18 +859,18 @@ fn a_custom_base_returns_the_hex_cache_row_and_not_a_decoy() {
     fs::write(&hex_path, HEX_CATALOG).expect("the hex cache fixture should be written");
     mark_fresh(&hex_path);
     let hex_before = fs::read(&hex_path).expect("the hex cache should be readable before search");
-    assert!(
-        !cache.join("models.json").exists(),
-        "this case has no models.json, so a default-base read has nothing to return"
-    );
+    let decoy = cache.join("models.json");
+    fs::write(&decoy, FIXTURE).expect("the models.json decoy should be written");
+    mark_fresh(&decoy);
+    let decoy_before = fs::read(&decoy).expect("the decoy should be readable");
     let output = run(
         &dir,
         &[
             "--config",
-            config.to_str().expect("the config path should be UTF-8"),
+            &utf8_arg(&config, "the config path should be UTF-8"),
             "search",
             "--cache-dir",
-            cache.to_str().expect("the cache path should be UTF-8"),
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
             "--json",
             "hex-cache",
         ],
@@ -526,19 +893,165 @@ fn a_custom_base_returns_the_hex_cache_row_and_not_a_decoy() {
         "the hex file's row should be returned, not a decoy; stdout: {stdout}"
     );
     assert!(
-        !stdout.contains("gpt-4") && !stdout.contains("decoy"),
-        "the result should not contain a default-catalog or decoy row; stdout: {stdout}"
+        !stdout.contains("gpt-4"),
+        "models.json must not answer a custom base; stdout: {stdout}"
+    );
+    assert_eq!(
+        fs::read(&hex_path).expect("the hex cache should still exist"),
+        hex_before,
+        "a cache hit must not rewrite the hex file"
+    );
+    assert_eq!(
+        fs::read(&decoy).expect("models.json should still exist"),
+        decoy_before,
+        "search must not rewrite the decoy"
+    );
+    assert_eq!(
+        fs::read(&config).expect("the custom-base config should still exist"),
+        config_before,
+        "search must not write the config"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn an_openrouter_base_uses_models_json_even_when_the_name_is_not_openrouter() {
+    let dir = temp_root("mirror-models-json");
+    let source = provider_record(
+        "default_provider = \"mirror\"\n",
+        "mirror",
+        COMPILED_URL,
+        "OPENROUTER_API_KEY",
+        Some("openrouter-models"),
+    );
+    let config = write_config(&dir, &source);
+    let cache = dir.join("cache");
+    fs::create_dir_all(&cache).expect("the cache directory should be created");
+    let models = cache.join("models.json");
+    fs::write(&models, FIXTURE).expect("models.json should be written");
+    mark_fresh(&models);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--provider",
+            "mirror",
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "--quiet",
+            "turbo",
+        ],
     );
     assert!(
-        !cache.join("models.json").exists(),
-        "search must not create models.json for a custom base"
+        output.status.success(),
+        "an OpenRouter base should read models.json; stderr: {}",
+        stderr_text(&output)
     );
-    let hex_after = fs::read(&hex_path).expect("the hex cache should still exist");
-    assert_eq!(hex_before, hex_after, "a cache hit must not rewrite the hex file");
-    let config_after = fs::read(&config).expect("the custom-base config should still exist");
+    assert_eq!(stdout_text(&output), "gpt-4-turbo\n");
+    remove_temp(&dir);
+}
+
+#[test]
+fn a_provider_named_openrouter_with_another_base_does_not_use_models_json() {
+    let dir = temp_root("openrouter-other-base");
+    let source = provider_record(
+        "default_provider = \"openrouter\"\n",
+        "openrouter",
+        "https://example.invalid/v1",
+        "OPENROUTER_API_KEY",
+        Some("openrouter-models"),
+    );
+    let config = write_config(&dir, &source);
+    let cache = dir.join("cache");
+    fs::create_dir_all(&cache).expect("the cache directory should be created");
+    let decoy = cache.join("models.json");
+    fs::write(&decoy, FIXTURE).expect("the models.json decoy should be written");
+    mark_fresh(&decoy);
+    let decoy_before = fs::read(&decoy).expect("the decoy should be readable");
+    let models_url = grok_router::catalog::models_url("https://example.invalid/v1");
+    let hex_path = grok_router::catalog::cache_file_for(&cache, &models_url);
+    assert_ne!(hex_path, decoy);
+    fs::write(&hex_path, HEX_CATALOG).expect("the hex cache should be written");
+    mark_fresh(&hex_path);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "--quiet",
+            "hex-cache",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "the other base should read its hex cache; stderr: {}",
+        stderr_text(&output)
+    );
+    assert_eq!(stdout_text(&output), "hex-cache/only\n");
     assert_eq!(
-        config_before, config_after,
-        "search must not write the config"
+        fs::read(&decoy).expect("models.json should still exist"),
+        decoy_before
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn a_deepseek_base_reads_its_hex_cache_and_not_models_json() {
+    let dir = temp_root("deepseek-cache");
+    let source = provider_record(
+        "default_provider = \"deepseek\"\n",
+        "deepseek",
+        "https://api.deepseek.com",
+        "DEEPSEEK_API_KEY",
+        Some("deepseek-list-models"),
+    );
+    let config = write_config(&dir, &source);
+    let cache = dir.join("cache");
+    fs::create_dir_all(&cache).expect("the cache directory should be created");
+    let decoy = cache.join("models.json");
+    fs::write(&decoy, FIXTURE).expect("the models.json decoy should be written");
+    mark_fresh(&decoy);
+    let decoy_before = fs::read(&decoy).expect("the decoy should be readable");
+    let models_url = grok_router::catalog::models_url("https://api.deepseek.com");
+    let hex_path = grok_router::catalog::cache_file_for(&cache, &models_url);
+    let name = hex_path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .expect("the hex cache name should be Unicode");
+    assert_ne!(name, "models.json");
+    fs::write(&hex_path, DEEPSEEK_DOC).expect("the deepseek cache should be written");
+    mark_fresh(&hex_path);
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "search",
+            "--cache-dir",
+            &utf8_arg(&cache, "the cache path should be UTF-8"),
+            "--quiet",
+            "deepseek-v4-pro",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "deepseek should read its hex cache; stderr: {}",
+        stderr_text(&output)
+    );
+    assert_eq!(stdout_text(&output), "deepseek-v4-pro\n");
+    assert!(
+        !stdout_text(&output).contains("gpt-4"),
+        "models.json must not answer a deepseek base; stdout: {}",
+        stdout_text(&output)
+    );
+    assert_eq!(
+        fs::read(&decoy).expect("models.json should still exist"),
+        decoy_before
     );
     remove_temp(&dir);
 }

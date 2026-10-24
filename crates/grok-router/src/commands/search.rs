@@ -1,10 +1,12 @@
 //! `search` subcommand.
 //!
-//! Search reads the OpenRouter catalog from `--catalog-file` or from a cache.
-//! It does not modify the config. Without `--catalog-file`, it reads the config
-//! only to resolve the OpenRouter base. A missing file keeps the compiled base.
-//! The only write is the catalog cache, and only when the command itself
-//! downloads a new body into `--cache-dir`.
+//! Search reads the selected provider catalog from `--catalog-file` or from a
+//! cache. The record is resolved, and its cartridge is selected, before any
+//! catalog parse or download. `--catalog-file` reads local bytes and does not
+//! use the network. A missing config file is a miss: it is not created, and
+//! search does not fall back to a compiled base. Search does not modify the
+//! config. The only write is the catalog cache, and only when the command
+//! itself downloads a new body into `--cache-dir`.
 
 use std::env;
 use std::fs;
@@ -14,19 +16,25 @@ use std::time::SystemTime;
 
 use clap::{ArgAction, Args};
 
-use crate::catalog::{self, CachedOrFetch, CatalogRow};
-use crate::config_edit::{self, RefuseReason};
+use crate::catalog::{
+    self, CachedBodyOrFetch, CartridgeError, CatalogCartridge, CatalogError, CatalogRow,
+};
+use crate::config_edit::{self, ProviderChoice, RefuseReason};
 
-/// Search the OpenRouter catalog. This command does not modify the config.
+/// Search the selected provider catalog. This command does not modify the config.
 #[derive(Debug, Args)]
 #[command(
     verbatim_doc_comment,
-    after_help = "Examples:\n  grok-router search --catalog-file models.json glm"
+    after_help = "Examples:\n  grok-router search --catalog-file models.json --config config.toml glm\n  grok-router search --provider deepseek --catalog-file deepseek.json --config config.toml deepseek"
 )]
 pub struct SearchArgs {
     /// Case-insensitive term. Repeat to require every term. Each term must match the id, name, or description.
     #[arg(value_name = "TERM", action = ArgAction::Append, verbatim_doc_comment)]
     terms: Vec<String>,
+
+    /// Provider record under [router.provider]. Omitted uses default_provider.
+    #[arg(long, value_name = "NAME", verbatim_doc_comment)]
+    provider: Option<String>,
 
     /// Read this catalog JSON instead of the network or the cache.
     #[arg(long, value_name = "PATH", verbatim_doc_comment)]
@@ -112,50 +120,130 @@ fn collect_terms(values: &[String]) -> Result<Vec<String>, String> {
     Ok(terms)
 }
 
-/// Load rows from `--catalog-file`, or from the cache for the resolved base.
+/// Resolve one provider record, select its cartridge, then read catalog bytes.
 ///
-/// `--catalog-file` returns before the config is read. A missing config uses
-/// the compiled base and is not created. Any other config failure returns
-/// before the cache helper runs.
+/// `--catalog-file` does not skip resolution and does not GET. The network path
+/// calls [`catalog::prepare_cached_body`] and then [`CatalogCartridge::parse`].
+/// This function does not call [`catalog::parse_catalog`] and does not call
+/// [`CatalogCartridge::slug`].
 ///
 /// # Errors
 ///
-/// Returns an error when the catalog file, the config, or the cache cannot be used.
+/// Returns an error when the config, the cartridge, the catalog file, or the cache cannot be used.
 fn load_rows(config: Option<&str>, args: &SearchArgs) -> Result<Vec<CatalogRow>, String> {
+    let config_path = search_config_path(config)?;
+    let text = read_config_text(&config_path)?;
+    let choice = provider_choice(args);
+    let record =
+        config_edit::resolve_provider(&text, choice).map_err(|reason| resolve_failure(&reason))?;
+    let selected = catalog::cartridge(record.catalog.as_deref())
+        .map_err(|err| cartridge_failure(&record_name(&text, choice), &err))?;
     if let Some(path) = &args.catalog_file {
         let bytes = fs::read(path).map_err(|err| {
             format!(
-                "could not read catalog file {}. {err}. Pass a readable --catalog-file, or omit it to use the cache.",
+                "could not read catalog file {}. {err}. Nothing was downloaded. The config was not written. Pass a readable --catalog-file, or omit it to use the cache.",
                 path.display()
             )
         })?;
-        return catalog::parse_catalog(&bytes).map_err(|err| err.to_string());
+        return selected
+            .parse(&bytes)
+            .map_err(|err| format!("{err} Nothing was downloaded. The config was not written."));
     }
 
-    let base_url = resolved_base(&search_config_path(config)?)?;
+    let api_key = bearer(&record.env_key)?;
     let cache_dir = match &args.cache_dir {
         Some(path) => path.clone(),
         None => default_cache_dir()?,
     };
-    let api_key = live_api_key()?;
     let now = SystemTime::now();
-    match catalog::prepare_cached_load(&cache_dir, now, args.refresh, &api_key, &base_url)
-    .map_err(|err| err.to_string())?
+    match catalog::prepare_cached_body(&cache_dir, now, args.refresh, &api_key, &record.base_url)
+        .map_err(|err| cache_failure(&err, &record.env_key))?
     {
-        CachedOrFetch::Cached(rows) => Ok(rows),
-        CachedOrFetch::Fetch(request) => {
-            let bytes = catalog::fetch_catalog_bytes(&request).map_err(|err| err.to_string())?;
-            let stored = catalog::write_cache(&cache_dir, &base_url, &bytes)
-                .map_err(|err| err.to_string())?;
-            if stored != catalog::cache_file_for(&cache_dir, &catalog::models_url(&base_url)) {
+        CachedBodyOrFetch::Cached(bytes) => selected
+            .parse(&bytes)
+            .map_err(|err| format!("{err} The config was not written.")),
+        CachedBodyOrFetch::Fetch(request) => {
+            let bytes = catalog::fetch_catalog_bytes(&request)
+                .map_err(|err| cache_failure(&err, &record.env_key))?;
+            let stored = catalog::write_cache(&cache_dir, &record.base_url, &bytes)
+                .map_err(|err| cache_failure(&err, &record.env_key))?;
+            if stored != catalog::cache_file_for(&cache_dir, &catalog::models_url(&record.base_url))
+            {
                 return Err(format!(
-                    "the catalog cache was written to {}, outside {}. Pass --cache-dir.",
+                    "the catalog cache was written to {}, outside {}. The config was not written. Pass --cache-dir.",
                     stored.display(),
                     cache_dir.display()
                 ));
             }
-            catalog::parse_catalog(&bytes).map_err(|err| err.to_string())
+            selected
+                .parse(&bytes)
+                .map_err(|err| format!("{err} The config was not written."))
         }
+    }
+}
+
+/// `--provider` when present, including an empty name. Omitted means the default record.
+fn provider_choice(args: &SearchArgs) -> ProviderChoice<'_> {
+    match args.provider.as_deref() {
+        Some(name) => ProviderChoice::Explicit(name),
+        None => ProviderChoice::Default,
+    }
+}
+
+/// Name used in a cartridge refusal. Explicit uses the flag. Default reads the key already resolved.
+fn record_name(config: &str, choice: ProviderChoice<'_>) -> String {
+    match choice {
+        ProviderChoice::Explicit(name) => name.to_owned(),
+        ProviderChoice::Default => config
+            .parse::<toml::Table>()
+            .ok()
+            .as_ref()
+            .and_then(|root| root.get("router"))
+            .and_then(toml::Value::as_table)
+            .and_then(|router| router.get("default_provider"))
+            .and_then(toml::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("the default provider")
+            .to_owned(),
+    }
+}
+
+/// What failed, why the record was not used, and that nothing was downloaded or written.
+fn resolve_failure(reason: &RefuseReason) -> String {
+    let preserved = "The file was left unchanged. Nothing was downloaded. Nothing was written.";
+    let must_write = match reason {
+        RefuseReason::InvalidSetting { key, detail }
+            if key == "router"
+                || key == "default_provider"
+                || key == "provider"
+                || detail.contains("[router]") =>
+        {
+            " The operator must write that record."
+        }
+        _ => "",
+    };
+    format!("{reason}.{must_write} {preserved}")
+}
+
+/// A cartridge refusal names the provider and does not parse or download.
+fn cartridge_failure(provider: &str, err: &CartridgeError) -> String {
+    let next = "Set catalog to openrouter-models or deepseek-list-models, or pass --provider for a record that already has one.";
+    let preserved = "Nothing was downloaded. Nothing was written.";
+    match err {
+        CartridgeError::Missing => {
+            format!("{provider} has no catalog cartridge configured. {preserved} {next}")
+        }
+        CartridgeError::Unknown { id } => format!(
+            "catalog {id} on {provider} is not a cartridge, so no catalog cartridge is configured. {preserved} {next}"
+        ),
+    }
+}
+
+/// Turn a cache or download error into the command's sentence.
+fn cache_failure(err: &CatalogError, env_key: &str) -> String {
+    match err {
+        CatalogError::MissingKey => missing_bearer(env_key),
+        other => other.to_string(),
     }
 }
 
@@ -169,7 +257,7 @@ fn load_rows(config: Option<&str>, args: &SearchArgs) -> Result<Vec<CatalogRow>,
 fn search_config_path(config: Option<&str>) -> Result<PathBuf, String> {
     match config {
         Some("") => Err(
-            "--config is empty, so the catalog was not read. Pass --config with the file to read, or pass --catalog-file."
+            "--config is empty, so the catalog was not read. Pass --config with the file to read."
                 .to_owned(),
         ),
         Some(path) => Ok(PathBuf::from(path)),
@@ -191,63 +279,43 @@ fn default_config_path() -> Result<PathBuf, String> {
     match env::var_os("HOME") {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".grok").join("config.toml")),
         Some(_) => Err(
-            "HOME is empty and GROK_HOME is unset, so there is no config path. The catalog was not read. Pass --config or --catalog-file."
+            "HOME is empty and GROK_HOME is unset, so there is no config path. The catalog was not read. Pass --config."
                 .to_owned(),
         ),
         None => Err(
-            "HOME is not set and GROK_HOME is unset, so there is no config path. The catalog was not read. Pass --config or --catalog-file."
+            "HOME is not set and GROK_HOME is unset, so there is no config path. The catalog was not read. Pass --config."
                 .to_owned(),
         ),
     }
 }
 
-/// OpenRouter base from `path`, or the compiled base when the file is missing.
-///
-/// A missing file is not created. Any other read error, non-UTF-8 text, invalid
-/// TOML, or an invalid setting fails without opening the cache.
+/// Read `path`. A missing file is a missing `[router]` record and is not created.
 ///
 /// # Errors
 ///
-/// Returns an error when the file exists but cannot be used as settings.
-fn resolved_base(path: &Path) -> Result<String, String> {
+/// Returns an error when the file is missing, unreadable, or not UTF-8.
+fn read_config_text(path: &Path) -> Result<String, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(config_edit::OPENROUTER_BASE_URL.to_owned());
+            return Err(resolve_failure(&RefuseReason::InvalidSetting {
+                key: "router".to_owned(),
+                detail: "[router] is missing; write that table".to_owned(),
+            }));
         }
         Err(err) => {
             return Err(format!(
-                "could not read config {}. {err}. The catalog was not read. Nothing was downloaded and the cache was not written. Pass --config pointing at a readable file, or pass --catalog-file.",
+                "could not read config {}. {err}. The catalog was not read. Nothing was downloaded and the cache was not written. Pass --config pointing at a readable file.",
                 path.display()
             ));
         }
     };
-    let text = String::from_utf8(bytes).map_err(|_| {
+    String::from_utf8(bytes).map_err(|_| {
         format!(
-            "config {} is not UTF-8, so the catalog was not read. Nothing was downloaded and the cache was not written. Save it as UTF-8, or pass --catalog-file.",
+            "config {} is not UTF-8, so the catalog was not read. Nothing was downloaded and the cache was not written. Save it as UTF-8.",
             path.display()
         )
-    })?;
-    match config_edit::router_settings(&text) {
-        Ok(settings) => Ok(settings.base_url),
-        Err(reason) => Err(settings_failure(&reason)),
-    }
-}
-
-/// What failed, why nothing was downloaded, and what to do next.
-fn settings_failure(reason: &RefuseReason) -> String {
-    let repair = match reason {
-        RefuseReason::InvalidSetting { key, .. } => {
-            format!("Fix {key} in the config, or pass --catalog-file.")
-        }
-        RefuseReason::Parse { .. } => {
-            "Fix the config so it parses as TOML, or pass --catalog-file.".to_owned()
-        }
-        _ => "Fix the config, or pass --catalog-file.".to_owned(),
-    };
-    format!(
-        "{reason}. The catalog was not read. Nothing was downloaded and the cache was not written. {repair}"
-    )
+    })
 }
 
 /// Default cache directory `~/.cache/grok-router`.
@@ -267,23 +335,41 @@ fn default_cache_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".cache").join("grok-router"))
 }
 
-/// The API key, or an empty string when the variable is unset.
-fn live_api_key() -> Result<String, String> {
-    match env::var("OPENROUTER_API_KEY") {
+/// The record's bearer, or an empty string when the variable is unset.
+///
+/// A blank value is left blank. [`catalog::prepare_cached_body`] accepts that
+/// when the cache is fresh and refuses it when a download is required.
+///
+/// # Errors
+///
+/// Returns an error when the variable is set to non-Unicode bytes.
+fn bearer(env_key: &str) -> Result<String, String> {
+    match env::var(env_key) {
         Ok(value) => Ok(value),
         Err(env::VarError::NotPresent) => Ok(String::new()),
-        Err(env::VarError::NotUnicode(_)) => Err(
-            "OPENROUTER_API_KEY is not valid Unicode, so the catalog was not downloaded. Export a Unicode key or pass --catalog-file."
-                .to_owned(),
-        ),
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "{env_key} is not valid Unicode, so the catalog was not downloaded. Export a Unicode key or pass --catalog-file."
+        )),
+    }
+}
+
+/// Missing-key sentence. `OPENROUTER_API_KEY` keeps the sentence the cache helper already uses.
+fn missing_bearer(env_key: &str) -> String {
+    if env_key == "OPENROUTER_API_KEY" {
+        "OPENROUTER_API_KEY is missing, so the catalog was not downloaded. Export OPENROUTER_API_KEY or pass --catalog-file. The config was not written and an empty cache was not written."
+            .to_owned()
+    } else {
+        format!(
+            "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
+        )
     }
 }
 
 /// Reject zero. Clap prints the returned string and exits.
 fn parse_limit(raw: &str) -> Result<usize, String> {
-    let limit: usize = raw.parse().map_err(|_| {
-        format!("--limit {raw} is not a whole number. Pass --limit 30.")
-    })?;
+    let limit: usize = raw
+        .parse()
+        .map_err(|_| format!("--limit {raw} is not a whole number. Pass --limit 30."))?;
     if limit == 0 {
         return Err(
             "--limit 0 would hide every row. Pass --limit 30 or another number greater than zero."
