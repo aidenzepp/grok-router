@@ -1,6 +1,6 @@
 # Rust Workspace Template
 
-This repository is an intentionally empty stable Rust workspace. It is a foundation for future projects, not a sample application. Create only the crates the project needs under `crates/`; do not pre-create shared or FFI crates.
+This repository is a stable Rust workspace. It is a foundation for future projects, not a sample application. Create only the crates the project needs under `crates/`; do not pre-create shared or FFI crates.
 
 ## Policy
 
@@ -17,7 +17,7 @@ If a rule appears inappropriate, explain the failing rule, why changing the code
 
 ## Workflow
 
-Follow `README.md` to create the first crate. The workspace has no build targets until then.
+The build target is `crates/grok-router`.
 
 Before completion, run:
 
