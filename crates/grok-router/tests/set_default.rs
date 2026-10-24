@@ -9,8 +9,8 @@
 
 //! `grok-router set-default` writes `[models].default` in a temp config.
 //!
-//! These tests pass `--config`. They do not call the network, do not read a
-//! home config, and do not start a session.
+//! These tests pass `--config`, except the missing-path witness. They do not
+//! call the network, do not read a home config, and do not start a session.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -363,6 +363,29 @@ fn json_prints_one_object_and_quiet_prints_the_slug_only() {
     assert!(
         after.contains("default = \"or-glm-5-3\"\n"),
         "quiet should still save the configured slug; config: {after}"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn set_default_without_config_exits_1_and_does_not_open_a_home_config() {
+    let dir = temp_root("no-config");
+    let home_config = dir.join(".grok").join("config.toml");
+    let output = run(&dir, &["set-default", "grok-4.6"]);
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "set-default without --config should fail; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no --config"),
+        "stderr should say that no --config path was given, not that a home file was missing; stderr: {stderr}"
+    );
+    assert!(
+        !home_config.exists(),
+        "set-default should not create a home config at {}",
+        home_config.display()
     );
     remove_temp(&dir);
 }
