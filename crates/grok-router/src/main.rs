@@ -21,13 +21,12 @@ fn main() {
     let cmd = skill::augment(cmd);
     let matches = cmd.get_matches();
     match matches.subcommand_name() {
-        Some("list") => {}
-        Some("search") => std::process::exit(search::run()),
-        Some("add") => std::process::exit(add::run()),
-        Some("set-default") => std::process::exit(set_default::run()),
-        Some("remove") => std::process::exit(remove::run()),
-        Some("skill") => std::process::exit(skill::run()),
-        Some("__internal") => std::process::exit(skill::run()),
-        _ => {}
+        None | Some("list") => std::process::exit(list::run(&matches)),
+        Some("search") => std::process::exit(search::run(&matches)),
+        Some("add") => std::process::exit(add::run(&matches)),
+        Some("set-default") => std::process::exit(set_default::run(&matches)),
+        Some("remove") => std::process::exit(remove::run(&matches)),
+        Some("skill" | "__internal") => std::process::exit(skill::run(&matches)),
+        Some(_) => {}
     }
 }

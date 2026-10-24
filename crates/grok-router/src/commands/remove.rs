@@ -10,7 +10,8 @@ pub fn augment(cmd: Command) -> Command {
 
 /// Prints that the command is not implemented and returns the failure status.
 #[must_use]
-pub fn run() -> i32 {
+pub fn run(matches: &clap::ArgMatches) -> i32 {
+    let _ = matches;
     eprintln!("not implemented");
     2
 }
