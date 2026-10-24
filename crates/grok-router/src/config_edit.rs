@@ -4,6 +4,8 @@
 //! the document back out. After a splice, the text is parsed again and refused
 //! when a top-level table, an existing provider id, the intended membership, or
 //! the saved default drifts. Refusal returns the caller's original text.
+//! [`read_configured`] reports the saved default and configured models and does
+//! not change the text.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -19,6 +21,27 @@ pub const BUILTIN_SLUGS: [&str; 4] = [
     "grok-4.6",
     "grok-4.5",
 ];
+
+/// One configured model and the provider id stored in its block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredModel {
+    /// Slug under `[model]`.
+    pub slug: String,
+    /// Provider id from the block's `model` field.
+    pub provider_id: String,
+}
+
+/// The saved default and every configured model, in slug order.
+///
+/// Built-in slugs are not inserted. A default with no block is only
+/// [`Self::saved_default`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredInventory {
+    /// `[models].default` when that value is a string.
+    pub saved_default: Option<String>,
+    /// Configured slugs and their provider ids.
+    pub models: Vec<ConfiguredModel>,
+}
 
 /// Catalog fields the splice reads. The caller supplies them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,6 +495,25 @@ pub fn remove_model(config: &str, slug: &str) -> Result<String, Refused> {
         DefaultExpectation::Unchanged,
         None,
     )
+}
+
+/// Read the saved default and each configured slug with its provider id.
+///
+/// # Errors
+///
+/// Returns [`Refused`] when the text is not a config this crate will read.
+#[must_use = "the inventory is the caller's only copy of the parsed models"]
+pub fn read_configured(config: &str) -> Result<ConfiguredInventory, Refused> {
+    let root = read_config(config)?;
+    let saved_default = saved_default(&root).map(str::to_owned);
+    let models = configured_models(&root)
+        .into_iter()
+        .map(|(slug, provider_id)| ConfiguredModel { slug, provider_id })
+        .collect();
+    Ok(ConfiguredInventory {
+        saved_default,
+        models,
+    })
 }
 
 /// Back up `path`, then replace it with `bytes` via a temp file in the same directory.
