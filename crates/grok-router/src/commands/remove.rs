@@ -3,7 +3,6 @@
 //! Remove deletes one model block from the file named by `--config`.
 //! `--yes` is required to delete. `--dry-run` prints the slug and does not write.
 
-use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -69,8 +68,8 @@ fn run_remove(config: Option<&str>, args: &RemoveArgs) -> Result<String, String>
     let removed = if dry_run {
         false
     } else {
-        let secret = live_api_key()?;
-        config_edit::replace_file(&config_path, Backup::Sibling, edited.as_bytes(), &secret)
+        config_edit::refuse_named_secrets(&edited, &[])?;
+        config_edit::replace_file(&config_path, Backup::Sibling, edited.as_bytes(), "")
             .map_err(|err| {
                 format!(
                     "{err}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the deletion."
@@ -108,20 +107,6 @@ fn configured_path(config: Option<&str>) -> Result<PathBuf, String> {
         ),
         None => Err(
             "no --config path was given, so nothing was deleted. Pass --config with the file to edit."
-                .to_owned(),
-        ),
-    }
-}
-
-/// The API key, or an empty string when the variable is unset.
-///
-/// An empty string is not searched. A non-empty key that occurs in the replacement refuses the write.
-fn live_api_key() -> Result<String, String> {
-    match env::var("OPENROUTER_API_KEY") {
-        Ok(value) => Ok(value),
-        Err(env::VarError::NotPresent) => Ok(String::new()),
-        Err(env::VarError::NotUnicode(_)) => Err(
-            "OPENROUTER_API_KEY is not valid Unicode, so the config was not written. Export a Unicode key or unset it."
                 .to_owned(),
         ),
     }

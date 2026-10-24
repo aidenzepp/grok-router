@@ -694,7 +694,7 @@ fn a_custom_base_cache_miss_reports_a_missing_key_and_does_not_read_models_json(
     mark_fresh(&models);
     let models_before = fs::read(&models).expect("models.json should be readable before add");
     let models_url = grok_router::catalog::models_url(CUSTOM_BASE);
-    let hex_path = grok_router::catalog::cache_file_for(&cache, &models_url);
+    let hex_path = grok_router::catalog::cache_path_for(&cache, &models_url);
     let hex_name = hex_path
         .file_name()
         .and_then(|file_name| file_name.to_str())
@@ -912,7 +912,7 @@ fn assert_secret_absent(label: &str, text: &str, secret: &str) {
 #[test]
 fn other_commands_do_not_grow_provider() {
     let dir = temp_root("no-provider-flag");
-    for command in ["search", "set-default", "remove", "list"] {
+    for command in ["set-default", "remove", "list"] {
         let output = run(&dir, &[command, "--help"]);
         let help = stdout_text(&output);
         assert_eq!(
@@ -1506,6 +1506,11 @@ fn an_unknown_catalog_id_is_named_and_does_not_select_openrouter() {
         !stderr.to_ascii_lowercase().contains("json"),
         "the fixture must not be parsed as OpenRouter; stderr: {stderr}"
     );
+    let retired = format!("{} was not selected", "openrouter-models");
+    assert!(
+        !stderr.contains(&retired),
+        "stderr must not say OpenRouter was not selected; stderr: {stderr}"
+    );
     let after = fs::read_to_string(&config).expect("the config should stay UTF-8");
     assert_eq!(after.as_bytes(), before.as_slice());
     assert!(!after.contains("[model.or-widget-v2]"));
@@ -1551,7 +1556,101 @@ fn a_pasted_secret_refuses_before_a_write() {
     let after_text = String::from_utf8(after).expect("the config should stay UTF-8");
     assert_secret_absent("config", &after_text, openrouter_secret);
     assert_secret_absent("config", &after_text, deepseek_secret);
+
+    let mirror_dir = temp_root("pasted-mirror");
+    let mirror_secret = "pasted-mirror-token";
+    let mirror_config = write_named(
+        &mirror_dir,
+        "config.toml",
+        "[router]\ndefault_provider = \"mirror\"\n\n[router.provider.mirror]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"MIRROR_API_KEY\"\ncatalog = \"openrouter-models\"\n\n[models]\ndefault = \"grok-4.7\"\n",
+    );
+    let mirror_before = fs::read(&mirror_config).expect("the mirror config should be readable");
+    let mirror_document = format!(
+        "{{\"data\":[{{\"id\":\"acme/widget.v2\",\"name\":\"{mirror_secret}\",\"context_length\":8,\"architecture\":{{\"input_modalities\":[\"text\"]}}}}]}}"
+    );
+    let mirror_catalog = write_named(&mirror_dir, "secret.json", &mirror_document);
+    let mirror = run_with(
+        &mirror_dir,
+        &[
+            "--config",
+            &utf8_arg(&mirror_config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&mirror_catalog, "the catalog path should be UTF-8"),
+            "acme/widget.v2",
+        ],
+        &[("MIRROR_API_KEY", mirror_secret)],
+    );
+    let mirror_err = stderr_text(&mirror);
+    assert_secret_absent("stderr", &mirror_err, mirror_secret);
+    assert_eq!(
+        exit_code(&mirror),
+        1,
+        "a third env key should refuse; stderr: {mirror_err}"
+    );
+    assert!(
+        mirror_err.contains("MIRROR_API_KEY"),
+        "stderr should name the third variable, not only the old pair; stderr: {mirror_err}"
+    );
+    assert_eq!(
+        fs::read(&mirror_config).expect("the mirror config should still exist"),
+        mirror_before,
+        "a third env key should leave the file unchanged"
+    );
+
+    use std::os::unix::ffi::OsStringExt;
+    let raw_dir = temp_root("pasted-raw");
+    let raw_config = write_named(
+        &raw_dir,
+        "config.toml",
+        "[router]\ndefault_provider = \"mirror\"\n\n[router.provider.mirror]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"MIRROR_API_KEY\"\ncatalog = \"openrouter-models\"\n\n[models]\ndefault = \"grok-4.7\"\n",
+    );
+    let raw_before = fs::read(&raw_config).expect("the raw config should be readable");
+    let raw_catalog = write_named(
+        &raw_dir,
+        "plain.json",
+        r#"{"data":[{"id":"acme/widget.v2","name":"Widget","context_length":8,"architecture":{"input_modalities":["text"]}}]}"#,
+    );
+    let raw = Command::new(env!("CARGO_BIN_EXE_grok-router"))
+        .args([
+            "--config",
+            &utf8_arg(&raw_config, "the config path should be UTF-8"),
+            "add",
+            "--catalog-file",
+            &utf8_arg(&raw_catalog, "the catalog path should be UTF-8"),
+            "acme/widget.v2",
+        ])
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env("MIRROR_API_KEY", std::ffi::OsString::from_vec(vec![0xff, 0xfe]))
+        .env("HOME", &raw_dir)
+        .env("NO_COLOR", "1")
+        .current_dir(&raw_dir)
+        .output()
+        .expect("the grok-router binary should start");
+    let raw_err = stderr_text(&raw);
+    assert_eq!(
+        exit_code(&raw),
+        1,
+        "a non-Unicode env value should refuse; stderr: {raw_err}"
+    );
+    assert!(
+        raw_err.contains("MIRROR_API_KEY"),
+        "stderr should name the non-Unicode variable; stderr: {raw_err}"
+    );
+    assert!(
+        !raw_err.contains("OPENROUTER_API_KEY"),
+        "a mirror key must not be described as OPENROUTER_API_KEY; stderr: {raw_err}"
+    );
+    assert_eq!(
+        fs::read(&raw_config).expect("the raw config should still exist"),
+        raw_before,
+        "a non-Unicode env value should leave the file unchanged"
+    );
+
     remove_temp(&dir);
+    remove_temp(&mirror_dir);
+    remove_temp(&raw_dir);
 }
 
 #[test]
@@ -1563,16 +1662,23 @@ fn an_openrouter_base_reads_models_json_and_a_deepseek_base_does_not() {
     mark_fresh(&models);
     let models_before = fs::read(&models).expect("models.json should be readable");
     let openrouter_url = grok_router::catalog::models_url("https://openrouter.ai/api/v1");
+    let hex_name = {
+        let mut hex = String::new();
+        for byte in openrouter_url.as_bytes() {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        format!("models-{hex}.json")
+    };
+    let hex_path = grok_router::catalog::cache_path_for(&cache, &openrouter_url);
     assert_eq!(
-        openrouter_url,
-        grok_router::catalog::MODELS_URL,
-        "the OpenRouter record base should be the models.json URL"
+        hex_path.file_name().and_then(|name| name.to_str()),
+        Some(hex_name.as_str()),
+        "the OpenRouter URL should cache as the hex of its bytes"
     );
-    assert_eq!(
-        grok_router::catalog::cache_file_for(&cache, &openrouter_url),
-        models,
-        "that URL should cache as models.json"
-    );
+    assert_ne!(hex_path, models, "models.json must not be that cache");
+    fs::write(&hex_path, CATALOG).expect("the hex cache should be written");
+    mark_fresh(&hex_path);
+    let hex_before = fs::read(&hex_path).expect("the hex cache should be readable");
     let hit = run_with(
         &dir,
         &[
@@ -1590,13 +1696,18 @@ fn an_openrouter_base_reads_models_json_and_a_deepseek_base_does_not() {
     assert_eq!(
         exit_code(&hit),
         0,
-        "a fresh models.json should answer an OpenRouter base; stderr: {hit_err}; stdout: {}",
+        "a fresh hex cache should answer an OpenRouter base; stderr: {hit_err}; stdout: {}",
         stdout_text(&hit)
     );
     let models_after = fs::read(&models).expect("models.json should still exist");
     assert_eq!(
         models_before, models_after,
-        "a cache hit must not rewrite models.json"
+        "a cache hit must not rewrite the models.json decoy"
+    );
+    assert_eq!(
+        fs::read(&hex_path).expect("the hex cache should still exist"),
+        hex_before,
+        "a cache hit must not rewrite the hex file"
     );
     let after = fs::read_to_string(&config).expect("the config should be UTF-8");
     assert_secret_absent("config", &after, "cache-hit-token");
@@ -1615,7 +1726,7 @@ fn an_openrouter_base_reads_models_json_and_a_deepseek_base_does_not() {
     mark_fresh(&decoy);
     let decoy_before = fs::read(&decoy).expect("the decoy should be readable");
     let deepseek_url = grok_router::catalog::models_url(DEEPSEEK_BASE);
-    let hex_path = grok_router::catalog::cache_file_for(&deepseek_cache, &deepseek_url);
+    let hex_path = grok_router::catalog::cache_path_for(&deepseek_cache, &deepseek_url);
     assert_ne!(
         hex_path.file_name().and_then(|name| name.to_str()),
         Some("models.json"),

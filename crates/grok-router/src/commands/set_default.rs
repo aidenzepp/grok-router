@@ -4,7 +4,6 @@
 //! session. The text edit is [`config_edit::set_default`]; the file edit is
 //! [`config_edit::replace_file`]. `--dry-run` does not replace the file.
 
-use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -61,8 +60,8 @@ fn apply(config: Option<&str>, args: &SetDefaultArgs) -> Result<String, String> 
     let wrote = if unchanged || dry_run {
         false
     } else {
-        let secret = api_key_or_empty()?;
-        config_edit::replace_file(&path, Backup::Sibling, edited.as_bytes(), &secret).map_err(
+        config_edit::refuse_named_secrets(&edited, &[])?;
+        config_edit::replace_file(&path, Backup::Sibling, edited.as_bytes(), "").map_err(
             |err| {
                 format!(
                     "{err}. The saved default was not changed. Retry with a writable --config, or pass --dry-run to preview the slug."
@@ -121,18 +120,6 @@ fn read_config_text(path: &Path) -> Result<String, String> {
             path.display()
         )
     })
-}
-
-/// `OPENROUTER_API_KEY` when it is set, otherwise an empty string that [`config_edit::replace_file`] does not search for.
-fn api_key_or_empty() -> Result<String, String> {
-    match env::var("OPENROUTER_API_KEY") {
-        Ok(value) => Ok(value),
-        Err(env::VarError::NotPresent) => Ok(String::new()),
-        Err(env::VarError::NotUnicode(_)) => Err(
-            "OPENROUTER_API_KEY is not valid Unicode, so the saved default was not changed. Unset it or export a Unicode value."
-                .to_owned(),
-        ),
-    }
 }
 
 /// What failed, why, and what to do next. The file was not written.

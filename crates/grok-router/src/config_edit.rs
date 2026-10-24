@@ -6,18 +6,13 @@
 //! the saved default drifts. Refusal returns the caller's original text.
 //! [`read_configured`] reports the saved default and configured models and does
 //! not change the text. [`resolve_provider`] reads one
-//! `[router.provider.<name>]` record and does not fall back to
-//! [`OPENROUTER_BASE_URL`]. [`builtins_from`] reads `builtins` from `[router]`.
+//! `[router.provider.<name>]` record and does not fall back to a compiled
+//! OpenRouter URL. [`builtins_from`] reads `builtins` from `[router]`.
 //! None of them write the document. The edit never writes that table back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-
-/// OpenRouter API base `https://openrouter.ai/api/v1`.
-///
-/// This constant is not a fallback. A missing config does not select it.
-pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// Built-in Grok slugs used when `builtins` is absent. They have no config block.
 pub const BUILTIN_SLUGS: [&str; 4] = ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
@@ -322,38 +317,13 @@ struct Span {
     name: String,
 }
 
-/// Derive `or-` plus the provider id's normalized last path segment.
-///
-/// # Errors
-///
-/// Returns an error when the id is empty or its leaf has no alphanumeric characters.
-#[must_use = "the derived slug is the caller's only copy of the normalized id"]
-pub fn derive_slug(provider_id: &str) -> Result<String, RefuseReason> {
-    if provider_id.is_empty() {
-        return Err(RefuseReason::EmptyProviderId);
-    }
-    let leaf = match provider_id.rsplit('/').next() {
-        Some(segment) => segment,
-        None => provider_id,
-    };
-    let normalized = normalize_leaf(leaf);
-    if normalized.is_empty() {
-        return Err(RefuseReason::EmptySlugLeaf {
-            provider_id: provider_id.to_owned(),
-        });
-    }
-    let slug = format!("or-{normalized}");
-    require_slug(&slug)?;
-    Ok(slug)
-}
-
 /// Read one `[router.provider.<name>]` record from `config`.
 ///
 /// [`ProviderChoice::Explicit`] uses that name and does not read `default_provider`.
 /// [`ProviderChoice::Default`] reads `default_provider` and refuses when `[router]`
 /// is missing, when that key is missing, blank, or not a string, or when the
 /// named record is missing. A miss is [`RefuseReason::InvalidSetting`]. It is
-/// not [`OPENROUTER_BASE_URL`], and another provider record is not a silent
+/// not a compiled OpenRouter URL, and another provider record is not a silent
 /// default. `base_url` must match `^https?://\S+$` and `env_key` must match
 /// `^[A-Za-z_][A-Za-z0-9_]*$`, both with no trim. Absent or blank `catalog`
 /// is [`None`]. Any other string is returned as written. This function does
@@ -452,7 +422,7 @@ pub fn render_block(
 /// Insert one model block into `config`.
 ///
 /// `slug` is the slug the caller already chose. This function calls
-/// [`require_slug`] and does not call [`derive_slug`] or read `[grok_router]`.
+/// [`require_slug`] and does not add an `or-` prefix or read `[grok_router]`.
 /// The same provider id at `base_url` with the same slug returns `config`
 /// unchanged. The same id at `base_url` under a different slug is
 /// [`RefuseReason::DuplicateProvider`]. The same id at a different base is not
@@ -631,6 +601,74 @@ pub fn read_configured(config: &str) -> Result<ConfiguredInventory, Refused> {
         saved_default,
         models,
     })
+}
+
+/// Refuse when `text` contains the value of a named environment variable.
+///
+/// Names are every `env_key` string in `text`, plus each name in `also`. An
+/// unset name is skipped. An empty value is skipped. A non-Unicode value
+/// refuses and names the variable. A non-empty value that occurs in `text`
+/// refuses, names the variable, and does not include the value. No file is
+/// touched.
+///
+/// # Errors
+///
+/// Returns an error when a scanned name is not Unicode or its value occurs in `text`.
+pub fn refuse_named_secrets(text: &str, also: &[&str]) -> Result<(), String> {
+    let mut names = BTreeSet::new();
+    if let Ok(root) = text.parse::<toml::Table>() {
+        collect_env_keys(&toml::Value::Table(root), &mut names);
+    }
+    for name in also {
+        if is_env_key(name) {
+            let _inserted = names.insert((*name).to_owned());
+        }
+    }
+    for name in names {
+        match std::env::var(&name) {
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!(
+                    "{name} is not valid Unicode, so the config was not written. Export a Unicode value or unset {name}. The file was left unchanged."
+                ));
+            }
+            Ok(value) if !value.is_empty() && text.contains(&value) => {
+                return Err(format!(
+                    "the new config contains the value of {name}. The file was left unchanged. Remove that value from the text before writing."
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Record every `env_key` string in `value`.
+fn collect_env_keys(value: &toml::Value, names: &mut BTreeSet<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                if key == "env_key" {
+                    if let Some(name) = child.as_str() {
+                        if is_env_key(name) {
+                            let _inserted = names.insert(name.to_owned());
+                        }
+                    }
+                }
+                collect_env_keys(child, names);
+            }
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                collect_env_keys(item, names);
+            }
+        }
+        toml::Value::String(_)
+        | toml::Value::Integer(_)
+        | toml::Value::Float(_)
+        | toml::Value::Boolean(_)
+        | toml::Value::Datetime(_) => {}
+    }
 }
 
 /// Back up `path`, then replace it with `bytes` via a temp file in the same directory.
@@ -1006,26 +1044,6 @@ fn record_catalog(value: Option<&toml::Value>) -> Result<Option<String>, RefuseR
     } else {
         Ok(Some(text.to_owned()))
     }
-}
-
-/// Turn every non-alphanumeric run into one hyphen, then trim and lowercase.
-fn normalize_leaf(leaf: &str) -> String {
-    let mut normalized = String::new();
-    let mut pending_hyphen = false;
-    let mut started = false;
-    for ch in leaf.chars() {
-        if ch.is_ascii_alphanumeric() {
-            if pending_hyphen && started {
-                normalized.push('-');
-            }
-            pending_hyphen = false;
-            started = true;
-            normalized.push(ch.to_ascii_lowercase());
-        } else if started {
-            pending_hyphen = true;
-        }
-    }
-    normalized
 }
 
 /// Use the catalog name when it has a non-blank trimmed form, otherwise the provider id.
@@ -1615,6 +1633,9 @@ fn discard_temp(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::CatalogCartridge;
+
+    const FIXTURE_BASE: &str = "https://openrouter.ai/api/v1";
 
     /// Splice with the OpenRouter base and env name. The slug is already chosen.
     fn open_insert(config: &str, model: CatalogModel<'_>, slug: &str) -> Result<String, Refused> {
@@ -1622,7 +1643,7 @@ mod tests {
             config,
             model,
             slug,
-            OPENROUTER_BASE_URL,
+            FIXTURE_BASE,
             "OPENROUTER_API_KEY",
         )
     }
@@ -1732,7 +1753,7 @@ default_reasoning_effort = \"high\"
         let block = render_block(
             "or-widget-v2",
             widget(Some(1_048_576), false),
-            OPENROUTER_BASE_URL,
+            FIXTURE_BASE,
             "OPENROUTER_API_KEY",
         )
         .expect("a positive context window should render a block");
@@ -1832,8 +1853,10 @@ context_window = 1048576
             refused.reason
         );
         assert_eq!(
-            derive_slug("deepseek/deepseek-v4.1-flash-1017")
-                .expect("this provider id should derive a slug"),
+            crate::catalog::cartridge(Some("openrouter-models"))
+                .expect("openrouter-models should select a cartridge")
+                .slug("deepseek/deepseek-v4.1-flash-1017", None)
+                .expect("this provider id should derive a slug on the OpenRouter cartridge"),
             "or-deepseek-v4-1-flash-1017"
         );
     }
@@ -1936,20 +1959,7 @@ context_window = 1048576
     }
 
     #[test]
-    fn derived_slug_uses_the_leaf_and_an_empty_leaf_is_an_error() {
-        assert_eq!(
-            derive_slug("z-ai/glm-5.3").expect("glm-5.3 should derive a bare slug"),
-            "or-glm-5-3"
-        );
-        for provider_id in ["acme/", "@@@", "/"] {
-            let refused =
-                derive_slug(provider_id).expect_err("an empty leaf should refuse derivation");
-            assert!(
-                matches!(refused, RefuseReason::EmptySlugLeaf { .. }),
-                "{provider_id} should be an empty leaf, got {refused}"
-            );
-        }
-
+    fn explicit_slug_inserts_when_the_provider_id_has_an_empty_leaf() {
         let updated = open_insert(
             FIXTURE,
             CatalogModel {
@@ -2012,7 +2022,7 @@ context_window = 1048576
         let block = render_block(
             "or-widget-v2",
             widget(Some(8), false),
-            OPENROUTER_BASE_URL,
+            FIXTURE_BASE,
             "OPENROUTER_API_KEY",
         )
         .expect("the widget block should render");
@@ -2526,7 +2536,7 @@ default = \"or-glm-5-3\"
                 &config,
                 widget(Some(8), false),
                 "or-widget-v2",
-                OPENROUTER_BASE_URL,
+                FIXTURE_BASE,
                 "OPENROUTER_API_KEY",
             )
             .expect("insert should ignore an invalid [grok_router] table");
@@ -2559,7 +2569,7 @@ default = \"or-glm-5-3\"
             &config,
             widget(Some(8), false),
             "or-widget-v2",
-            OPENROUTER_BASE_URL,
+            FIXTURE_BASE,
             "OPENROUTER_API_KEY",
         )
         .expect("an invalid [grok_router] table should not refuse insert");
@@ -2699,7 +2709,7 @@ env_key = \"DEEPSEEK_API_KEY\"
             assert_setting(&error, key);
             let rendered = error.to_string();
             assert!(
-                !rendered.contains(OPENROUTER_BASE_URL),
+                !rendered.contains(FIXTURE_BASE),
                 "a default miss must not name the compiled base, got {rendered}"
             );
             assert!(
@@ -2759,7 +2769,7 @@ env_key = \"DEEPSEEK_API_KEY\"
             for error in [&explicit, &defaulted] {
                 let rendered = error.to_string();
                 assert!(
-                    !rendered.contains(OPENROUTER_BASE_URL),
+                    !rendered.contains(FIXTURE_BASE),
                     "a miss must not name the compiled base, got {rendered}"
                 );
                 assert!(

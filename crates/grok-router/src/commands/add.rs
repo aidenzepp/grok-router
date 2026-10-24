@@ -110,7 +110,7 @@ fn run_add(config: Option<&str>, args: &AddArgs) -> Result<String, String> {
     let wrote = if unchanged || dry_run {
         false
     } else {
-        pasted_secret(&edited)?;
+        config_edit::refuse_named_secrets(&edited, &[record.env_key.as_str()])?;
         config_edit::replace_file(&config_path, Backup::Sibling, edited.as_bytes(), "")
             .map_err(|err| {
                 format!(
@@ -226,8 +226,7 @@ fn query_terms(values: &[String]) -> Result<Vec<String>, String> {
 ///
 /// `--catalog-file` calls [`CatalogCartridge::parse`] and does not call
 /// [`catalog::parse_catalog`] or the network. The cache path calls
-/// [`catalog::prepare_cached_body`] and then the same parse. It does not call
-/// [`catalog::prepare_cached_load`].
+/// [`catalog::prepare_cached_body`] and then the same parse.
 fn load_rows(
     args: &AddArgs,
     cartridge: &Cartridge,
@@ -252,7 +251,7 @@ fn load_rows(
         None => default_cache_dir()?,
     };
     let now = SystemTime::now();
-    match catalog::prepare_cached_body(&cache_dir, now, args.refresh, &api_key, base_url)
+    match catalog::prepare_cached_body(&cache_dir, now, args.refresh, &api_key, base_url, env_key)
         .map_err(|err| format!("{err} Nothing was written."))?
     {
         CachedBodyOrFetch::Cached(bytes) => cartridge
@@ -263,7 +262,7 @@ fn load_rows(
                 .map_err(|err| format!("{err} Nothing was written."))?;
             let stored = catalog::write_cache(&cache_dir, base_url, &bytes)
                 .map_err(|err| format!("{err} Nothing was written."))?;
-            if stored != catalog::cache_file_for(&cache_dir, &catalog::models_url(base_url)) {
+            if stored != catalog::cache_path_for(&cache_dir, &catalog::models_url(base_url)) {
                 return Err(format!(
                     "the catalog cache was written to {}, outside {}. The config was not written. Pass --cache-dir.",
                     stored.display(),
@@ -288,16 +287,11 @@ fn required_bearer(env_key: &str) -> Result<String, String> {
     }
 }
 
-/// Missing-key sentence. `OPENROUTER_API_KEY` keeps the sentence the cache helper already uses.
+/// Missing-key sentence. The name is the record's `env_key`.
 fn missing_bearer(env_key: &str) -> String {
-    if env_key == "OPENROUTER_API_KEY" {
-        "OPENROUTER_API_KEY is missing, so the catalog was not downloaded. Export OPENROUTER_API_KEY or pass --catalog-file. The config was not written and an empty cache was not written."
-            .to_owned()
-    } else {
-        format!(
-            "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
-        )
-    }
+    format!(
+        "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
+    )
 }
 
 /// Default cache directory `~/.cache/grok-router`. This is not the config file.
@@ -349,26 +343,6 @@ fn edited_config(
         return Ok(inserted);
     }
     config_edit::set_default(&inserted, slug).map_err(|refused| edit_failure(&refused.reason))
-}
-
-/// Refuse when either watched secret value would be written. The message names the variable, not the value.
-fn pasted_secret(text: &str) -> Result<(), String> {
-    for name in ["DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"] {
-        match env::var(name) {
-            Ok(value) if !value.is_empty() && text.contains(&value) => {
-                return Err(format!(
-                    "the new config contains the value of {name}. The file was left unchanged. Remove that value from the catalog fields before adding."
-                ));
-            }
-            Ok(_) | Err(env::VarError::NotPresent) => {}
-            Err(env::VarError::NotUnicode(_)) => {
-                return Err(format!(
-                    "{name} is not valid Unicode, so the config was not written. Export a Unicode value or unset {name}."
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// What failed, why, and what to do next. The file was not written.

@@ -156,7 +156,14 @@ fn load_rows(config: Option<&str>, args: &SearchArgs) -> Result<Vec<CatalogRow>,
         None => default_cache_dir()?,
     };
     let now = SystemTime::now();
-    match catalog::prepare_cached_body(&cache_dir, now, args.refresh, &api_key, &record.base_url)
+    match catalog::prepare_cached_body(
+        &cache_dir,
+        now,
+        args.refresh,
+        &api_key,
+        &record.base_url,
+        &record.env_key,
+    )
         .map_err(|err| cache_failure(&err, &record.env_key))?
     {
         CachedBodyOrFetch::Cached(bytes) => selected
@@ -167,7 +174,7 @@ fn load_rows(config: Option<&str>, args: &SearchArgs) -> Result<Vec<CatalogRow>,
                 .map_err(|err| cache_failure(&err, &record.env_key))?;
             let stored = catalog::write_cache(&cache_dir, &record.base_url, &bytes)
                 .map_err(|err| cache_failure(&err, &record.env_key))?;
-            if stored != catalog::cache_file_for(&cache_dir, &catalog::models_url(&record.base_url))
+            if stored != catalog::cache_path_for(&cache_dir, &catalog::models_url(&record.base_url))
             {
                 return Err(format!(
                     "the catalog cache was written to {}, outside {}. The config was not written. Pass --cache-dir.",
@@ -242,7 +249,7 @@ fn cartridge_failure(provider: &str, err: &CartridgeError) -> String {
 /// Turn a cache or download error into the command's sentence.
 fn cache_failure(err: &CatalogError, env_key: &str) -> String {
     match err {
-        CatalogError::MissingKey => missing_bearer(env_key),
+        CatalogError::MissingKey { .. } => missing_bearer(env_key),
         other => other.to_string(),
     }
 }
@@ -353,16 +360,11 @@ fn bearer(env_key: &str) -> Result<String, String> {
     }
 }
 
-/// Missing-key sentence. `OPENROUTER_API_KEY` keeps the sentence the cache helper already uses.
+/// Missing-key sentence. The name is the record's `env_key`.
 fn missing_bearer(env_key: &str) -> String {
-    if env_key == "OPENROUTER_API_KEY" {
-        "OPENROUTER_API_KEY is missing, so the catalog was not downloaded. Export OPENROUTER_API_KEY or pass --catalog-file. The config was not written and an empty cache was not written."
-            .to_owned()
-    } else {
-        format!(
-            "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
-        )
-    }
+    format!(
+        "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
+    )
 }
 
 /// Reject zero. Clap prints the returned string and exits.

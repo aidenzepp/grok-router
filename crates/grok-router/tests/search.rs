@@ -819,6 +819,11 @@ fn an_unknown_catalog_id_is_named_and_does_not_select_openrouter() {
         !stderr.to_ascii_lowercase().contains("json"),
         "the fixture must not be parsed as OpenRouter; stderr: {stderr}"
     );
+    let retired = format!("{} was not selected", "openrouter-models");
+    assert!(
+        !stderr.contains(&retired),
+        "stderr must not say OpenRouter was not selected; stderr: {stderr}"
+    );
     assert!(
         !stdout_text(&output).contains("gpt-4"),
         "the OpenRouter fixture must not be printed; stdout: {}",
@@ -847,7 +852,7 @@ fn a_custom_base_returns_the_hex_cache_row_and_not_a_decoy() {
     fs::create_dir_all(&cache).expect("the cache directory should be created");
     let base = "https://example.invalid/v1";
     let models_url = grok_router::catalog::models_url(base);
-    let hex_path = grok_router::catalog::cache_file_for(&cache, &models_url);
+    let hex_path = grok_router::catalog::cache_path_for(&cache, &models_url);
     let name = hex_path
         .file_name()
         .and_then(|file_name| file_name.to_str())
@@ -930,6 +935,22 @@ fn an_openrouter_base_uses_models_json_even_when_the_name_is_not_openrouter() {
     let models = cache.join("models.json");
     fs::write(&models, FIXTURE).expect("models.json should be written");
     mark_fresh(&models);
+    let models_before = fs::read(&models).expect("models.json should be readable");
+    let openrouter_url = grok_router::catalog::models_url(COMPILED_URL);
+    let mut hex = String::new();
+    for byte in openrouter_url.as_bytes() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    let hex_path = grok_router::catalog::cache_path_for(&cache, &openrouter_url);
+    let expected_name = format!("models-{hex}.json");
+    assert_eq!(
+        hex_path.file_name().and_then(|name| name.to_str()),
+        Some(expected_name.as_str()),
+        "the OpenRouter URL should cache as the hex of its bytes"
+    );
+    assert_ne!(hex_path, models);
+    fs::write(&hex_path, FIXTURE).expect("the hex cache should be written");
+    mark_fresh(&hex_path);
     let output = run(
         &dir,
         &[
@@ -946,10 +967,15 @@ fn an_openrouter_base_uses_models_json_even_when_the_name_is_not_openrouter() {
     );
     assert!(
         output.status.success(),
-        "an OpenRouter base should read models.json; stderr: {}",
+        "an OpenRouter base should read its hex cache, not models.json; stderr: {}",
         stderr_text(&output)
     );
     assert_eq!(stdout_text(&output), "gpt-4-turbo\n");
+    assert_eq!(
+        fs::read(&models).expect("models.json should still exist"),
+        models_before,
+        "search must not use the models.json decoy"
+    );
     remove_temp(&dir);
 }
 
@@ -971,7 +997,7 @@ fn a_provider_named_openrouter_with_another_base_does_not_use_models_json() {
     mark_fresh(&decoy);
     let decoy_before = fs::read(&decoy).expect("the decoy should be readable");
     let models_url = grok_router::catalog::models_url("https://example.invalid/v1");
-    let hex_path = grok_router::catalog::cache_file_for(&cache, &models_url);
+    let hex_path = grok_router::catalog::cache_path_for(&cache, &models_url);
     assert_ne!(hex_path, decoy);
     fs::write(&hex_path, HEX_CATALOG).expect("the hex cache should be written");
     mark_fresh(&hex_path);
@@ -1018,7 +1044,7 @@ fn a_deepseek_base_reads_its_hex_cache_and_not_models_json() {
     mark_fresh(&decoy);
     let decoy_before = fs::read(&decoy).expect("the decoy should be readable");
     let models_url = grok_router::catalog::models_url("https://api.deepseek.com");
-    let hex_path = grok_router::catalog::cache_file_for(&cache, &models_url);
+    let hex_path = grok_router::catalog::cache_path_for(&cache, &models_url);
     let name = hex_path
         .file_name()
         .and_then(|file_name| file_name.to_str())

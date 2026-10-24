@@ -13,13 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::config_edit::{CatalogModel, RefuseReason, derive_slug, require_slug};
-
-/// Default OpenRouter models URL. A derived URL equal to this caches as `models.json`.
-pub const MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
-
-/// Cache file name for [`MODELS_URL`] only. Any other models URL uses [`cache_file_for`].
-pub const CACHE_FILE_NAME: &str = "models.json";
+use crate::config_edit::{CatalogModel, RefuseReason, require_slug};
 
 /// A cache younger than this duration is the answer, unless refresh was asked for.
 pub const CACHE_FRESH: Duration = Duration::from_secs(60 * 60);
@@ -110,8 +104,13 @@ impl CatalogRow {
 /// Why a catalog load, match, or cache write stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogError {
-    /// `OPENROUTER_API_KEY` was missing or blank. Nothing was downloaded or cached.
-    MissingKey,
+    /// The API key was missing or blank. `env_key` is the variable that was required.
+    ///
+    /// An empty `env_key` names no provider. Nothing was downloaded or cached.
+    MissingKey {
+        /// Environment variable the caller asked to read. Empty names no provider.
+        env_key: String,
+    },
     /// The models URL was empty or only whitespace. No request was built.
     EmptyUrl,
     /// The bytes were not JSON.
@@ -132,24 +131,22 @@ pub enum CatalogError {
         detail: String,
     },
     /// The download returned no bytes. The cache was not written.
-    EmptyBody,
+    EmptyBody {
+        /// Environment variable whose value was sent. Empty names no provider.
+        env_key: String,
+    },
     /// The download failed. The cache was not written.
     Http {
         /// Failure detail, with the API key removed.
         detail: String,
+        /// Environment variable whose value was sent. Empty names no provider.
+        env_key: String,
     },
     /// The cache file could not be read or written.
     CacheIo {
         /// Path that failed.
         path: String,
         /// Filesystem detail.
-        detail: String,
-    },
-    /// A fresh cache file was not valid catalog JSON.
-    CacheInvalid {
-        /// Cache file that failed to parse.
-        path: String,
-        /// Parse detail.
         detail: String,
     },
     /// A caller asked to store an empty body. No file was written.
@@ -179,10 +176,19 @@ impl CatalogError {
 impl fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingKey => write!(
-                formatter,
-                "OPENROUTER_API_KEY is missing, so the catalog was not downloaded. Export OPENROUTER_API_KEY or pass --catalog-file. The config was not written and an empty cache was not written."
-            ),
+            Self::MissingKey { env_key } => {
+                if env_key.is_empty() {
+                    write!(
+                        formatter,
+                        "the API key is missing, so the catalog was not downloaded. Pass --catalog-file. The config was not written and an empty cache was not written."
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
+                    )
+                }
+            }
             Self::EmptyUrl => write!(
                 formatter,
                 "the models URL is empty or only whitespace, so no catalog request was built. Pass a non-blank models URL. Nothing was downloaded and the cache was not written."
@@ -199,21 +205,35 @@ impl fmt::Display for CatalogError {
                 formatter,
                 "catalog data[{index}] {detail}. Fix that element or remove it from the file."
             ),
-            Self::EmptyBody => write!(
-                formatter,
-                "the catalog download was empty. 0 bytes. Nothing was cached. Check OPENROUTER_API_KEY or pass --catalog-file."
-            ),
-            Self::Http { detail } => write!(
-                formatter,
-                "the catalog download failed: {detail}. Nothing was cached. Check the network and OPENROUTER_API_KEY, or pass --catalog-file."
-            ),
+            Self::EmptyBody { env_key } => {
+                if env_key.is_empty() {
+                    write!(
+                        formatter,
+                        "the catalog download was empty. 0 bytes. Nothing was cached. Pass --catalog-file."
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "the catalog download was empty. 0 bytes. Nothing was cached. Check {env_key} or pass --catalog-file."
+                    )
+                }
+            }
+            Self::Http { detail, env_key } => {
+                if env_key.is_empty() {
+                    write!(
+                        formatter,
+                        "the catalog download failed: {detail}. Nothing was cached. Check the network, or pass --catalog-file."
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "the catalog download failed: {detail}. Nothing was cached. Check the network and {env_key}, or pass --catalog-file."
+                    )
+                }
+            }
             Self::CacheIo { path, detail } => write!(
                 formatter,
                 "the catalog cache at {path} could not be used: {detail}. Pass --cache-dir or --catalog-file."
-            ),
-            Self::CacheInvalid { path, detail } => write!(
-                formatter,
-                "the cached catalog at {path} is not valid OpenRouter JSON: {detail}. Pass --refresh to download it again."
             ),
             Self::EmptyCacheWrite => write!(
                 formatter,
@@ -238,6 +258,7 @@ impl std::error::Error for CatalogError {}
 pub struct CatalogRequest {
     api_key: String,
     url: String,
+    env_key: String,
 }
 
 impl CatalogRequest {
@@ -266,6 +287,7 @@ impl fmt::Debug for CatalogRequest {
             .debug_struct("CatalogRequest")
             .field("method", &self.method())
             .field("url", &self.url())
+            .field("env_key", &self.env_key)
             .field("authorization", &"Bearer <redacted>")
             .finish()
     }
@@ -344,14 +366,23 @@ impl std::error::Error for ResolveError {}
 
 /// Build the models GET. A blank key or a blank URL does not build a request.
 ///
+/// `env_key` is copied onto [`CatalogError::MissingKey`] and onto the request.
+/// An empty name names no provider.
+///
 /// # Errors
 ///
 /// Returns [`CatalogError::MissingKey`] when `api_key` is empty or only whitespace.
 /// Returns [`CatalogError::EmptyUrl`] when `models_url` is empty or only whitespace.
 #[must_use = "the request is not sent until fetch_catalog_bytes"]
-pub fn catalog_request(api_key: &str, models_url: &str) -> Result<CatalogRequest, CatalogError> {
+pub fn catalog_request(
+    api_key: &str,
+    models_url: &str,
+    env_key: &str,
+) -> Result<CatalogRequest, CatalogError> {
     if api_key.is_empty() || api_key.chars().all(char::is_whitespace) {
-        return Err(CatalogError::MissingKey);
+        return Err(CatalogError::MissingKey {
+            env_key: env_key.to_owned(),
+        });
     }
     if models_url.is_empty() || models_url.chars().all(char::is_whitespace) {
         return Err(CatalogError::EmptyUrl);
@@ -359,6 +390,7 @@ pub fn catalog_request(api_key: &str, models_url: &str) -> Result<CatalogRequest
     Ok(CatalogRequest {
         api_key: api_key.to_owned(),
         url: models_url.to_owned(),
+        env_key: env_key.to_owned(),
     })
 }
 
@@ -410,7 +442,7 @@ pub enum Cartridge {
 pub enum CartridgeError {
     /// The catalog id was absent or empty.
     Missing,
-    /// `id` is not a known cartridge. OpenRouter was not selected.
+    /// `id` is not a known cartridge. No cartridge was selected.
     Unknown {
         /// Catalog id that was refused.
         id: String,
@@ -426,7 +458,7 @@ impl fmt::Display for CartridgeError {
             ),
             Self::Unknown { id } => write!(
                 formatter,
-                "catalog id {id:?} is not a cartridge, so openrouter-models was not selected. Pass openrouter-models or deepseek-list-models. Nothing was written."
+                "catalog id {id:?} is not a cartridge. No cartridge was selected. Pass openrouter-models or deepseek-list-models. Nothing was written."
             ),
         }
     }
@@ -488,15 +520,57 @@ pub fn cartridge(catalog_id: Option<&str>) -> Result<Cartridge, CartridgeError> 
     }
 }
 
-/// OpenRouter slug: derive `or-` plus the leaf, or require `--as` as given.
+/// OpenRouter slug: `or-` plus the leaf, or `--as` as given.
+///
+/// This is the only path that adds an `or-` prefix.
 fn openrouter_slug(model_id: &str, explicit: Option<&str>) -> Result<String, RefuseReason> {
     match explicit {
         Some(slug) => {
             require_slug(slug)?;
             Ok(slug.to_owned())
         }
-        None => derive_slug(model_id),
+        None => openrouter_leaf_slug(model_id),
     }
+}
+
+/// `or-` plus the normalized last path segment of `provider_id`.
+fn openrouter_leaf_slug(provider_id: &str) -> Result<String, RefuseReason> {
+    if provider_id.is_empty() {
+        return Err(RefuseReason::EmptyProviderId);
+    }
+    let leaf = match provider_id.rsplit('/').next() {
+        Some(segment) => segment,
+        None => provider_id,
+    };
+    let normalized = normalize_leaf(leaf);
+    if normalized.is_empty() {
+        return Err(RefuseReason::EmptySlugLeaf {
+            provider_id: provider_id.to_owned(),
+        });
+    }
+    let slug = format!("or-{normalized}");
+    require_slug(&slug)?;
+    Ok(slug)
+}
+
+/// Turn every non-alphanumeric run into one hyphen, then trim and lowercase.
+fn normalize_leaf(leaf: &str) -> String {
+    let mut normalized = String::new();
+    let mut pending_hyphen = false;
+    let mut started = false;
+    for ch in leaf.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_hyphen && started {
+                normalized.push('-');
+            }
+            pending_hyphen = false;
+            started = true;
+            normalized.push(ch.to_ascii_lowercase());
+        } else if started {
+            pending_hyphen = true;
+        }
+    }
+    normalized
 }
 
 /// DeepSeek slug: the id itself, or `--as` when present. Never a derived leaf.
@@ -568,7 +642,7 @@ pub enum CachedBodyOrFetch {
 
 /// Read a fresh cache body for `base_url`, or build the GET that should replace it.
 ///
-/// The path is [`cache_file_for`] of [`models_url`]. Does not parse, does not
+/// The path is [`cache_path_for`] of [`models_url`]. Does not parse, does not
 /// write, does not call the network, and does not read the clock. `now` is
 /// the caller's instant. A cache whose modification time is in the future is
 /// not used. `base_url` is a base URL, not a provider name or a catalog id.
@@ -577,14 +651,17 @@ pub enum CachedBodyOrFetch {
 ///
 /// Returns [`CatalogError::MissingKey`] when a download is required and `api_key` is blank.
 /// Returns [`CatalogError::CacheIo`] when an existing cache file cannot be read.
+/// `env_key` is stored on that error and on the request. This function does not
+/// call [`models_url`]; [`fresh_bytes_or_fetch`] does.
 pub fn prepare_cached_body(
     cache_dir: &Path,
     now: SystemTime,
     refresh: bool,
     api_key: &str,
     base_url: &str,
+    env_key: &str,
 ) -> Result<CachedBodyOrFetch, CatalogError> {
-    match fresh_bytes_or_fetch(cache_dir, now, refresh, api_key, base_url)? {
+    match fresh_bytes_or_fetch(cache_dir, now, refresh, api_key, base_url, env_key)? {
         FreshBytesOrFetch::Fresh { bytes } => Ok(CachedBodyOrFetch::Cached(bytes)),
         FreshBytesOrFetch::Fetch(request) => Ok(CachedBodyOrFetch::Fetch(request)),
     }
@@ -608,9 +685,10 @@ fn fresh_bytes_or_fetch(
     refresh: bool,
     api_key: &str,
     base_url: &str,
+    env_key: &str,
 ) -> Result<FreshBytesOrFetch, CatalogError> {
     let url = models_url(base_url);
-    let path = cache_file_for(cache_dir, &url);
+    let path = cache_path_for(cache_dir, &url);
     if !refresh {
         if let Some((bytes, age)) = read_cache_age(&path, now)? {
             if !bytes.is_empty() && cache_choice(age, false) == CacheChoice::Use {
@@ -618,7 +696,7 @@ fn fresh_bytes_or_fetch(
             }
         }
     }
-    catalog_request(api_key, &url).map(FreshBytesOrFetch::Fetch)
+    catalog_request(api_key, &url, env_key).map(FreshBytesOrFetch::Fetch)
 }
 
 /// Download the catalog body. Does not write the cache or the config.
@@ -631,6 +709,7 @@ pub fn fetch_catalog_bytes(request: &CatalogRequest) -> Result<Vec<u8>, CatalogE
     if request.method() != "GET" {
         return Err(CatalogError::Http {
             detail: "refusing to send a catalog request that is not GET".to_owned(),
+            env_key: request.env_key.clone(),
         });
     }
     let authorization = request.authorization();
@@ -639,6 +718,7 @@ pub fn fetch_catalog_bytes(request: &CatalogRequest) -> Result<Vec<u8>, CatalogE
         .call()
         .map_err(|err| CatalogError::Http {
             detail: redact(&err.to_string(), request),
+            env_key: request.env_key.clone(),
         })?;
     let bytes = response
         .body_mut()
@@ -647,9 +727,12 @@ pub fn fetch_catalog_bytes(request: &CatalogRequest) -> Result<Vec<u8>, CatalogE
         .read_to_vec()
         .map_err(|err| CatalogError::Http {
             detail: redact(&err.to_string(), request),
+            env_key: request.env_key.clone(),
         })?;
     if bytes.is_empty() {
-        return Err(CatalogError::EmptyBody);
+        return Err(CatalogError::EmptyBody {
+            env_key: request.env_key.clone(),
+        });
     }
     Ok(bytes)
 }
@@ -666,32 +749,19 @@ pub fn models_url(base_url: &str) -> String {
     format!("{without_one_slash}/models")
 }
 
-/// Path of `models.json` inside `cache_dir`.
-///
-/// Correct only for the derived default models URL. Other URLs use [`cache_file_for`].
-#[must_use]
-pub fn cache_file(cache_dir: &Path) -> PathBuf {
-    cache_dir.join(CACHE_FILE_NAME)
-}
-
 /// Cache path for one models URL.
 ///
-/// [`MODELS_URL`] uses [`cache_file`]. Any other URL uses
-/// `<cache_dir>/models-<hex>.json`. `<hex>` is the lowercase hex of the URL's
-/// UTF-8 bytes, two digits per byte, with no separators. That file name is
-/// never `models.json`.
+/// The file is `<cache_dir>/models-<hex>.json`. `<hex>` is the lowercase hex
+/// of the URL's UTF-8 bytes, two digits per byte, with no separators. The name
+/// is never `models.json`.
 #[must_use]
-pub fn cache_file_for(cache_dir: &Path, models_url: &str) -> PathBuf {
+pub fn cache_path_for(cache_dir: &Path, models_url: &str) -> PathBuf {
     cache_dir.join(cache_file_name(models_url))
 }
 
-/// File name for `models_url`. Never `models.json` unless `models_url` is [`MODELS_URL`].
+/// File name for `models_url`. Always `models-<hex>.json`, never `models.json`.
 fn cache_file_name(models_url: &str) -> String {
-    if models_url == MODELS_URL {
-        CACHE_FILE_NAME.to_owned()
-    } else {
-        format!("models-{}.json", encode_hex(models_url.as_bytes()))
-    }
+    format!("models-{}.json", encode_hex(models_url.as_bytes()))
 }
 
 /// Lowercase hex of `bytes`, two digits per byte, no separators.
@@ -705,9 +775,9 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 /// Store catalog bytes for `base_url` under `cache_dir`.
 ///
-/// The path is [`cache_file_for`] of [`models_url`]. Empty bytes are refused
+/// The path is [`cache_path_for`] of [`models_url`]. Empty bytes are refused
 /// and no file is created. A non-empty body is written to a temporary file in
-/// `cache_dir` that is not named `models.json`, then renamed into place.
+/// `cache_dir`, then renamed into place. The temporary name is not `models.json`.
 ///
 /// # Errors
 ///
@@ -722,7 +792,7 @@ pub fn write_cache(
     }
     fs::create_dir_all(cache_dir).map_err(|err| CatalogError::cache_io(cache_dir, &err))?;
     let url = models_url(base_url);
-    let destination = cache_file_for(cache_dir, &url);
+    let destination = cache_path_for(cache_dir, &url);
     let temporary = cache_dir.join(format!(".{}.tmp", cache_file_name(&url)));
     fs::write(&temporary, bytes).map_err(|err| CatalogError::cache_io(&temporary, &err))?;
     if let Err(err) = fs::rename(&temporary, &destination) {
@@ -1031,7 +1101,16 @@ mod tests {
 
     use super::*;
 
-    const COMPILED_BASE: &str = crate::config_edit::OPENROUTER_BASE_URL;
+    const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
+    const OPENROUTER_ENV: &str = "OPENROUTER_API_KEY";
+
+    fn openrouter_cache(dir: &Path) -> PathBuf {
+        cache_path_for(dir, &models_url(OPENROUTER_BASE))
+    }
+
+    fn models_json(dir: &Path) -> PathBuf {
+        dir.join("models.json")
+    }
 
     const FIXTURE: &str = r#"{
         "data": [
@@ -1285,7 +1364,7 @@ mod tests {
 
     #[test]
     fn models_request_is_a_get_with_a_bearer_header_and_does_not_call_the_network() {
-        let request = catalog_request("test-key", &models_url(COMPILED_BASE))
+        let request = catalog_request("test-key", &models_url(OPENROUTER_BASE), OPENROUTER_ENV)
             .expect("a non-empty key should build a request");
         assert_eq!(request.method(), "GET");
         assert_eq!(request.url(), "https://openrouter.ai/api/v1/models");
@@ -1299,13 +1378,23 @@ mod tests {
 
     #[test]
     fn an_empty_key_refuses_the_request_and_names_the_next_step() {
-        let error =
-            catalog_request("  ", MODELS_URL).expect_err("a blank key must not build a request");
-        assert_eq!(error, CatalogError::MissingKey);
+        let env_key = "DEEPSEEK_API_KEY";
+        let error = catalog_request("  ", "https://api.deepseek.com/models", env_key)
+            .expect_err("a blank key must not build a request");
+        assert_eq!(
+            error,
+            CatalogError::MissingKey {
+                env_key: env_key.to_owned(),
+            }
+        );
         let message = error.to_string();
         assert!(
-            message.contains("OPENROUTER_API_KEY"),
-            "the error should name the missing key; message: {message}"
+            message.contains(env_key),
+            "the error should name the key that was passed in; message: {message}"
+        );
+        assert!(
+            !message.contains(OPENROUTER_ENV),
+            "a deepseek key must not be described as {OPENROUTER_ENV}; message: {message}"
         );
         assert!(
             message.contains("--catalog-file"),
@@ -1349,7 +1438,7 @@ mod tests {
     #[test]
     fn prepare_uses_a_fresh_cache_without_a_key_and_does_not_write() {
         let dir = temp_cache("fresh");
-        let path = cache_file(&dir);
+        let path = openrouter_cache(&dir);
         fs::write(&path, FIXTURE).expect("the fresh cache fixture should be written");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         fs::File::options()
@@ -1360,7 +1449,7 @@ mod tests {
             .expect("the test should set the cache mtime");
         let before = fs::read(&path).expect("the cache fixture should still be readable");
         let now = modified + Duration::from_secs(30 * 60);
-        let prepared = prepare_cached_body(&dir, now, false, "", COMPILED_BASE)
+        let prepared = prepare_cached_body(&dir, now, false, "", OPENROUTER_BASE, OPENROUTER_ENV)
             .expect("a fresh cache should load without an API key");
         match prepared {
             CachedBodyOrFetch::Cached(bytes) => {
@@ -1380,7 +1469,7 @@ mod tests {
     #[test]
     fn prepare_refetches_when_the_cache_is_older_than_one_hour() {
         let dir = temp_cache("stale");
-        let path = cache_file(&dir);
+        let path = openrouter_cache(&dir);
         fs::write(&path, FIXTURE).expect("the stale cache fixture should be written");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         fs::File::options()
@@ -1390,7 +1479,7 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let now = modified + CACHE_FRESH;
-        let prepared = prepare_cached_body(&dir, now, false, "test-key", COMPILED_BASE)
+        let prepared = prepare_cached_body(&dir, now, false, "test-key", OPENROUTER_BASE, OPENROUTER_ENV)
             .expect("a stale cache with a key should plan a download");
         match prepared {
             CachedBodyOrFetch::Fetch(request) => {
@@ -1408,7 +1497,7 @@ mod tests {
     #[test]
     fn prepare_refetches_a_fresh_cache_when_refresh_is_set() {
         let dir = temp_cache("refresh");
-        let path = cache_file(&dir);
+        let path = openrouter_cache(&dir);
         fs::write(&path, FIXTURE).expect("the cache fixture should be written");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         fs::File::options()
@@ -1418,7 +1507,7 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let now = modified + Duration::from_secs(1);
-        let prepared = prepare_cached_body(&dir, now, true, "test-key", COMPILED_BASE)
+        let prepared = prepare_cached_body(&dir, now, true, "test-key", OPENROUTER_BASE, OPENROUTER_ENV)
             .expect("refresh with a key should plan a download");
         assert!(
             matches!(prepared, CachedBodyOrFetch::Fetch(_)),
@@ -1430,7 +1519,7 @@ mod tests {
     #[test]
     fn a_stale_cache_without_a_key_fails_and_writes_nothing() {
         let dir = temp_cache("nokey");
-        let path = cache_file(&dir);
+        let path = openrouter_cache(&dir);
         fs::write(&path, FIXTURE).expect("the cache fixture should be written");
         let before = fs::read(&path).expect("the cache fixture should be readable");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -1441,9 +1530,14 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let now = modified + CACHE_FRESH + Duration::from_secs(5);
-        let error = prepare_cached_body(&dir, now, false, "", COMPILED_BASE)
+        let error = prepare_cached_body(&dir, now, false, "", OPENROUTER_BASE, OPENROUTER_ENV)
             .expect_err("a stale cache without a key must not download");
-        assert_eq!(error, CatalogError::MissingKey);
+        assert_eq!(
+            error,
+            CatalogError::MissingKey {
+                env_key: OPENROUTER_ENV.to_owned(),
+            }
+        );
         let after = fs::read(&path).expect("the stale cache should still exist");
         assert_eq!(before, after, "a missing key must not rewrite the cache");
         remove_temp(&dir);
@@ -1453,12 +1547,21 @@ mod tests {
     fn a_missing_cache_without_a_key_does_not_create_a_file() {
         let dir = temp_cache("absent");
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let error = prepare_cached_body(&dir, now, false, "", COMPILED_BASE)
+        let error = prepare_cached_body(&dir, now, false, "", OPENROUTER_BASE, OPENROUTER_ENV)
             .expect_err("a missing cache without a key must fail");
-        assert_eq!(error, CatalogError::MissingKey);
+        assert_eq!(
+            error,
+            CatalogError::MissingKey {
+                env_key: OPENROUTER_ENV.to_owned(),
+            }
+        );
         assert!(
-            !cache_file(&dir).exists(),
-            "a missing key must not create an empty cache"
+            !openrouter_cache(&dir).exists(),
+            "a missing key must not create the hex cache"
+        );
+        assert!(
+            !models_json(&dir).exists(),
+            "a missing key must not create models.json"
         );
         remove_temp(&dir);
     }
@@ -1467,14 +1570,21 @@ mod tests {
     fn empty_cache_bytes_are_not_written() {
         let dir = temp_cache("empty");
         let error =
-            write_cache(&dir, COMPILED_BASE, b"").expect_err("an empty body must not be stored");
+            write_cache(&dir, OPENROUTER_BASE, b"").expect_err("an empty body must not be stored");
         assert_eq!(error, CatalogError::EmptyCacheWrite);
         assert!(
-            !cache_file(&dir).exists(),
+            !openrouter_cache(&dir).exists(),
+            "refusing an empty cache must not create the hex cache"
+        );
+        assert!(
+            !models_json(&dir).exists(),
             "refusing an empty cache must not create models.json"
         );
         assert!(
-            !dir.join(".models.json.tmp").exists(),
+            dir.read_dir()
+                .expect("the empty cache directory should be readable")
+                .next()
+                .is_none(),
             "refusing an empty cache must not create a temporary file"
         );
         remove_temp(&dir);
@@ -1483,14 +1593,23 @@ mod tests {
     #[test]
     fn write_cache_stores_bytes_only_under_the_cache_directory() {
         let dir = temp_cache("store");
-        let written = write_cache(&dir, COMPILED_BASE, FIXTURE.as_bytes())
+        let written = write_cache(&dir, OPENROUTER_BASE, FIXTURE.as_bytes())
             .expect("a non-empty catalog should be stored");
-        assert_eq!(written, cache_file(&dir));
+        assert_eq!(written, openrouter_cache(&dir));
         let stored = fs::read(&written).expect("the stored cache should be readable");
         assert_eq!(stored, FIXTURE.as_bytes());
+        let name = written
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .expect("the cache file name should be Unicode");
+        assert_ne!(name, "models.json");
         assert!(
-            !dir.join(".models.json.tmp").exists(),
+            !dir.join(format!(".{name}.tmp")).exists(),
             "the temporary file should be renamed into place"
+        );
+        assert!(
+            !models_json(&dir).exists(),
+            "the OpenRouter URL must not also be stored as models.json"
         );
         remove_temp(&dir);
     }
@@ -1518,7 +1637,7 @@ mod tests {
             "surrounding spaces stay"
         );
         assert_eq!(
-            models_url(COMPILED_BASE),
+            models_url(OPENROUTER_BASE),
             "https://openrouter.ai/api/v1/models",
             "the compiled base still derives to the OpenRouter models URL"
         );
@@ -1526,16 +1645,49 @@ mod tests {
 
     #[test]
     fn the_default_models_url_caches_as_models_json() {
-        let dir = Path::new("cache");
-        let url = models_url(COMPILED_BASE);
-        assert_eq!(url, MODELS_URL);
-        assert_eq!(cache_file_for(dir, &url), cache_file(dir));
+        let dir = temp_cache("openrouter-hex");
+        let url = models_url("https://openrouter.ai/api/v1");
+        assert_eq!(url, "https://openrouter.ai/api/v1/models");
+        let hex_name = format!("models-{}.json", lowercase_hex(&url));
+        let path = cache_path_for(&dir, &url);
         assert_eq!(
-            cache_file_for(dir, MODELS_URL)
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some(CACHE_FILE_NAME)
+            path.file_name().and_then(|name| name.to_str()),
+            Some(hex_name.as_str()),
+            "the OpenRouter URL caches as the hex of its bytes, not a hardcoded name"
         );
+        assert_ne!(hex_name, "models.json");
+        let decoy = models_json(&dir);
+        let decoy_bytes = br#"{"data":[{"id":"decoy/model","name":"Decoy"}]}"#;
+        fs::write(&path, FIXTURE).expect("the hex cache fixture should be written");
+        fs::write(&decoy, decoy_bytes).expect("the models.json decoy should be written");
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        set_cache_mtime(&path, modified);
+        set_cache_mtime(&decoy, modified);
+        let now = modified + Duration::from_secs(30 * 60);
+        let prepared = prepare_cached_body(&dir, now, false, "", OPENROUTER_BASE, OPENROUTER_ENV)
+            .expect("a fresh hex cache should answer the OpenRouter URL");
+        match prepared {
+            CachedBodyOrFetch::Cached(bytes) => {
+                let rows = parse_catalog(&bytes).expect("the hex cache should parse");
+                assert!(
+                    rows.iter().any(|row| row.id() == "gpt-4"),
+                    "the hex file should answer https://openrouter.ai/api/v1/models"
+                );
+                assert!(
+                    rows.iter().all(|row| row.id() != "decoy/model"),
+                    "models.json must not answer the OpenRouter URL"
+                );
+            }
+            CachedBodyOrFetch::Fetch(request) => {
+                panic!("a fresh hex cache must not build a download; request {request:?}")
+            }
+        }
+        assert_eq!(
+            fs::read(&decoy).expect("models.json should still be readable"),
+            decoy_bytes,
+            "prepare must not rewrite the models.json decoy"
+        );
+        remove_temp(&dir);
     }
 
     #[test]
@@ -1543,21 +1695,20 @@ mod tests {
         let dir = Path::new("cache");
         let url = models_url("https://example.invalid/v1");
         assert_eq!(models_url("https://example.invalid/v1/"), url);
-        let path = cache_file_for(dir, &url);
+        let path = cache_path_for(dir, &url);
         let hex = lowercase_hex(&url);
         assert_eq!(
             path,
             dir.join(format!("models-{hex}.json")),
             "the hex name is the lowercase hex of the models URL bytes"
         );
-        assert_ne!(path, cache_file(dir));
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .expect("the cache file name should be Unicode");
         assert_ne!(name, "models.json");
         assert_eq!(
-            cache_file_for(dir, &models_url("https://example.invalid/v1/")),
+            cache_path_for(dir, &models_url("https://example.invalid/v1/")),
             path,
             "one trailing slash on the base does not get a second cache file"
         );
@@ -1567,8 +1718,8 @@ mod tests {
     fn a_custom_base_reads_its_cache_and_does_not_read_models_json() {
         let dir = temp_cache("custom-read");
         let url = models_url("https://example.invalid/v1");
-        let custom = cache_file_for(&dir, &url);
-        let decoy = cache_file(&dir);
+        let custom = cache_path_for(&dir, &url);
+        let decoy = models_json(&dir);
         let decoy_bytes = br#"{"data":[{"id":"decoy/model","name":"Decoy"}]}"#;
         fs::write(&custom, FIXTURE).expect("the custom cache fixture should be written");
         fs::write(&decoy, decoy_bytes).expect("the models.json decoy should be written");
@@ -1576,7 +1727,14 @@ mod tests {
         set_cache_mtime(&custom, modified);
         set_cache_mtime(&decoy, modified);
         let now = modified + Duration::from_secs(30 * 60);
-        let prepared = prepare_cached_body(&dir, now, false, "", "https://example.invalid/v1/")
+        let prepared = prepare_cached_body(
+            &dir,
+            now,
+            false,
+            "",
+            "https://example.invalid/v1/",
+            "EXAMPLE_API_KEY",
+        )
             .expect("a fresh cache for the derived custom URL should load");
         match prepared {
             CachedBodyOrFetch::Cached(bytes) => {
@@ -1610,11 +1768,11 @@ mod tests {
         let written = write_cache(&dir, base, FIXTURE.as_bytes())
             .expect("a non-empty catalog for a custom base should be stored");
         let url = models_url(base);
-        let expected = cache_file_for(&dir, &url);
+        let expected = cache_path_for(&dir, &url);
         assert_eq!(written, expected);
-        assert_ne!(written, cache_file(&dir));
+        assert_ne!(written, models_json(&dir));
         assert!(
-            !cache_file(&dir).exists(),
+            !models_json(&dir).exists(),
             "a custom base must not create models.json"
         );
         let stored = fs::read(&written).expect("the hex cache should be readable");
@@ -1635,7 +1793,7 @@ mod tests {
     #[test]
     fn a_blank_models_url_does_not_build_a_request() {
         for url in ["", " ", "\t", " \n"] {
-            let error = catalog_request("test-key", url)
+            let error = catalog_request("test-key", url, OPENROUTER_ENV)
                 .expect_err("a blank models URL must not build a request");
             assert_eq!(error, CatalogError::EmptyUrl, "url {url:?}");
             let message = error.to_string();
@@ -1657,7 +1815,7 @@ mod tests {
     #[test]
     fn catalog_request_returns_the_models_url_it_stored() {
         let url = models_url("https://example.invalid/v1");
-        let request = catalog_request("test-key", &url)
+        let request = catalog_request("test-key", &url, "EXAMPLE_API_KEY")
             .expect("a non-blank key and URL should build a request");
         assert_eq!(request.method(), "GET");
         assert_eq!(request.url(), url);
@@ -1766,8 +1924,13 @@ mod tests {
             "the unknown-id error should name that id; message: {message}"
         );
         assert!(
-            message.contains("not selected"),
-            "the unknown-id error should say OpenRouter was not selected; message: {message}"
+            message.contains("No cartridge was selected"),
+            "the unknown-id error should say no cartridge was selected; message: {message}"
+        );
+        let retired = format!("{} was not selected", "openrouter-models");
+        assert!(
+            !message.contains(&retired),
+            "the unknown-id error must not say OpenRouter was not selected; message: {message}"
         );
     }
 
@@ -1931,6 +2094,90 @@ mod tests {
     }
 
     #[test]
+    fn derived_slug_uses_the_leaf_and_an_empty_leaf_is_an_error() {
+        let openrouter = selected("openrouter-models");
+        assert_eq!(
+            openrouter
+                .slug("z-ai/glm-5.3", None)
+                .expect("glm-5.3 should derive a bare slug"),
+            "or-glm-5-3"
+        );
+        for provider_id in ["acme/", "@@@", "/"] {
+            let refused = openrouter
+                .slug(provider_id, None)
+                .expect_err("an empty leaf should refuse derivation");
+            assert!(
+                matches!(refused, RefuseReason::EmptySlugLeaf { .. }),
+                "{provider_id} should be an empty leaf, got {refused}"
+            );
+        }
+        let direct = selected("deepseek-list-models");
+        assert_eq!(
+            direct
+                .slug("deepseek-v4-pro", None)
+                .expect("a direct id should stay the id"),
+            "deepseek-v4-pro",
+            "a direct-catalog slug is the id, not an or- leaf"
+        );
+    }
+
+    #[test]
+    fn download_errors_name_the_env_key_that_was_used() {
+        for env_key in ["DEEPSEEK_API_KEY", OPENROUTER_ENV] {
+            let missing = CatalogError::MissingKey {
+                env_key: env_key.to_owned(),
+            };
+            let empty = CatalogError::EmptyBody {
+                env_key: env_key.to_owned(),
+            };
+            let http = CatalogError::Http {
+                detail: "connection refused".to_owned(),
+                env_key: env_key.to_owned(),
+            };
+            for error in [&missing, &empty, &http] {
+                let message = error.to_string();
+                assert!(
+                    message.contains(env_key),
+                    "{env_key} should be named; message: {message}"
+                );
+                if env_key != OPENROUTER_ENV {
+                    assert!(
+                        !message.contains(OPENROUTER_ENV),
+                        "{env_key} must not be described as {OPENROUTER_ENV}; message: {message}"
+                    );
+                }
+            }
+            assert!(
+                missing.to_string().contains("Export "),
+                "a named key should say how to export it"
+            );
+        }
+        let unnamed = [
+            CatalogError::MissingKey {
+                env_key: String::new(),
+            },
+            CatalogError::EmptyBody {
+                env_key: String::new(),
+            },
+            CatalogError::Http {
+                detail: "connection refused".to_owned(),
+                env_key: String::new(),
+            },
+        ];
+        for error in unnamed {
+            let message = error.to_string();
+            assert!(
+                !message.contains("Export "),
+                "an empty env key must not say Export; message: {message}"
+            );
+            assert!(
+                !message.contains(OPENROUTER_ENV),
+                "an empty env key must not name {OPENROUTER_ENV}; message: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn openrouter_slug_derives_or_leaf_unless_as_is_present() {
         let openrouter = selected("openrouter-models");
         assert_eq!(
@@ -2002,7 +2249,7 @@ mod tests {
             with_slash, without_slash,
             "one trailing slash is the same models URL"
         );
-        let path = cache_file_for(dir, &without_slash);
+        let path = cache_path_for(dir, &without_slash);
         let name = path
             .file_name()
             .and_then(|file_name| file_name.to_str())
@@ -2013,27 +2260,32 @@ mod tests {
             "the other cache name is computed from the URL bytes and is not a hardcoded hex"
         );
         assert_ne!(name, "models.json");
-        assert_ne!(path, cache_file(dir));
-        let openrouter = models_url(COMPILED_BASE);
-        assert_eq!(openrouter, MODELS_URL);
+        let openrouter = models_url("https://openrouter.ai/api/v1");
+        let openrouter_name = cache_path_for(dir, &openrouter)
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .expect("the OpenRouter cache name should be Unicode")
+            .to_owned();
         assert_eq!(
-            cache_file_for(dir, &openrouter),
-            cache_file(dir),
-            "the OpenRouter base caches as models.json because the URL equals MODELS_URL"
+            openrouter_name,
+            format!("models-{}.json", lowercase_hex(&openrouter)),
+            "the OpenRouter URL also caches as the hex of its bytes"
         );
+        assert_ne!(openrouter_name, "models.json");
+        assert_ne!(openrouter_name, name);
     }
 
     #[test]
     fn prepare_cached_body_returns_fresh_bytes_without_parsing() {
         let dir = temp_cache("body");
         let base = "https://api.deepseek.com";
-        let path = cache_file_for(&dir, &models_url("https://api.deepseek.com/"));
+        let path = cache_path_for(&dir, &models_url("https://api.deepseek.com/"));
         let bytes = b"not-json-but-fresh";
         fs::write(&path, bytes).expect("the fresh body fixture should be written");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         set_cache_mtime(&path, modified);
         let now = modified + Duration::from_secs(30 * 60);
-        let prepared = prepare_cached_body(&dir, now, false, "", base)
+        let prepared = prepare_cached_body(&dir, now, false, "", base, "DEEPSEEK_API_KEY")
             .expect("a fresh cache body should load without an API key");
         match prepared {
             CachedBodyOrFetch::Cached(got) => assert_eq!(got, bytes),
@@ -2045,7 +2297,7 @@ mod tests {
             }
         }
         assert!(
-            !cache_file(&dir).exists(),
+            !models_json(&dir).exists(),
             "a DeepSeek base must not read or create models.json"
         );
         let parsed = parse_catalog(bytes);
@@ -2061,12 +2313,12 @@ mod tests {
         let dir = temp_cache("body-stale");
         let base = "https://api.deepseek.com/";
         let url = models_url(base);
-        let path = cache_file_for(&dir, &url);
+        let path = cache_path_for(&dir, &url);
         fs::write(&path, b"stale").expect("the stale body fixture should be written");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         set_cache_mtime(&path, modified);
         let now = modified + CACHE_FRESH;
-        let prepared = prepare_cached_body(&dir, now, false, "test-key", base)
+        let prepared = prepare_cached_body(&dir, now, false, "test-key", base, "DEEPSEEK_API_KEY")
             .expect("a stale cache with a key should plan a download");
         match prepared {
             CachedBodyOrFetch::Fetch(request) => {
@@ -2074,8 +2326,8 @@ mod tests {
                 assert_eq!(request.url(), url);
                 assert_eq!(request.authorization(), "Bearer test-key");
                 assert_ne!(
-                    cache_file_for(&dir, request.url()),
-                    cache_file(&dir),
+                    cache_path_for(&dir, request.url()).file_name(),
+                    models_json(&dir).file_name(),
                     "the fetch URL must not be the models.json cache"
                 );
             }

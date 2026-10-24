@@ -458,3 +458,62 @@ fn remove_without_config_exits_1_and_does_not_open_a_home_config() {
     );
     remove_temp(&dir);
 }
+
+#[test]
+fn remove_refuses_a_named_env_key_value_and_leaves_the_file() {
+    let dir = temp_root("named-secret");
+    let config = dir.join("config.toml");
+    let secret = "deepseek-secret-value-91";
+    let text = format!(
+        "\
+# kept comment
+[model.or-drop]
+model = \"z-ai/glm-5.3\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"GLM 5.3\"
+env_key = \"DEEPSEEK_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 600000
+
+[model.or-kept]
+model = \"deepseek/deepseek-v4.1-flash-1017\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"{secret}\"
+env_key = \"DEEPSEEK_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 1000000
+
+[models]
+default = \"grok-4.7\"
+default_reasoning_effort = \"high\"
+"
+    );
+    fs::write(&config, &text).expect("the named-secret fixture should be written");
+    let before = fs::read(&config).expect("the named-secret fixture should be readable");
+    let output = Command::new(env!("CARGO_BIN_EXE_grok-router"))
+        .args(["remove", "--yes", "--config", "config.toml", "or-drop"])
+        .env("DEEPSEEK_API_KEY", secret)
+        .env_remove("OPENROUTER_API_KEY")
+        .env("HOME", &dir)
+        .env("GROK_HOME", &dir)
+        .env("NO_COLOR", "1")
+        .current_dir(&dir)
+        .output()
+        .expect("the grok-router binary should start");
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "remove should refuse a named env value; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("DEEPSEEK_API_KEY"),
+        "stderr should name DEEPSEEK_API_KEY; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(secret),
+        "stderr should not print the secret value; stderr: {stderr}"
+    );
+    assert_file_unchanged(&config, &before);
+    remove_temp(&dir);
+}
