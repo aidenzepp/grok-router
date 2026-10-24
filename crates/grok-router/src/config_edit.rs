@@ -491,6 +491,225 @@ pub fn insert_model(
     )
 }
 
+/// One direct model span. Absent optionals omit their lines.
+///
+/// `name`, `context_window`, and `vision` are independent of each other.
+/// `context_window` is written only when it is greater than zero. `vision`
+/// writes `vision = true` and never `vision = false`.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectBlock<'a> {
+    /// Header slug. Not taken from [`Self::model`].
+    pub slug: &'a str,
+    /// Value of the `model` line.
+    pub model: &'a str,
+    /// Value of the `base_url` line. Not trimmed.
+    pub base_url: &'a str,
+    /// Value of the `name` line. `None` omits the line. `Some("")` is refused.
+    pub name: Option<&'a str>,
+    /// Value of the `api_backend` line. Written as supplied.
+    pub api_backend: &'a str,
+    /// Value of the `env_key` line. The variable name, not its value.
+    pub env_key: &'a str,
+    /// Value of the `context_window` line. `None` omits it. Zero and below are refused.
+    pub context_window: Option<i64>,
+    /// Whether to write `vision = true` after the window, or after `env_key` when the window is omitted.
+    pub vision: bool,
+}
+
+/// Insert one direct model block into `config`.
+///
+/// Renders the span itself and splices it with the same block insert the
+/// catalog path uses. Does not call [`render_block`] or [`insert_model`], and
+/// does not treat two slugs that
+/// store the same model id as duplicates. An existing span for `block.slug`
+/// that already equals the rendered block returns `config`. A different span
+/// for that slug, or a built-in slug from [`builtins_from`], is
+/// [`RefuseReason::SlugInUse`]. An absent `[router]` table still uses the
+/// compiled built-in slugs.
+///
+/// # Errors
+///
+/// Returns [`Refused`] and the original text when the block is unusable, the
+/// slug is taken, or the splice would not preserve the document.
+pub fn insert_direct(config: &str, block: DirectBlock<'_>) -> Result<String, Refused> {
+    let builtins = require_builtins(config)?;
+    let root = read_config(config)?;
+    let rendered = match render_direct_block(&block) {
+        Ok(rendered) => rendered,
+        Err(reason) => return Err(refuse(config, reason)),
+    };
+    if is_builtin(&builtins, block.slug) {
+        return Err(refuse(
+            config,
+            RefuseReason::SlugInUse {
+                slug: block.slug.to_owned(),
+            },
+        ));
+    }
+    match model_span_text(config, block.slug) {
+        Ok(Some(existing)) if existing == rendered => Ok(config.to_owned()),
+        Ok(Some(_)) => Err(refuse(
+            config,
+            RefuseReason::SlugInUse {
+                slug: block.slug.to_owned(),
+            },
+        )),
+        Ok(None) => {
+            let spliced = insert_block(config, &rendered);
+            finish(
+                config,
+                &root,
+                spliced,
+                Some(block.slug),
+                None,
+                DefaultExpectation::Unchanged,
+                Some(block.model),
+            )
+        }
+        Err(reason) => Err(refuse(config, reason)),
+    }
+}
+
+/// Render one direct block, including its trailing newline and no extra blank line.
+///
+/// Field order is `model`, `base_url`, `name` when present, `api_backend`,
+/// `env_key`, `context_window` when greater than zero, then `vision = true`
+/// only when asked. Values are not trimmed. The model id is not copied into
+/// the slug or the display name.
+///
+/// # Errors
+///
+/// Returns an error when the slug, model id, base URL, env name, display name,
+/// api backend, or context window cannot be written as specified.
+fn render_direct_block(block: &DirectBlock<'_>) -> Result<String, RefuseReason> {
+    require_slug(block.slug)?;
+    if block.model.is_empty() {
+        return Err(invalid_setting(
+            "model",
+            "must be non-empty; the value is not trimmed and is not used as the slug",
+        ));
+    }
+    if !is_http_base(block.base_url) {
+        return Err(invalid_setting(
+            "base_url",
+            "must match ^https?://\\S+$ with no trim",
+        ));
+    }
+    if let Some(name) = block.name {
+        if name.is_empty() {
+            return Err(invalid_setting(
+                "name",
+                "must be non-empty when passed; the value is not trimmed and is not copied from the model id",
+            ));
+        }
+    }
+    if block.api_backend.is_empty() {
+        return Err(invalid_setting(
+            "api_backend",
+            "must be non-empty; the value is not trimmed",
+        ));
+    }
+    if !is_env_key(block.env_key) {
+        return Err(invalid_setting(
+            "env_key",
+            "must match ^[A-Za-z_][A-Za-z0-9_]*$ with no trim",
+        ));
+    }
+    let context_window = match block.context_window {
+        None => None,
+        Some(window) if window > 0 => Some(window),
+        Some(window) => {
+            return Err(invalid_setting(
+                "context_window",
+                &format!("must be greater than zero, got {window}"),
+            ));
+        }
+    };
+    let mut lines = vec![
+        model_header(block.slug)?,
+        format!("model = {}", toml_basic_string(block.model)),
+        format!("base_url = {}", toml_basic_string(block.base_url)),
+    ];
+    if let Some(name) = block.name {
+        lines.push(format!("name = {}", toml_basic_string(name)));
+    }
+    lines.push(format!(
+        "api_backend = {}",
+        toml_basic_string(block.api_backend)
+    ));
+    lines.push(format!("env_key = {}", toml_basic_string(block.env_key)));
+    if let Some(window) = context_window {
+        lines.push(format!("context_window = {window}"));
+    }
+    if block.vision {
+        lines.push("vision = true".to_owned());
+    }
+    let mut rendered = lines.join("\n");
+    rendered.push('\n');
+    Ok(rendered)
+}
+
+/// The span [`delete_span`] would remove, without trailing blank lines.
+///
+/// `None` means the slug has no header. This copies no other bytes and does
+/// not call [`delete_span`].
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::DuplicateSlugHeader`] when the slug header appears
+/// more than once, or a header-decode error from the span walk.
+fn model_span_text(text: &str, slug: &str) -> Result<Option<String>, RefuseReason> {
+    let lines_ref = split_keepends(text);
+    let spans = table_spans(&lines_ref);
+    let mut found = Vec::new();
+    for span in &spans {
+        if let Some(header_slug) = model_slug_from_header(&span.name)? {
+            if header_slug == slug {
+                found.push((span.start, span.end));
+            }
+        }
+    }
+    let (start, end) = match found.as_slice() {
+        [] => return Ok(None),
+        [(start, end)] => (*start, *end),
+        _ => {
+            return Err(RefuseReason::DuplicateSlugHeader {
+                slug: slug.to_owned(),
+            });
+        }
+    };
+    let mut raw = String::new();
+    for (index, line) in lines_ref.iter().enumerate() {
+        if index >= start && index < end {
+            raw.push_str(line);
+        }
+    }
+    Ok(Some(without_trailing_blank_lines(&raw)))
+}
+
+/// Drop blank lines from the end of `text` and keep the last content line's newline.
+fn without_trailing_blank_lines(text: &str) -> String {
+    let lines = split_keepends(text);
+    let mut end = lines.len();
+    while end > 0 {
+        let blank = lines
+            .get(end.saturating_sub(1))
+            .is_some_and(|line| line.trim().is_empty());
+        if blank {
+            end = end.saturating_sub(1);
+        } else {
+            break;
+        }
+    }
+    let mut kept = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index < end {
+            kept.push_str(line);
+        }
+    }
+    kept
+}
+
 /// Replace the `default` line inside the single `[models]` table.
 ///
 /// Creates that table only when the header is absent. Model spans are not rewritten.
@@ -3040,6 +3259,129 @@ catalog = \"not-a-cartridge\"
         assert!(
             !tree.path().join("custom.toml.prev").exists(),
             "a secret refusal should not write the backup"
+        );
+    }
+
+    fn example_direct(window: Option<i64>, vision: bool) -> DirectBlock<'static> {
+        DirectBlock {
+            slug: "example-model",
+            model: "example-model",
+            base_url: "https://example.test/v1",
+            name: None,
+            api_backend: "messages",
+            env_key: "EXAMPLE_API_KEY",
+            context_window: window,
+            vision,
+        }
+    }
+
+    #[test]
+    fn direct_window_and_vision_follow_the_flags() {
+        let original = "# kept\n\n[models]\ndefault = \"grok-4.7\"\n";
+        let omitted = insert_direct(original, example_direct(None, false))
+            .expect("a direct add without window or vision should insert one span");
+        let omitted_block = "\
+[model.example-model]
+model = \"example-model\"
+base_url = \"https://example.test/v1\"
+api_backend = \"messages\"
+env_key = \"EXAMPLE_API_KEY\"
+";
+        assert_eq!(
+            omitted,
+            format!("# kept\n\n{omitted_block}\n[models]\ndefault = \"grok-4.7\"\n"),
+            "absent window and vision should omit both lines and leave the other bytes"
+        );
+        assert!(
+            !omitted.contains("context_window") && !omitted.contains("vision"),
+            "the omitted block should not mention a window or vision; config: {omitted}"
+        );
+        assert_eq!(
+            model_span_text(&omitted, "example-model").expect("the new span should be readable"),
+            Some(omitted_block.to_owned()),
+            "the stored span, without the separator blank line, should equal the rendered block"
+        );
+
+        for window in [0, -1] {
+            let refused = insert_direct(original, example_direct(Some(window), false))
+                .expect_err("a non-positive context_window should refuse");
+            assert_eq!(
+                refused.text, original,
+                "context_window {window} should return the original text"
+            );
+            assert!(
+                matches!(
+                    refused.reason,
+                    RefuseReason::InvalidSetting { ref key, .. } if key == "context_window"
+                ),
+                "context_window {window} should be the refusal, got {}",
+                refused.reason
+            );
+        }
+
+        let windowed = insert_direct(original, example_direct(Some(4096), false))
+            .expect("a positive context_window should be written");
+        assert!(
+            windowed.contains("context_window = 4096\n"),
+            "a positive window should be written as that integer; config: {windowed}"
+        );
+        assert!(
+            !windowed.contains("vision"),
+            "a window without --vision should not write vision; config: {windowed}"
+        );
+
+        let vision_only = insert_direct(original, example_direct(None, true))
+            .expect("vision without a window should be written");
+        assert!(
+            vision_only.contains("env_key = \"EXAMPLE_API_KEY\"\nvision = true\n"),
+            "vision without a window should follow env_key; config: {vision_only}"
+        );
+        assert!(
+            !vision_only.contains("context_window"),
+            "vision without a window should omit context_window; config: {vision_only}"
+        );
+        assert_eq!(
+            vision_only.matches("vision").count(),
+            1,
+            "vision should be written once; config: {vision_only}"
+        );
+        assert!(
+            !vision_only.contains("vision = false"),
+            "vision should not be written as false; config: {vision_only}"
+        );
+
+        let both = insert_direct(original, example_direct(Some(4096), true))
+            .expect("a window and vision should both be written");
+        assert!(
+            both.contains("context_window = 4096\nvision = true\n"),
+            "vision should follow context_window when that line exists; config: {both}"
+        );
+        assert!(
+            !both.contains("vision = false"),
+            "vision true should not also write vision false; config: {both}"
+        );
+
+        let again = insert_direct(&omitted, example_direct(None, false))
+            .expect("the same direct block should be a no-op");
+        assert_eq!(
+            again, omitted,
+            "an equal span should return the original text"
+        );
+
+        let builtin = insert_direct(original, {
+            let mut block = example_direct(None, false);
+            block.slug = "grok-4.7";
+            block
+        })
+        .expect_err("a compiled built-in slug should be in use when builtins is absent");
+        assert_eq!(
+            builtin.text, original,
+            "a built-in slug should return the original text"
+        );
+        assert!(
+            matches!(builtin.reason, RefuseReason::SlugInUse { .. }),
+            "a built-in slug should be SlugInUse, got {}",
+            builtin.reason
         );
     }
 

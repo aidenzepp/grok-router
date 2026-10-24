@@ -50,7 +50,7 @@ pub enum Commands {
     /// Search the selected provider catalog. This command does not modify the config.
     #[command(verbatim_doc_comment)]
     Search(commands::search::SearchArgs),
-    /// Add one model from the selected provider record. This command writes unless --dry-run is set.
+    /// Add one model from the selected provider record, or write one block from --model, --base-url, --env-key, and --api-backend without resolving a provider. This command writes unless --dry-run is set.
     #[command(verbatim_doc_comment)]
     Add(commands::add::AddArgs),
     /// Set [models].default for the next session. This does not switch the running session. This command writes the saved default unless --dry-run is set.

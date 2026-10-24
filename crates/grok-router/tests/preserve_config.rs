@@ -158,6 +158,8 @@ fn run(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_grok-router"))
         .args(args)
         .env_remove("OPENROUTER_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("EXAMPLE_API_KEY")
         .env("HOME", dir)
         .env("NO_COLOR", "1")
         .current_dir(dir)
@@ -424,4 +426,68 @@ fn refused_edits_leave_the_fixture_byte_identical() {
         );
         remove_temp(&dir);
     }
+}
+
+const DIRECT_BLOCK: &str = "\
+[model.claude-opus]
+model = \"claude-opus-5-5\"
+base_url = \"https://proxy.tokenfix.trilogy.com/v1\"
+name = \"Claude Opus (TokenFix)\"
+api_backend = \"messages\"
+env_key = \"ANTHROPIC_AUTH_TOKEN\"
+";
+
+#[test]
+fn direct_add_inserts_only_the_supplied_block() {
+    let dir = temp_root("direct-add");
+    let config = dir.join("config.toml");
+    fs::write(&config, LIVED_IN).expect("the direct fixture should be written");
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--as",
+            "claude-opus",
+            "--model",
+            "claude-opus-5-5",
+            "--base-url",
+            "https://proxy.tokenfix.trilogy.com/v1",
+            "--name",
+            "Claude Opus (TokenFix)",
+            "--api-backend",
+            "messages",
+            "--env-key",
+            "ANTHROPIC_AUTH_TOKEN",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "a direct add should insert one block; stderr: {stderr}; stdout: {}",
+        stdout_text(&output)
+    );
+    let edited = read_config(&config);
+    let models_at = LIVED_IN
+        .rfind("[models]\n")
+        .expect("the fixture should end with one [models] table");
+    let head = LIVED_IN
+        .get(..models_at)
+        .expect("the [models] header should sit inside the fixture");
+    let tail = LIVED_IN
+        .get(models_at..)
+        .expect("the [models] header should start the fixture tail");
+    assert!(
+        head.ends_with("\n\n"),
+        "the fixture should already keep one blank line before [models]"
+    );
+    let expected = format!("{head}{DIRECT_BLOCK}\n{tail}");
+    assert_eq!(
+        edited, expected,
+        "direct add should insert only the supplied block and the blank line that separates it from [models]"
+    );
+    assert_lived_in_outside_models(&edited);
+    remove_temp(&dir);
 }

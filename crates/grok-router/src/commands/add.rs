@@ -1,11 +1,14 @@
 //! `add` subcommand.
 //!
-//! Add writes one model from the selected `[router]` provider record into the
-//! file named by `--config`. The record is resolved, and its cartridge is
-//! selected, before any catalog parse or download. `--catalog-file` reads
-//! local bytes and does not use the network. Without that flag, a missing or
-//! blank bearer fails before any config write and does not write the cache.
-//! A missing `--config` fails before any home path is opened.
+//! Add writes one model into the file named by `--config`. The catalog path
+//! resolves one `[router]` provider record and selects its cartridge before
+//! any catalog parse or download. The direct path runs when `--model`,
+//! `--base-url`, `--env-key`, and `--api-backend` are all present: it writes
+//! one block from those flags and does not resolve a provider.
+//! `--catalog-file` reads local bytes and does not use the network. Without
+//! that flag, a missing or blank bearer fails before any config write and
+//! does not write the cache. A missing `--config` fails before any home path
+//! is opened.
 
 use std::env;
 use std::fs;
@@ -18,11 +21,11 @@ use clap::{ArgAction, Args};
 use crate::catalog::{self, CachedBodyOrFetch, Cartridge, CartridgeError, CatalogCartridge};
 use crate::config_edit::{self, Backup, ProviderChoice, RefuseReason};
 
-/// Add one model from the selected provider record. This command writes unless --dry-run is set.
+/// Add one model from the selected provider record, or write one block from --model, --base-url, --env-key, and --api-backend without resolving a provider. This command writes unless --dry-run is set.
 #[derive(Debug, Args)]
 #[command(
     verbatim_doc_comment,
-    after_help = "Examples:\n  grok-router add --catalog-file models.json --config config.toml z-ai/glm-5.3\n  grok-router add --provider deepseek --catalog-file deepseek.json --config config.toml deepseek-v4-pro"
+    after_help = "Examples:\n  grok-router add --catalog-file models.json --config config.toml z-ai/glm-5.3\n  grok-router add --provider deepseek --catalog-file deepseek.json --config config.toml deepseek-v4-pro\n  grok-router add --config config.toml --as example-model --model example-model --base-url https://example.test/v1 --api-backend messages --env-key EXAMPLE_API_KEY"
 )]
 pub struct AddArgs {
     /// Provider id or terms. Repeat to require every term. Optional when the catalog has one row.
@@ -33,9 +36,42 @@ pub struct AddArgs {
     #[arg(long, value_name = "NAME", verbatim_doc_comment)]
     provider: Option<String>,
 
-    /// Slug to write instead of the cartridge slug.
+    /// Slug to write instead of the cartridge slug. Required on the direct path.
     #[arg(long = "as", value_name = "SLUG", verbatim_doc_comment)]
     as_slug: Option<String>,
+
+    /// Model id written on the direct path. Not trimmed, and not used as the slug.
+    #[arg(long, value_name = "ID", verbatim_doc_comment)]
+    model: Option<String>,
+
+    /// Base URL written on the direct path. Not trimmed.
+    #[arg(long, value_name = "URL", verbatim_doc_comment)]
+    base_url: Option<String>,
+
+    /// Environment variable name written on the direct path. Not trimmed.
+    #[arg(long, value_name = "KEY", verbatim_doc_comment)]
+    env_key: Option<String>,
+
+    /// api_backend value written on the direct path. Not trimmed.
+    #[arg(long, value_name = "BACKEND", verbatim_doc_comment)]
+    api_backend: Option<String>,
+
+    /// Display name written on the direct path. Omitted leaves the name line out.
+    #[arg(long, value_name = "TEXT", verbatim_doc_comment)]
+    name: Option<String>,
+
+    /// context_window written on the direct path when greater than zero.
+    #[arg(
+        long,
+        value_name = "N",
+        allow_hyphen_values = true,
+        verbatim_doc_comment
+    )]
+    context_window: Option<i64>,
+
+    /// Write `vision = true` on the direct path. Omitted leaves the line out.
+    #[arg(long, action = ArgAction::SetTrue, verbatim_doc_comment)]
+    vision: bool,
 
     /// Set this slug as [models].default in the same write.
     #[arg(long = "default", verbatim_doc_comment)]
@@ -78,17 +114,224 @@ pub fn run(config: Option<&str>, args: &AddArgs) -> i32 {
     }
 }
 
-/// Resolve one provider record, parse with its cartridge, and write once.
+/// The four flags that select the direct path. Order is the refusal order.
+const DIRECT_FLAGS: [&str; 4] = ["--model", "--base-url", "--env-key", "--api-backend"];
+
+/// Resolve one provider record, or write one direct block, and write once.
 fn run_add(config: Option<&str>, args: &AddArgs) -> Result<String, String> {
     let config_path = configured_path(config)?;
     let original = read_config_text(&config_path)?;
+    let present = direct_flags_present(args);
+    let missing = direct_flags_missing(&present);
+    if present.is_empty() {
+        let extras = catalog_refused_flags(args);
+        if !extras.is_empty() {
+            return Err(catalog_flag_refusal(&extras));
+        }
+        return run_catalog_add(&config_path, &original, args);
+    }
+    if !missing.is_empty() {
+        return Err(partial_direct_refusal(&present, &missing));
+    }
+    run_direct_add(&config_path, &original, args)
+}
+
+/// Which of [`DIRECT_FLAGS`] were passed, including an empty value.
+fn direct_flags_present(args: &AddArgs) -> Vec<&'static str> {
+    let passed = [
+        args.model.is_some(),
+        args.base_url.is_some(),
+        args.env_key.is_some(),
+        args.api_backend.is_some(),
+    ];
+    DIRECT_FLAGS
+        .into_iter()
+        .zip(passed)
+        .filter_map(|(name, passed)| passed.then_some(name))
+        .collect()
+}
+
+/// [`DIRECT_FLAGS`] that [`direct_flags_present`] did not return.
+fn direct_flags_missing(present: &[&str]) -> Vec<&'static str> {
+    DIRECT_FLAGS
+        .into_iter()
+        .filter(|name| !present.contains(name))
+        .collect()
+}
+
+/// Flags that belong only to the direct path.
+fn catalog_refused_flags(args: &AddArgs) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if args.name.is_some() {
+        names.push("--name");
+    }
+    if args.context_window.is_some() {
+        names.push("--context-window");
+    }
+    if args.vision {
+        names.push("--vision");
+    }
+    names
+}
+
+/// Catalog flags that select a provider, a cartridge, or a download.
+fn direct_conflicts(args: &AddArgs) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if args.provider.is_some() {
+        names.push("--provider");
+    }
+    if !args.query.is_empty() {
+        names.push("a query");
+    }
+    if args.catalog_file.is_some() {
+        names.push("--catalog-file");
+    }
+    if args.cache_dir.is_some() {
+        names.push("--cache-dir");
+    }
+    if args.refresh {
+        names.push("--refresh");
+    }
+    if args.set_default {
+        names.push("--default");
+    }
+    names
+}
+
+/// Join flag names as `a`, `a and b`, or `a, b, and c`.
+fn english_list(items: &[&str]) -> String {
+    let mut listed = String::new();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            let last = index.saturating_add(1) == items.len();
+            if items.len() == 2 {
+                listed.push_str(" and ");
+            } else if last {
+                listed.push_str(", and ");
+            } else {
+                listed.push_str(", ");
+            }
+        }
+        listed.push_str(item);
+    }
+    listed
+}
+
+/// A mix of the four direct flags. Names what was passed and what was not.
+fn partial_direct_refusal(present: &[&str], missing: &[&str]) -> String {
+    format!(
+        "{} {} set, but {} {} missing. Pass all four of --model, --base-url, --env-key, and --api-backend, or none of them. The file was left unchanged. Nothing was downloaded. Nothing was written.",
+        english_list(present),
+        if present.len() == 1 { "was" } else { "were" },
+        english_list(missing),
+        if missing.len() == 1 { "was" } else { "were" },
+    )
+}
+
+/// `--name`, `--context-window`, or `--vision` without the four direct flags.
+fn catalog_flag_refusal(extras: &[&str]) -> String {
+    format!(
+        "{} {} only used together with --model, --base-url, --env-key, and --api-backend. The file was left unchanged. Nothing was downloaded. Nothing was written.",
+        english_list(extras),
+        if extras.len() == 1 { "is" } else { "are" },
+    )
+}
+
+/// Catalog selectors passed to a direct add.
+fn direct_conflict_refusal(conflicts: &[&str]) -> String {
+    format!(
+        "{} cannot be combined with --model, --base-url, --env-key, and --api-backend. The file was left unchanged. Nothing was downloaded. Nothing was written.",
+        english_list(conflicts)
+    )
+}
+
+/// `--as` for a direct add. Empty is not trimmed into absence.
+fn required_direct_slug(args: &AddArgs) -> Result<&str, String> {
+    match args.as_slug.as_deref() {
+        Some(slug) if !slug.is_empty() => Ok(slug),
+        Some(_) => Err(
+            "--as is empty, so nothing was written. Pass --as with a slug. The file was left unchanged. Nothing was downloaded. Nothing was written."
+                .to_owned(),
+        ),
+        None => Err(
+            "--as is required with --model, --base-url, --env-key, and --api-backend. Pass --as with the slug to write. The file was left unchanged. Nothing was downloaded. Nothing was written."
+                .to_owned(),
+        ),
+    }
+}
+
+/// Write one block from the four direct flags. Does not resolve a provider or download a catalog.
+fn run_direct_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<String, String> {
+    let conflicts = direct_conflicts(args);
+    if !conflicts.is_empty() {
+        return Err(direct_conflict_refusal(&conflicts));
+    }
+    let slug = required_direct_slug(args)?;
+    let (model, base_url, env_key, api_backend) = match (
+        args.model.as_deref(),
+        args.base_url.as_deref(),
+        args.env_key.as_deref(),
+        args.api_backend.as_deref(),
+    ) {
+        (Some(model), Some(base_url), Some(env_key), Some(api_backend)) => {
+            (model, base_url, env_key, api_backend)
+        }
+        _ => {
+            return Err(partial_direct_refusal(
+                &direct_flags_present(args),
+                &direct_flags_missing(&direct_flags_present(args)),
+            ));
+        }
+    };
+    let edited = config_edit::insert_direct(
+        original,
+        config_edit::DirectBlock {
+            slug,
+            model,
+            base_url,
+            name: args.name.as_deref(),
+            api_backend,
+            env_key,
+            context_window: args.context_window,
+            vision: args.vision,
+        },
+    )
+    .map_err(|refused| edit_failure(&refused.reason))?;
+    let unchanged = edited == original;
+    let dry_run = args.dry_run;
+    let wrote = if unchanged || dry_run {
+        false
+    } else {
+        config_edit::refuse_named_secrets(&edited, &[env_key])?;
+        config_edit::replace_file(config_path, Backup::Sibling, edited.as_bytes(), "").map_err(
+            |err| {
+                format!(
+                    "{err}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the edit."
+                )
+            },
+        )?;
+        true
+    };
+    let report = AddReport {
+        slug: slug.to_owned(),
+        provider_id: model.to_owned(),
+        wrote,
+        dry_run,
+        unchanged,
+        default: false,
+    };
+    render(args, &report, config_path)
+}
+
+/// Resolve one provider record, parse with its cartridge, and write once.
+fn run_catalog_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<String, String> {
     let choice = provider_choice(args);
-    let record = config_edit::resolve_provider(&original, choice)
+    let record = config_edit::resolve_provider(original, choice)
         .map_err(|reason| resolve_failure(&reason))?;
     let selected = catalog::cartridge(record.catalog.as_deref())
-        .map_err(|err| cartridge_failure(&record_name(&original, choice), &err))?;
+        .map_err(|err| cartridge_failure(&record_name(original, choice), &err))?;
     let _builtins =
-        config_edit::builtins_from(&original).map_err(|reason| early_refusal(&reason))?;
+        config_edit::builtins_from(original).map_err(|reason| early_refusal(&reason))?;
     let terms = query_terms(&args.query)?;
     let rows = load_rows(args, &selected, &record.base_url, &record.env_key)?;
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
@@ -98,7 +341,7 @@ fn run_add(config: Option<&str>, args: &AddArgs) -> Result<String, String> {
         .slug(row.id(), args.as_slug.as_deref())
         .map_err(|reason| edit_failure(&reason))?;
     let edited = edited_config(
-        &original,
+        original,
         row,
         &slug,
         &record.base_url,
@@ -111,12 +354,13 @@ fn run_add(config: Option<&str>, args: &AddArgs) -> Result<String, String> {
         false
     } else {
         config_edit::refuse_named_secrets(&edited, &[record.env_key.as_str()])?;
-        config_edit::replace_file(&config_path, Backup::Sibling, edited.as_bytes(), "")
-            .map_err(|err| {
+        config_edit::replace_file(config_path, Backup::Sibling, edited.as_bytes(), "").map_err(
+            |err| {
                 format!(
                     "{err}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the edit."
                 )
-            })?;
+            },
+        )?;
         true
     };
     let report = AddReport {
@@ -127,7 +371,7 @@ fn run_add(config: Option<&str>, args: &AddArgs) -> Result<String, String> {
         unchanged,
         default: args.set_default,
     };
-    render(args, &report, &config_path)
+    render(args, &report, config_path)
 }
 
 /// `--config` from the global flag. Never a home path.

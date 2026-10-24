@@ -130,6 +130,8 @@ fn run_with(dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> std::proces
             .args(args)
             .env_remove("OPENROUTER_API_KEY")
             .env_remove("DEEPSEEK_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("EXAMPLE_API_KEY")
             .env("HOME", dir)
             .env("NO_COLOR", "1")
             .current_dir(dir),
@@ -212,6 +214,16 @@ fn add_help_contains_an_example_and_says_it_writes_unless_dry_run() {
     assert!(
         help.contains("writes unless --dry-run"),
         "add --help should say the command writes unless --dry-run is set; help: {help}"
+    );
+    assert!(
+        help.contains("https://example.test/v1") && help.contains("EXAMPLE_API_KEY"),
+        "add --help should show the direct example; help: {help}"
+    );
+    assert!(
+        !help.contains("TokenFix")
+            && !help.contains("proxy.tokenfix.trilogy.com")
+            && !help.contains("ANTHROPIC_AUTH_TOKEN"),
+        "add --help should not contain the acceptance host or its secret name; help: {help}"
     );
     remove_temp(&dir);
 }
@@ -1766,4 +1778,248 @@ fn an_openrouter_base_reads_models_json_and_a_deepseek_base_does_not() {
     assert_secret_absent("config", &written, "deepseek-cache-token");
     remove_temp(&dir);
     remove_temp(&deepseek_dir);
+}
+
+const ACCEPTANCE_BLOCK: &str = "\
+[model.claude-opus]
+model = \"claude-opus-5-5\"
+base_url = \"https://proxy.tokenfix.trilogy.com/v1\"
+name = \"Claude Opus (TokenFix)\"
+api_backend = \"messages\"
+env_key = \"ANTHROPIC_AUTH_TOKEN\"
+";
+
+fn acceptance_args(config: &str) -> Vec<&str> {
+    vec![
+        "--config",
+        config,
+        "add",
+        "--as",
+        "claude-opus",
+        "--model",
+        "claude-opus-5-5",
+        "--base-url",
+        "https://proxy.tokenfix.trilogy.com/v1",
+        "--name",
+        "Claude Opus (TokenFix)",
+        "--api-backend",
+        "messages",
+        "--env-key",
+        "ANTHROPIC_AUTH_TOKEN",
+    ]
+}
+
+#[test]
+fn direct_flags_write_the_supplied_block_and_leave_the_four_spans() {
+    let dir = temp_root("direct-accept");
+    let source = four_spans();
+    let config = write_named(&dir, "config.toml", &source);
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let output = run(&dir, &acceptance_args(&config_arg));
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "the acceptance command should write without a provider; stderr: {stderr}; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("download"),
+        "a direct add should not download a catalog; stderr: {stderr}"
+    );
+    let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
+    let header_at = after
+        .find("[model.claude-opus]\n")
+        .expect("the acceptance slug should be present");
+    let written = after
+        .get(header_at..)
+        .expect("the acceptance header should start a span");
+    assert!(
+        written.starts_with(ACCEPTANCE_BLOCK),
+        "the new span should equal the acceptance block; config: {after}"
+    );
+    assert!(
+        !ACCEPTANCE_BLOCK.contains("chat_completions")
+            && !ACCEPTANCE_BLOCK.contains("context_window")
+            && !ACCEPTANCE_BLOCK.contains("vision"),
+        "the acceptance block should not force a catalog backend, window, or vision"
+    );
+    for span in [DEEPSEEK_SPAN, PRO_SPAN, GLM_SPAN, GLM_FLASH_SPAN] {
+        assert!(
+            after.contains(span),
+            "an existing span should stay byte-identical; config: {after}"
+        );
+    }
+    assert!(
+        !source.contains("[router]"),
+        "the fixture should have no [router] table"
+    );
+    let again = run(&dir, &acceptance_args(&config_arg));
+    assert_eq!(
+        exit_code(&again),
+        0,
+        "a second identical direct add should exit 0; stderr: {}",
+        stderr_text(&again)
+    );
+    let second = fs::read_to_string(&config).expect("the second run should leave UTF-8");
+    assert_eq!(
+        second, after,
+        "a second identical direct add should change nothing"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn direct_add_of_a_different_block_for_the_same_slug_writes_nothing() {
+    let dir = temp_root("direct-differ");
+    let source = four_spans();
+    let config = write_named(&dir, "config.toml", &source);
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let added = run(&dir, &acceptance_args(&config_arg));
+    assert_eq!(
+        exit_code(&added),
+        0,
+        "the first direct add should write; stderr: {}",
+        stderr_text(&added)
+    );
+    let before = fs::read(&config).expect("the first write should be readable");
+    let mut changed = acceptance_args(&config_arg);
+    let model_at = changed
+        .iter()
+        .position(|arg| *arg == "--model")
+        .expect("the acceptance args should include --model");
+    let model_value_at = model_at.saturating_add(1);
+    let model_slot = changed
+        .get_mut(model_value_at)
+        .expect("the model value should follow --model");
+    *model_slot = "claude-opus-5-5-other";
+    let refused = run(&dir, &changed);
+    assert_ne!(
+        exit_code(&refused),
+        0,
+        "a different block for claude-opus should fail; stdout: {}",
+        stdout_text(&refused)
+    );
+    assert_eq!(
+        fs::read(&config).expect("the refused config should still exist"),
+        before,
+        "a different block for the same slug should write nothing"
+    );
+    remove_temp(&dir);
+
+    let flash_dir = temp_root("direct-flash");
+    let flash_source = four_spans();
+    let flash_config = write_named(&flash_dir, "config.toml", &flash_source);
+    let flash_before = fs::read(&flash_config).expect("the flash fixture should be readable");
+    let flash_arg = utf8_arg(&flash_config, "the config path should be UTF-8");
+    let mut flash_args = acceptance_args(&flash_arg);
+    let as_at = flash_args
+        .iter()
+        .position(|arg| *arg == "--as")
+        .expect("the acceptance args should include --as");
+    let as_slot = flash_args
+        .get_mut(as_at.saturating_add(1))
+        .expect("the slug should follow --as");
+    *as_slot = "or-deepseek-flash";
+    let flash = run(&flash_dir, &flash_args);
+    assert_ne!(
+        exit_code(&flash),
+        0,
+        "--as or-deepseek-flash with a different block should fail; stdout: {}",
+        stdout_text(&flash)
+    );
+    assert_eq!(
+        fs::read(&flash_config).expect("the flash fixture should still exist"),
+        flash_before,
+        "--as or-deepseek-flash with the acceptance model id should write nothing"
+    );
+    remove_temp(&flash_dir);
+}
+
+#[test]
+fn partial_direct_flags_refuse_without_a_cartridge_or_a_write() {
+    let dir = temp_root("direct-partial");
+    let source = format!(
+        "[router]\ndefault_provider = \"zai\"\n\n[router.provider.zai]\nbase_url = \"https://api.z.ai/api/paas/v4\"\nenv_key = \"ZAI_API_KEY\"\n\n{}",
+        four_spans()
+    );
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the partial fixture should be readable");
+    let output = run(
+        &dir,
+        &[
+            "--config",
+            &utf8_arg(&config, "the config path should be UTF-8"),
+            "add",
+            "--model",
+            "claude-opus-5-5",
+            "--base-url",
+            "https://example.test/v1",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_ne!(
+        exit_code(&output),
+        0,
+        "a partial direct flag set should fail; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("--model") && stderr.contains("--base-url"),
+        "stderr should name the direct flags that were set; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--env-key") && stderr.contains("--api-backend"),
+        "stderr should name the missing direct flags; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("cartridge"),
+        "a partial flag set should not say a cartridge is missing; stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&config).expect("the partial fixture should still exist"),
+        before,
+        "a partial flag set should write nothing"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn direct_add_refuses_when_the_env_key_value_would_be_written() {
+    let dir = temp_root("direct-secret");
+    let source = four_spans();
+    let config = write_named(&dir, "config.toml", &source);
+    let before = fs::read(&config).expect("the secret fixture should be readable");
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let mut args = acceptance_args(&config_arg);
+    let name_at = args
+        .iter()
+        .position(|arg| *arg == "--name")
+        .expect("the acceptance args should include --name");
+    let secret = "direct-add-secret-value";
+    let name_slot = args
+        .get_mut(name_at.saturating_add(1))
+        .expect("the name value should follow --name");
+    *name_slot = secret;
+    let output = run_with(&dir, &args, &[("ANTHROPIC_AUTH_TOKEN", secret)]);
+    let stderr = stderr_text(&output);
+    assert_ne!(
+        exit_code(&output),
+        0,
+        "a direct add that would write the env value should fail; stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr.contains("ANTHROPIC_AUTH_TOKEN"),
+        "stderr should name ANTHROPIC_AUTH_TOKEN; stderr length {}",
+        stderr.len()
+    );
+    assert_secret_absent("stderr", &stderr, secret);
+    assert_secret_absent("stdout", &stdout_text(&output), secret);
+    assert_eq!(
+        fs::read(&config).expect("the secret fixture should still exist"),
+        before,
+        "a secret refusal should write nothing"
+    );
+    remove_temp(&dir);
 }
