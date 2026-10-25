@@ -1,6 +1,6 @@
 # grok-router
 
-`grok-router` edits the Grok config that already lives at `$GROK_HOME/config.toml`, or at `~/.grok/config.toml` when `GROK_HOME` is unset. It searches a provider catalog, inserts one `[model.<slug>]` block, and changes the saved default. It does not switch the model of a running Grok session. `/model` and `grok -m` do that.
+`grok-router` edits the Grok config that already lives at `$GROK_HOME/config.toml`, or at `~/.grok/config.toml` when `GROK_HOME` is unset. It lists and shows configured models, searches a provider catalog, inserts one `[model.<slug>]` block, edits fields on a block that is already there, and changes the saved default. It does not switch the model of a running Grok session. `/model` and `grok -m` do that.
 
 The file stores the name of an environment variable in `env_key`. The key value stays in the environment. A write is refused when that value would be copied into the file.
 
