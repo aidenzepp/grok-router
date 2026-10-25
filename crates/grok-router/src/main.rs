@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use clap::error::ErrorKind;
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
-use grok_router::commands::{add, list, remove, search, set_default, skill};
+use grok_router::commands::{add, init, list, remove, search, set_default, skill};
 use grok_router::{Cli, Commands, OutputMode, error};
 
 /// Runs the `grok-router` binary.
@@ -53,6 +53,7 @@ fn dispatch(cli: &Cli, mode: OutputMode) -> i32 {
         Some(Commands::Add(args)) => add::run(config, args, mode),
         Some(Commands::SetDefault(args)) => set_default::run(config, args, mode),
         Some(Commands::Remove(args)) => remove::run(config, args, mode),
+        Some(Commands::Init(args)) => init::run(config, args, mode),
         Some(Commands::Skill(args)) => skill::run(args, mode),
         Some(Commands::Completions(args)) => args.run(mode),
         Some(Commands::Internal(args)) => skill::run_internal(args, mode),
@@ -197,6 +198,7 @@ fn usage_command_name() -> &'static str {
             "add" => "add",
             "set-default" => "set-default",
             "remove" => "remove",
+            "init" => "init",
             "completions" => "completions",
             "skill" | "__internal" => "skill",
             _ => "grok-router",

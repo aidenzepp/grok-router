@@ -494,3 +494,45 @@ fn direct_add_inserts_only_the_supplied_block() {
     assert_lived_in_outside_models(&edited);
     remove_temp(&dir);
 }
+
+#[test]
+fn init_appends_the_openrouter_block_and_keeps_lived_in_bytes() {
+    let dir = temp_root("init");
+    let (config, _) = write_fixture(&dir);
+    let before = fs::read(&config).expect("the lived-in fixture should be readable");
+    let arg = utf8_arg(&config, "the config path should be UTF-8");
+    let output = run(&dir, &["--config", &arg, "init"]);
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "init should append to the lived-in fixture; stderr: {stderr}; stdout: {}",
+        stdout_text(&output)
+    );
+    let edited = read_config(&config);
+    let block = grok_router::config_edit::openrouter_router_block();
+    assert_eq!(
+        edited,
+        format!("{LIVED_IN}{block}"),
+        "init should keep every lived-in byte and append the router block"
+    );
+    assert_lived_in_outside_models(&edited);
+    assert_eq!(
+        fs::read(config.with_file_name("config.toml.prev")).expect("init should back up an existing file"),
+        before,
+        "the backup should be the lived-in bytes from before the write"
+    );
+    let again = run(&dir, &["--config", &arg, "init"]);
+    assert_eq!(
+        exit_code(&again),
+        0,
+        "a second init of the lived-in file should exit 0; stderr: {}",
+        stderr_text(&again)
+    );
+    assert_eq!(
+        read_config(&config),
+        edited,
+        "a second init should leave the lived-in file byte-identical"
+    );
+    remove_temp(&dir);
+}

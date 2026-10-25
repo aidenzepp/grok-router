@@ -55,6 +55,7 @@ pub enum OutputMode {
 )]
 pub struct Cli {
     /// Reads default to $GROK_HOME/config.toml or ~/.grok/config.toml.
+    /// init writes that file when --config is omitted.
     /// add, set-default, and remove still require --config.
     #[arg(long, global = true, value_name = "PATH", verbatim_doc_comment)]
     pub config: Option<String>,
@@ -146,6 +147,7 @@ impl Cli {
             Some(Commands::Add(_)) => "add",
             Some(Commands::SetDefault(_)) => "set-default",
             Some(Commands::Remove(_)) => "remove",
+            Some(Commands::Init(_)) => "init",
             Some(Commands::Completions(_)) => "completions",
             Some(Commands::Skill(args)) => args.command_name(),
             Some(Commands::Internal(_)) => "skill",
@@ -172,6 +174,9 @@ pub enum Commands {
     /// Delete one model block from the config. This command deletes a model block.
     #[command(verbatim_doc_comment)]
     Remove(commands::remove::RemoveArgs),
+    /// Write a default OpenRouter [router] table when the file has none. An existing [router] table is left unchanged. This command writes unless --dry-run is set.
+    #[command(verbatim_doc_comment)]
+    Init(commands::init::InitArgs),
     /// Install, check, or remove the skill stub, or print its guide. setup and remove write; status and show do not.
     #[command(verbatim_doc_comment)]
     Skill(commands::skill::SkillArgs),

@@ -8,7 +8,9 @@
 //! not change the text. [`resolve_provider`] reads one
 //! `[router.provider.<name>]` record and does not fall back to a compiled
 //! OpenRouter URL. [`builtins_from`] reads `builtins` from `[router]`.
-//! None of them write the document. The edit never writes that table back.
+//! [`init_router_text`] appends a default OpenRouter `[router]` table when that
+//! key is absent and leaves every earlier byte in place.
+//! None of the readers write the document. Model splices do not write `[router]` back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -72,6 +74,37 @@ pub enum ProviderChoice<'a> {
     Explicit(&'a str),
     /// The `default_provider` key on `[router]`.
     Default,
+}
+
+/// What `init` should do with config text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouterInit {
+    /// Append these bytes. Earlier bytes stay, plus one newline when the text did not end in one.
+    Append(String),
+    /// `[router]` is already a table. Do not write.
+    AlreadyPresent,
+}
+
+/// Why `init` refused to build a router block. The caller's text is not rewritten.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RouterInitError {
+    /// The original text, or the text after the block was appended, did not parse.
+    #[error("config.toml did not parse: {detail}")]
+    Parse {
+        /// Parser message. The original text is not rewritten.
+        detail: String,
+        /// True when the appended text failed. False when the original text failed.
+        appended: bool,
+    },
+    /// A `[router]` key is present and is not a table.
+    #[error("[router] is not a table")]
+    NotTable,
+    /// Re-parse showed a top-level table that was already there and did not compare equal.
+    #[error("edit would change existing tables: {}", joined_tables(tables))]
+    ChangedTables {
+        /// Table names that changed or disappeared.
+        tables: Vec<String>,
+    },
 }
 
 /// Why a text edit was refused.
@@ -859,6 +892,115 @@ pub fn read_configured(config: &str) -> Result<ConfiguredInventory, Refused> {
     })
 }
 
+/// The OpenRouter `[router]` block `init` writes, including its trailing newline.
+///
+/// `builtins` is [`BUILTIN_SLUGS`] in order. This function does not read a file.
+#[must_use = "the block is the only copy of the bytes init writes"]
+pub fn openrouter_router_block() -> String {
+    let builtins = render_builtin_list();
+    format!(
+        "\
+[router]
+default_provider = \"openrouter\"
+builtins = {builtins}
+
+[router.provider.openrouter]
+base_url = \"https://openrouter.ai/api/v1\"
+env_key = \"OPENROUTER_API_KEY\"
+catalog = \"openrouter-models\"
+"
+    )
+}
+
+/// Append the OpenRouter router block, or report that `[router]` is already a table.
+///
+/// A missing `[router]` key appends [`openrouter_router_block`]. Every earlier byte
+/// stays. When `config` is non-empty and does not end in a newline, one newline is
+/// inserted before the block. The document is not reserialized. After the append,
+/// a top-level table that was already there must still compare equal.
+///
+/// # Errors
+///
+/// Returns [`RouterInitError::NotTable`] when `router` is present and not a table,
+/// [`RouterInitError::Parse`] when either text does not parse, and
+/// [`RouterInitError::ChangedTables`] when an existing top-level table changes.
+/// Nothing is written.
+#[must_use = "the plan is the only copy of the bytes init would write"]
+pub fn init_router_text(config: &str) -> Result<RouterInit, RouterInitError> {
+    if config.is_empty() {
+        return Ok(RouterInit::Append(openrouter_router_block()));
+    }
+    let before = match config.parse::<toml::Table>() {
+        Ok(root) => root,
+        Err(error) => {
+            return Err(RouterInitError::Parse {
+                detail: error.to_string(),
+                appended: false,
+            });
+        }
+    };
+    match before.get("router") {
+        Some(value) if value.as_table().is_some() => return Ok(RouterInit::AlreadyPresent),
+        Some(_) => return Err(RouterInitError::NotTable),
+        None => {}
+    }
+    let spliced = append_router_block(config, &openrouter_router_block());
+    let after = match spliced.parse::<toml::Table>() {
+        Ok(root) => root,
+        Err(error) => {
+            return Err(RouterInitError::Parse {
+                detail: error.to_string(),
+                appended: true,
+            });
+        }
+    };
+    let tables = changed_top_level_tables(&before, &after);
+    if !tables.is_empty() {
+        return Err(RouterInitError::ChangedTables { tables });
+    }
+    Ok(RouterInit::Append(spliced))
+}
+
+/// Render [`BUILTIN_SLUGS`] as a TOML array. The names are not copied by hand.
+fn render_builtin_list() -> String {
+    let mut list = String::from("[");
+    for (index, slug) in BUILTIN_SLUGS.iter().enumerate() {
+        if index > 0 {
+            list.push_str(", ");
+        }
+        list.push_str(&toml_basic_string(slug));
+    }
+    list.push(']');
+    list
+}
+
+/// Keep `config` and put `block` after it. A non-empty text without a trailing newline gets one.
+fn append_router_block(config: &str, block: &str) -> String {
+    let mut spliced = String::new();
+    spliced.push_str(config);
+    if !config.is_empty() && !config.ends_with('\n') {
+        spliced.push('\n');
+    }
+    spliced.push_str(block);
+    spliced
+}
+
+/// Top-level tables in `before` whose parsed value is missing or different in `after`.
+fn changed_top_level_tables(before: &toml::Table, after: &toml::Table) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (key, value) in before {
+        if value.as_table().is_none() {
+            continue;
+        }
+        match after.get(key) {
+            Some(current) if current == value => {}
+            _ => changed.push(key.clone()),
+        }
+    }
+    changed.sort();
+    changed
+}
+
 /// Refuse when `text` contains the value of a named environment variable.
 ///
 /// Names are every `env_key` string in `text`, plus each name in `also`. An
@@ -972,6 +1114,60 @@ pub fn replace_file(
             detail: io_detail("write backup", &backup_path, &error),
         });
     }
+    let temporary = temp_path(path);
+    if let Err(error) = std::fs::write(&temporary, bytes) {
+        return Err(ReplaceError {
+            kind: ReplaceKind::Temp,
+            detail: io_detail("write temporary config", &temporary, &error),
+        });
+    }
+    write_temp_and_rename(path, bytes)
+}
+
+/// Create `path` and any missing parent. Does not write a backup.
+///
+/// The bytes land via a temp file in the same directory, then a rename, the same
+/// way [`replace_file`] finishes a write. A file that already exists is left
+/// untouched. An empty `secret` is not searched. A non-empty secret that occurs
+/// in `bytes` refuses the create before any write.
+///
+/// # Errors
+///
+/// Returns an error when the bytes contain `secret`, `path` already exists, or a
+/// filesystem step fails. A failed create does not leave `path` behind.
+pub fn create_file(path: &Path, bytes: &[u8], secret: &str) -> Result<(), ReplaceError> {
+    if contains_secret(bytes, secret) {
+        return Err(ReplaceError {
+            kind: ReplaceKind::SecretInReplacement,
+            detail: "replacement contains the caller-supplied secret".to_owned(),
+        });
+    }
+    if path.exists() {
+        return Err(ReplaceError {
+            kind: ReplaceKind::Read,
+            detail: format!("{} already exists, so it was not created", path.display()),
+        });
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                return Err(ReplaceError {
+                    kind: ReplaceKind::Temp,
+                    detail: io_detail("create config directory", parent, &error),
+                });
+            }
+        }
+    }
+    write_temp_and_rename(path, bytes)
+}
+
+/// Write `bytes` to a temp file beside `path`, then rename it onto `path`.
+///
+/// # Errors
+///
+/// Returns an error when the temp file cannot be written or renamed. A failed
+/// rename deletes the temp file.
+fn write_temp_and_rename(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
     let temporary = temp_path(path);
     if let Err(error) = std::fs::write(&temporary, bytes) {
         return Err(ReplaceError {
@@ -3415,6 +3611,123 @@ env_key = \"EXAMPLE_API_KEY\"
             matches!(builtin.reason, RefuseReason::SlugInUse { .. }),
             "a built-in slug should be SlugInUse, got {}",
             builtin.reason
+        );
+    }
+
+    #[test]
+    fn openrouter_router_block_renders_the_compiled_builtins() {
+        let rendered = BUILTIN_SLUGS
+            .iter()
+            .map(|slug| format!("\"{slug}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let block = openrouter_router_block();
+        assert_eq!(
+            block,
+            format!(
+                "\
+[router]
+default_provider = \"openrouter\"
+builtins = [{rendered}]
+
+[router.provider.openrouter]
+base_url = \"https://openrouter.ai/api/v1\"
+env_key = \"OPENROUTER_API_KEY\"
+catalog = \"openrouter-models\"
+"
+            ),
+            "the block should be the compiled slugs plus the OpenRouter record"
+        );
+        assert_eq!(
+            BUILTIN_SLUGS,
+            [
+                "grok-4.7",
+                "grok-4.7-build-fast",
+                "grok-4.6",
+                "grok-4.5"
+            ],
+            "init's acceptance block is these four compiled slugs"
+        );
+    }
+
+    #[test]
+    fn init_router_text_appends_without_reserializing_and_keeps_models() {
+        let original = "# kept comment\n[models]\ndefault = \"grok-4.5\"";
+        let text = match init_router_text(original)
+            .expect("a file with no router key should accept the block")
+        {
+            RouterInit::Append(text) => text,
+            RouterInit::AlreadyPresent => {
+                panic!("a file with no [router] key should not count as already present")
+            }
+        };
+        assert_eq!(
+            text,
+            format!("{original}\n{}", openrouter_router_block()),
+            "a file that does not end in a newline should gain one newline and then the block"
+        );
+        let before = original
+            .parse::<toml::Table>()
+            .expect("the original comment and models table should parse");
+        let after = text
+            .parse::<toml::Table>()
+            .expect("the appended text should parse");
+        assert_eq!(
+            before.get("models"),
+            after.get("models"),
+            "appending [router] should leave the [models] table equal"
+        );
+        let again = init_router_text(&text)
+            .expect("a second plan should see the table the first plan added");
+        assert_eq!(
+            again,
+            RouterInit::AlreadyPresent,
+            "a second init should not build another block"
+        );
+    }
+
+    #[test]
+    fn init_router_text_keeps_an_existing_router_table_including_a_dotted_key() {
+        let header = "[router]\ndefault_provider = \"deepseek\"\n";
+        assert_eq!(
+            init_router_text(header).expect("a [router] table should be left alone"),
+            RouterInit::AlreadyPresent
+        );
+        let dotted = "router.default_provider = \"openrouter\"\n";
+        assert_eq!(
+            init_router_text(dotted).expect("a dotted router key is already a table"),
+            RouterInit::AlreadyPresent
+        );
+        assert_eq!(
+            init_router_text("").expect("an empty file should become the block"),
+            RouterInit::Append(openrouter_router_block())
+        );
+    }
+
+    #[test]
+    fn init_router_text_refuses_a_router_key_that_is_not_a_table() {
+        let error = init_router_text("router = \"nope\"\n")
+            .expect_err("a string router key should refuse before any rewrite");
+        assert!(
+            matches!(error, RouterInitError::NotTable),
+            "a non-table router key should be NotTable, got {error}"
+        );
+    }
+
+    #[test]
+    fn create_file_writes_a_new_path_without_a_backup() {
+        let tree = TempTree::new("create");
+        let config = tree.path().join("nested").join("config.toml");
+        let bytes = b"created\n";
+        create_file(&config, bytes, "").expect("a missing file should be created");
+        assert_eq!(
+            std::fs::read(&config).expect("the new file should be readable"),
+            bytes,
+            "create_file should leave the bytes it was given"
+        );
+        assert!(
+            !config.with_file_name("config.toml.prev").exists(),
+            "a new file has nothing to back up"
         );
     }
 

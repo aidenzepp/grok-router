@@ -4,7 +4,7 @@
 //! becomes the process result. `Display` is the sentence that path already prints.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::catalog::{CartridgeError, CatalogError, ResolveError, TimeoutError};
 use crate::config_edit::{RefuseReason, ReplaceError, SecretError};
@@ -535,6 +535,76 @@ pub enum Error {
     /// `skill` was given an empty `--skill-root`.
     #[error("--skill-root is empty, so nothing was written. Pass --skill-root with a directory.")]
     SkillRootEmpty,
+    /// `init` was given an empty `--config`.
+    #[error(
+        "--config is empty, so nothing was written. Pass --config with the file to write, or omit --config to use the default path."
+    )]
+    InitConfigEmpty,
+    /// `init` has no home path.
+    #[error(
+        "HOME is empty and GROK_HOME is unset, so there is no config path. Nothing was written. Pass --config with the file to write."
+    )]
+    InitHomeEmpty,
+    /// `init` has no home variable.
+    #[error(
+        "HOME is not set and GROK_HOME is unset, so there is no config path. Nothing was written. Pass --config with the file to write."
+    )]
+    InitHomeUnset,
+    /// `init` could not read an existing config.
+    #[error(
+        "could not read config {}. {source}. Nothing was written. Make that file readable, or pass --config with a readable file.",
+        path.display()
+    )]
+    InitConfigIo {
+        /// Path that could not be read.
+        path: PathBuf,
+        /// The filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// `init` read bytes that are not UTF-8.
+    #[error(
+        "config {} is not UTF-8, so nothing was written. The file was left unchanged. Save it as UTF-8 and retry init.",
+        path.display()
+    )]
+    InitConfigUtf8 {
+        /// Path that was not UTF-8.
+        path: PathBuf,
+    },
+    /// `init` refused because the config text did not parse.
+    #[error("{}", init_parse_sentence(path, *appended, detail))]
+    InitConfigParse {
+        /// Path that was left unchanged.
+        path: PathBuf,
+        /// Parser message.
+        detail: String,
+        /// True when the failure is the text after the block was appended.
+        appended: bool,
+    },
+    /// `init` found a `[router]` key that is not a table.
+    #[error(
+        "config {} has a [router] key that is not a table, so nothing was written. The file was left unchanged. Make [router] a table or remove that key, then retry init.",
+        path.display()
+    )]
+    InitRouterNotTable {
+        /// Path that was left unchanged.
+        path: PathBuf,
+    },
+    /// `init` would change a top-level table that was already in the file.
+    #[error("{}", init_changed_sentence(tables))]
+    InitChangedTables {
+        /// Table names that would change.
+        tables: Vec<String>,
+    },
+    /// `init` could not create or replace the file.
+    #[error(
+        "{source}. The config was not replaced. Retry with a writable path, or pass --dry-run to preview the write."
+    )]
+    InitReplace {
+        /// The create or replace that failed.
+        #[source]
+        source: ReplaceError,
+    },
     /// A refused config edit, printed as that refusal.
     #[error(transparent)]
     Refused(#[from] RefuseReason),
@@ -639,6 +709,15 @@ impl Error {
             Self::SearchEmpty { .. } => "search_empty",
             Self::SkillRootOmitted => "skill_root_omitted",
             Self::SkillRootEmpty => "skill_root_empty",
+            Self::InitConfigEmpty => "init_config_empty",
+            Self::InitHomeEmpty => "init_home_empty",
+            Self::InitHomeUnset => "init_home_unset",
+            Self::InitConfigIo { .. } => "init_config_io",
+            Self::InitConfigUtf8 { .. } => "init_config_utf8",
+            Self::InitConfigParse { .. } => "init_config_parse",
+            Self::InitRouterNotTable { .. } => "init_router_not_table",
+            Self::InitChangedTables { .. } => "init_changed_tables",
+            Self::InitReplace { .. } => "init_replace",
             Self::Refused(reason) => reason.kind(),
             Self::Replace(source) => source.failure_kind(),
             Self::Catalog(source) => source.kind(),
@@ -649,6 +728,32 @@ impl Error {
             Self::Timeout(_) => "timeout",
         }
     }
+}
+
+/// `before writing` or `after the router block was appended`.
+fn init_parse_when(appended: bool) -> &'static str {
+    if appended {
+        "after the router block was appended"
+    } else {
+        "before writing"
+    }
+}
+
+/// Parse refusal for `init`. Names the path, the consequence, and the next action.
+fn init_parse_sentence(path: &Path, appended: bool, detail: &str) -> String {
+    format!(
+        "config {} did not parse as TOML {when}, so nothing was written. The file was left unchanged. Fix the config so it parses as TOML and retry init. {detail}",
+        path.display(),
+        when = init_parse_when(appended)
+    )
+}
+
+/// Changed-table refusal for `init`. Names the tables, the consequence, and the next action.
+fn init_changed_sentence(tables: &[String]) -> String {
+    format!(
+        "init would change existing config tables ({}). Nothing was written. The file was left unchanged. Keep those tables and retry init.",
+        tables.join(", ")
+    )
 }
 
 /// Trim clap's display the way the JSON usage sentence already does.
