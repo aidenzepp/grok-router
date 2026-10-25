@@ -4,7 +4,6 @@
 //! whose body tells the agent to run `grok-router __internal skill`. Paths come
 //! from the caller. This module does not read the home directory.
 
-use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -155,20 +154,29 @@ pub struct Report {
 }
 
 /// Why setup or remove did not finish.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SkillFailure {
     /// Removal was not confirmed. The filesystem was not touched.
+    #[error(
+        "`skill remove` refuses to delete without --yes. Nothing was changed. Re-run with --yes, or pass --yes --dry-run to preview."
+    )]
     NeedsYes,
     /// The stub path is not ours, so nothing was written.
+    #[error(
+        "{} has no grok-router-skill-stub marker, so it was left in place and no stub was written. Move that directory aside or pass a different --skill-root.",
+        path.display()
+    )]
     Foreign {
         /// Path that was left in place.
         path: PathBuf,
     },
     /// A filesystem call failed.
+    #[error("could not update {}: {source}. {next}", path.display())]
     Io {
         /// Path the call was about.
         path: PathBuf,
         /// The filesystem error.
+        #[source]
         source: io::Error,
         /// What to do next.
         next: &'static str,
@@ -190,37 +198,6 @@ impl SkillFailure {
             path: path.to_path_buf(),
             source,
             next,
-        }
-    }
-}
-
-impl fmt::Display for SkillFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NeedsYes => formatter.write_str(
-                "`skill remove` refuses to delete without --yes. Nothing was changed. Re-run with --yes, or pass --yes --dry-run to preview.",
-            ),
-            Self::Foreign { path } => write!(
-                formatter,
-                "{} has no grok-router-skill-stub marker, so it was left in place and no stub was written. Move that directory aside or pass a different --skill-root.",
-                path.display()
-            ),
-            Self::Io { path, source, next } => {
-                write!(
-                    formatter,
-                    "could not update {}: {source}. {next}",
-                    path.display()
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SkillFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::NeedsYes | Self::Foreign { .. } => None,
         }
     }
 }

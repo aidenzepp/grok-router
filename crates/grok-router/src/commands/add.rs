@@ -19,7 +19,9 @@ use std::time::{Duration, SystemTime};
 
 use clap::{ArgAction, Args};
 
-use crate::catalog::{self, CachedBodyOrFetch, Cartridge, CartridgeError, CatalogCartridge};
+use crate::catalog::{
+    self, CachedBodyOrFetch, Cartridge, CartridgeError, CatalogCartridge, CatalogError,
+};
 use crate::config_edit::{self, Backup, ProviderChoice, RefuseReason};
 use crate::error::Error;
 use crate::OutputMode;
@@ -115,7 +117,7 @@ pub struct AddArgs {
 pub fn run(config: Option<&str>, args: &AddArgs, mode: OutputMode) -> i32 {
     let timeout = match catalog::require_timeout(&args.timeout) {
         Ok(timeout) => timeout,
-        Err(message) => return fail(mode, &Error::command(message)),
+        Err(err) => return fail(mode, &Error::from(err)),
     };
     match run_add(config, args, mode, timeout) {
         Ok(body) => write_stdout(mode, &body),
@@ -140,12 +142,15 @@ fn run_add(
     if present.is_empty() {
         let extras = catalog_refused_flags(args);
         if !extras.is_empty() {
-            return Err(Error::command(catalog_flag_refusal(&extras)));
+            return Err(Error::CatalogFlags {
+                extras: english_list(&extras),
+                verb: if extras.len() == 1 { "is" } else { "are" },
+            });
         }
         return run_catalog_add(&config_path, &original, args, mode, timeout);
     }
     if !missing.is_empty() {
-        return Err(Error::command(partial_direct_refusal(&present, &missing)));
+        return Err(partial_direct(&present, &missing));
     }
     run_direct_add(&config_path, &original, args, mode)
 }
@@ -229,45 +234,21 @@ fn english_list(items: &[&str]) -> String {
 }
 
 /// A mix of the four direct flags. Names what was passed and what was not.
-fn partial_direct_refusal(present: &[&str], missing: &[&str]) -> String {
-    format!(
-        "{} {} set, but {} {} missing. Pass all four of --model, --base-url, --env-key, and --api-backend, or none of them. The file was left unchanged. Nothing was downloaded. Nothing was written.",
-        english_list(present),
-        if present.len() == 1 { "was" } else { "were" },
-        english_list(missing),
-        if missing.len() == 1 { "was" } else { "were" },
-    )
-}
-
-/// `--name`, `--context-window`, or `--vision` without the four direct flags.
-fn catalog_flag_refusal(extras: &[&str]) -> String {
-    format!(
-        "{} {} only used together with --model, --base-url, --env-key, and --api-backend. The file was left unchanged. Nothing was downloaded. Nothing was written.",
-        english_list(extras),
-        if extras.len() == 1 { "is" } else { "are" },
-    )
-}
-
-/// Catalog selectors passed to a direct add.
-fn direct_conflict_refusal(conflicts: &[&str]) -> String {
-    format!(
-        "{} cannot be combined with --model, --base-url, --env-key, and --api-backend. The file was left unchanged. Nothing was downloaded. Nothing was written.",
-        english_list(conflicts)
-    )
+fn partial_direct(present: &[&str], missing: &[&str]) -> Error {
+    Error::PartialDirect {
+        present: english_list(present),
+        present_verb: if present.len() == 1 { "was" } else { "were" },
+        missing: english_list(missing),
+        missing_verb: if missing.len() == 1 { "was" } else { "were" },
+    }
 }
 
 /// `--as` for a direct add. Empty is not trimmed into absence.
-fn required_direct_slug(args: &AddArgs) -> Result<&str, String> {
+fn required_direct_slug(args: &AddArgs) -> Result<&str, Error> {
     match args.as_slug.as_deref() {
         Some(slug) if !slug.is_empty() => Ok(slug),
-        Some(_) => Err(
-            "--as is empty, so nothing was written. Pass --as with a slug. The file was left unchanged. Nothing was downloaded. Nothing was written."
-                .to_owned(),
-        ),
-        None => Err(
-            "--as is required with --model, --base-url, --env-key, and --api-backend. Pass --as with the slug to write. The file was left unchanged. Nothing was downloaded. Nothing was written."
-                .to_owned(),
-        ),
+        Some(_) => Err(Error::AsEmpty),
+        None => Err(Error::AsRequired),
     }
 }
 
@@ -282,7 +263,9 @@ fn run_direct_add(
 ) -> Result<String, Error> {
     let conflicts = direct_conflicts(args);
     if !conflicts.is_empty() {
-        return Err(Error::command(direct_conflict_refusal(&conflicts)));
+        return Err(Error::DirectConflict {
+            conflicts: english_list(&conflicts),
+        });
     }
     let slug = required_direct_slug(args)?;
     let (model, base_url, env_key, api_backend) = match (
@@ -295,10 +278,10 @@ fn run_direct_add(
             (model, base_url, env_key, api_backend)
         }
         _ => {
-            return Err(Error::command(partial_direct_refusal(
+            return Err(partial_direct(
                 &direct_flags_present(args),
                 &direct_flags_missing(&direct_flags_present(args)),
-            )));
+            ));
         }
     };
     let inserted = config_edit::insert_direct(
@@ -330,14 +313,8 @@ fn run_direct_add(
         false
     } else {
         config_edit::refuse_named_secrets(&edited, &[env_key])?;
-        config_edit::replace_file(config_path, Backup::Sibling, edited.as_bytes(), "").map_err(
-            |err| {
-                let message = format!(
-                    "{err}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the edit."
-                );
-                Error::replace(err, message)
-            },
-        )?;
+        config_edit::replace_file(config_path, Backup::Sibling, edited.as_bytes(), "")
+            .map_err(|err| Error::AddReplace { source: err })?;
         true
     };
     let report = AddReport {
@@ -348,7 +325,7 @@ fn run_direct_add(
         unchanged,
         default: args.set_default,
     };
-    render(mode, &report, config_path).map_err(Error::from)
+    render(mode, &report, config_path)
 }
 
 /// Resolve one provider record, parse with its cartridge, and write once.
@@ -368,11 +345,8 @@ fn run_catalog_add(
     let terms = query_terms(&args.query)?;
     let rows = load_rows(args, &selected, &record.base_url, &record.env_key, timeout)?;
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-    let row =
-        catalog::resolve(&rows, &term_refs).map_err(|err| {
-            let message = format!("{err} Nothing was written.");
-            Error::resolve(err, message)
-        })?;
+    let row = catalog::resolve(&rows, &term_refs)
+        .map_err(|err| Error::ResolveUnwritten { source: err })?;
     let slug = selected
         .slug(row.id(), args.as_slug.as_deref())
         .map_err(edit_failure)?;
@@ -390,14 +364,8 @@ fn run_catalog_add(
         false
     } else {
         config_edit::refuse_named_secrets(&edited, &[record.env_key.as_str()])?;
-        config_edit::replace_file(config_path, Backup::Sibling, edited.as_bytes(), "").map_err(
-            |err| {
-                let message = format!(
-                    "{err}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the edit."
-                );
-                Error::replace(err, message)
-            },
-        )?;
+        config_edit::replace_file(config_path, Backup::Sibling, edited.as_bytes(), "")
+            .map_err(|err| Error::AddReplace { source: err })?;
         true
     };
     let report = AddReport {
@@ -408,21 +376,15 @@ fn run_catalog_add(
         unchanged,
         default: args.set_default,
     };
-    render(mode, &report, config_path).map_err(Error::from)
+    render(mode, &report, config_path)
 }
 
 /// `--config` from the global flag. Never a home path.
-fn configured_path(config: Option<&str>) -> Result<PathBuf, String> {
+fn configured_path(config: Option<&str>) -> Result<PathBuf, Error> {
     match config {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
-        Some(_) => Err(
-            "--config is empty, so nothing was written. Pass --config with the file to edit."
-                .to_owned(),
-        ),
-        None => Err(
-            "no --config path was given, so nothing was written. Pass --config with the file to edit."
-                .to_owned(),
-        ),
+        Some(_) => Err(Error::AddConfigEmpty),
+        None => Err(Error::AddConfigOmitted),
     }
 }
 
@@ -454,54 +416,35 @@ fn record_name(config: &str, choice: ProviderChoice<'_>) -> String {
 
 /// What failed, why the record was not used, and that nothing was downloaded or written.
 fn resolve_failure(reason: RefuseReason) -> Error {
-    let preserved = "The file was left unchanged. Nothing was downloaded. Nothing was written.";
-    let must_write = match &reason {
-        RefuseReason::InvalidSetting { key, detail }
-            if key == "router"
-                || key == "default_provider"
-                || key == "provider"
-                || detail.contains("[router]") =>
-        {
-            " The operator must write that record."
-        }
-        _ => "",
-    };
-    let message = format!("{reason}.{must_write} {preserved}");
-    Error::refused(reason, message)
+    Error::ProviderResolve { reason }
 }
 
 /// A cartridge refusal names the provider and does not parse, download, or write.
 fn cartridge_failure(provider: &str, err: CartridgeError) -> Error {
-    let next = "Set catalog to openrouter-models or deepseek-list-models, or pass --provider for a record that already has one.";
-    let preserved = "Nothing was downloaded. Nothing was written.";
-    let message = match &err {
-        CartridgeError::Missing => {
-            format!("{provider} has no catalog cartridge configured. {preserved} {next}")
-        }
-        CartridgeError::Unknown { id } => format!(
-            "catalog {id} on {provider} is not a cartridge, so no catalog cartridge is configured. {preserved} {next}"
-        ),
-    };
-    Error::cartridge(err, message)
+    let provider = provider.to_owned();
+    match err {
+        CartridgeError::Missing => Error::CartridgeMissing {
+            provider,
+            source: CartridgeError::Missing,
+        },
+        CartridgeError::Unknown { id } => Error::CartridgeUnknown {
+            provider,
+            source: CartridgeError::Unknown { id },
+        },
+    }
 }
 
 /// Built-in membership failed before any catalog parse or download.
 fn early_refusal(reason: RefuseReason) -> Error {
-    let message = format!(
-        "{reason}. The file was left unchanged. Nothing was downloaded. Nothing was written."
-    );
-    Error::refused(reason, message)
+    Error::AddEarlyRefusal { reason }
 }
 
 /// Positional query terms. An empty term is a usage failure.
-fn query_terms(values: &[String]) -> Result<Vec<String>, String> {
+fn query_terms(values: &[String]) -> Result<Vec<String>, Error> {
     let mut terms = Vec::new();
     for term in values {
         if term.is_empty() {
-            return Err(
-                "an empty query was given. Nothing was written. Pass a provider id or terms."
-                    .to_owned(),
-            );
+            return Err(Error::EmptyQuery);
         }
         terms.push(term.clone());
     }
@@ -521,16 +464,13 @@ fn load_rows(
     timeout: Duration,
 ) -> Result<Vec<crate::catalog::CatalogRow>, Error> {
     if let Some(path) = &args.catalog_file {
-        let bytes = fs::read(path).map_err(|err| {
-            format!(
-                "could not read catalog file {}. {err}. Nothing was written. Pass a readable --catalog-file, or omit it to use the cache.",
-                path.display()
-            )
+        let bytes = fs::read(path).map_err(|err| Error::AddCatalogFile {
+            path: path.clone(),
+            source: err,
         })?;
-        return cartridge.parse(&bytes).map_err(|err| {
-            let message = format!("{err} Nothing was written.");
-            Error::catalog(err, message)
-        });
+        return cartridge
+            .parse(&bytes)
+            .map_err(|err| Error::CatalogUnwritten { source: err });
     }
 
     let api_key = required_bearer(env_key)?;
@@ -540,87 +480,64 @@ fn load_rows(
     };
     let now = SystemTime::now();
     match catalog::prepare_cached_body(&cache_dir, now, args.refresh, &api_key, base_url, env_key)
-        .map_err(|err| {
-            let message = format!("{err} Nothing was written.");
-            Error::catalog(err, message)
-        })?
+        .map_err(|err| Error::CatalogUnwritten { source: err })?
     {
-        CachedBodyOrFetch::Cached(bytes) => cartridge.parse(&bytes).map_err(|err| {
-            let message = format!("{err} Nothing was written.");
-            Error::catalog(err, message)
-        }),
+        CachedBodyOrFetch::Cached(bytes) => cartridge
+            .parse(&bytes)
+            .map_err(|err| Error::CatalogUnwritten { source: err }),
         CachedBodyOrFetch::Fetch(request) => {
-            let bytes = catalog::fetch_catalog_bytes(&request, timeout).map_err(|err| {
-                let message = format!("{err} Nothing was written.");
-                Error::catalog(err, message)
-            })?;
-            let stored = catalog::write_cache(&cache_dir, base_url, &bytes).map_err(|err| {
-                let message = format!("{err} Nothing was written.");
-                Error::catalog(err, message)
-            })?;
+            let bytes = catalog::fetch_catalog_bytes(&request, timeout)
+                .map_err(|err| Error::CatalogUnwritten { source: err })?;
+            let stored = catalog::write_cache(&cache_dir, base_url, &bytes)
+                .map_err(|err| Error::CatalogUnwritten { source: err })?;
             if stored != catalog::cache_path_for(&cache_dir, &catalog::models_url(base_url)) {
-                return Err(Error::command(format!(
-                    "the catalog cache was written to {}, outside {}. The config was not written. Pass --cache-dir.",
-                    stored.display(),
-                    cache_dir.display()
-                )));
+                return Err(Error::CacheOutside {
+                    stored,
+                    cache_dir,
+                });
             }
-            cartridge.parse(&bytes).map_err(|err| {
-                let message = format!("{err} The config was not written.");
-                Error::catalog(err, message)
-            })
+            cartridge
+                .parse(&bytes)
+                .map_err(|err| Error::CatalogConfigUnwritten { source: err })
         }
     }
 }
 
 /// The record's bearer. A missing or blank value fails before a download or a cache write.
-fn required_bearer(env_key: &str) -> Result<String, String> {
+fn required_bearer(env_key: &str) -> Result<String, Error> {
     match env::var(env_key) {
         Ok(value) if !value.is_empty() && !value.chars().all(char::is_whitespace) => Ok(value),
-        Ok(_) | Err(env::VarError::NotPresent) => Err(missing_bearer(env_key)),
-        Err(env::VarError::NotUnicode(_)) => Err(format!(
-            "{env_key} is not valid Unicode, so the config was not written. Export a Unicode key or pass --catalog-file."
-        )),
+        Ok(_) | Err(env::VarError::NotPresent) => Err(Error::MissingBearer {
+            env_key: env_key.to_owned(),
+            source: CatalogError::MissingKey {
+                env_key: env_key.to_owned(),
+            },
+        }),
+        Err(env::VarError::NotUnicode(_)) => Err(Error::AddEnvKeyNotUnicode {
+            name: env_key.to_owned(),
+        }),
     }
 }
 
-/// Missing-key sentence. The name is the record's `env_key`.
-fn missing_bearer(env_key: &str) -> String {
-    format!(
-        "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
-    )
-}
-
 /// Default cache directory `~/.cache/grok-router`. This is not the config file.
-fn default_cache_dir() -> Result<PathBuf, String> {
+fn default_cache_dir() -> Result<PathBuf, Error> {
     let Some(home) = env::var_os("HOME") else {
-        return Err(
-            "HOME is not set, so the catalog cache has no default directory. Nothing was written. Pass --cache-dir or --catalog-file."
-                .to_owned(),
-        );
+        return Err(Error::AddCacheHomeUnset);
     };
     if home.is_empty() {
-        return Err(
-            "HOME is empty, so the catalog cache has no default directory. Nothing was written. Pass --cache-dir or --catalog-file."
-                .to_owned(),
-        );
+        return Err(Error::AddCacheHomeEmpty);
     }
     Ok(PathBuf::from(home).join(".cache").join("grok-router"))
 }
 
 /// Read the named config. A missing file is a failure and not a reason to look elsewhere.
-fn read_config_text(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|err| {
-        format!(
-            "could not read config {}. {err}. Nothing was written. Pass --config pointing at an existing file.",
-            path.display()
-        )
+fn read_config_text(path: &Path) -> Result<String, Error> {
+    let bytes = fs::read(path).map_err(|err| Error::AddConfigIo {
+        path: path.to_path_buf(),
+        source: err,
     })?;
-    String::from_utf8(bytes).map_err(|_| {
-        format!(
-            "config {} is not UTF-8. Nothing was written. Save it as UTF-8 and pass that --config again.",
-            path.display()
-        )
+    String::from_utf8(bytes).map_err(|_| Error::AddConfigUtf8 {
+        path: path.to_path_buf(),
     })
 }
 
@@ -644,63 +561,16 @@ fn edited_config(
 
 /// What failed, why, and what to do next. The file was not written.
 fn edit_failure(reason: RefuseReason) -> Error {
-    let message = format!(
-        "{reason}. The file was left unchanged. {}",
-        next_step(&reason)
-    );
-    Error::refused(reason, message)
-}
-
-/// The next action for a refused edit.
-fn next_step(reason: &RefuseReason) -> String {
-    match reason {
-        RefuseReason::EmptyProviderId => "Choose a catalog row that has an id.".to_owned(),
-        RefuseReason::EmptySlugLeaf { .. } => "Pass --as with a slug.".to_owned(),
-        RefuseReason::InvalidSlug { .. } => {
-            "Pass --as with a slug that starts with a letter or digit and contains only letters, digits, dots, underscores, and hyphens.".to_owned()
-        }
-        RefuseReason::NonPositiveContext { .. } => {
-            "Choose a catalog row whose context window is greater than zero.".to_owned()
-        }
-        RefuseReason::DuplicateProvider { existing_slug, .. } => format!(
-            "Keep {existing_slug}, or remove it before adding another slug for that provider."
-        ),
-        RefuseReason::SlugInUse { .. } => {
-            "Pass --as with a slug that is not already used.".to_owned()
-        }
-        RefuseReason::UnknownSlug { .. } => {
-            "Add the model before passing --default, or choose a built-in or configured slug."
-                .to_owned()
-        }
-        RefuseReason::MultipleModelsTables => {
-            "Leave one [models] table in the config and retry.".to_owned()
-        }
-        RefuseReason::DuplicateSlugHeader { .. } => {
-            "Leave one header for that slug and retry.".to_owned()
-        }
-        RefuseReason::Parse { .. } => "Fix the config so it parses as TOML and retry.".to_owned(),
-        RefuseReason::NotConfigured { .. }
-        | RefuseReason::BuiltIn { .. }
-        | RefuseReason::IsDefault { .. }
-        | RefuseReason::DroppedTables { .. }
-        | RefuseReason::ChangedProvider { .. }
-        | RefuseReason::AddMissing { .. }
-        | RefuseReason::RemoveFailed { .. }
-        | RefuseReason::DefaultMismatch { .. }
-        | RefuseReason::InvalidSetting { .. } => {
-            "Retry with --dry-run after fixing the config. This command did not replace the file."
-                .to_owned()
-        }
-    }
+    Error::AddEdit { reason }
 }
 
 /// Human text, the slug, or one JSON object.
-fn render(mode: OutputMode, report: &AddReport, path: &Path) -> Result<String, String> {
+fn render(mode: OutputMode, report: &AddReport, path: &Path) -> Result<String, Error> {
     if mode == OutputMode::Json {
-        return serde_json::to_string(report).map_err(|err| {
-            format!(
-                "could not encode the add result as JSON: {err}. Retry the add; report this if it persists."
-            )
+        return serde_json::to_string(report).map_err(|err| Error::JsonEncode {
+            what: "the add result",
+            source: err,
+            retry: "Retry the add; report this if it persists.",
         });
     }
     if mode == OutputMode::Quiet {
@@ -727,9 +597,10 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &Error::command(format!(
-                "could not write the add result: {err}. Retry when stdout accepts output."
-            )),
+            &Error::Stdout {
+                what: "the add result",
+                source: err,
+            },
         ),
     }
 }

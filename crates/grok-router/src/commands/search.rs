@@ -78,7 +78,7 @@ pub struct SearchArgs {
 pub fn run(config: Option<&str>, args: &SearchArgs, mode: OutputMode) -> i32 {
     let timeout = match catalog::require_timeout(&args.timeout) {
         Ok(timeout) => timeout,
-        Err(message) => return fail(mode, &Error::command(message)),
+        Err(err) => return fail(mode, &Error::from(err)),
     };
     run_search(config, args, mode, timeout)
 }
@@ -87,7 +87,7 @@ pub fn run(config: Option<&str>, args: &SearchArgs, mode: OutputMode) -> i32 {
 fn run_search(config: Option<&str>, args: &SearchArgs, mode: OutputMode, timeout: Duration) -> i32 {
     let terms = match collect_terms(&args.terms) {
         Ok(terms) => terms,
-        Err(message) => return fail(mode, &Error::command(message)),
+        Err(err) => return fail(mode, &err),
     };
     let rows = match load_rows(config, args, timeout) {
         Ok(rows) => rows,
@@ -96,14 +96,19 @@ fn run_search(config: Option<&str>, args: &SearchArgs, mode: OutputMode, timeout
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let matched = catalog::matching(&rows, &term_refs);
     if matched.is_empty() {
-        return fail(mode, &Error::command(empty_message(&terms)));
+        return fail(
+            mode,
+            &Error::SearchEmpty {
+                quoted: quoted_terms(&terms),
+            },
+        );
     }
     let shown = take_rows(&matched, args.limit);
     let color = allow_color(io::stdout().is_terminal(), no_color_is_set());
     let body = match mode {
         OutputMode::Json => match format_json(&shown) {
             Ok(body) => body,
-            Err(message) => return fail(mode, &Error::command(message)),
+            Err(err) => return fail(mode, &err),
         },
         OutputMode::Quiet => format_quiet(&shown, color),
         OutputMode::Text => format_table(&shown, color),
@@ -112,14 +117,11 @@ fn run_search(config: Option<&str>, args: &SearchArgs, mode: OutputMode, timeout
 }
 
 /// Terms from the positional arguments. An empty term is a usage failure.
-fn collect_terms(values: &[String]) -> Result<Vec<String>, String> {
+fn collect_terms(values: &[String]) -> Result<Vec<String>, Error> {
     let mut terms = Vec::new();
     for term in values {
         if term.is_empty() {
-            return Err(
-                "an empty search term was given. Remove the empty argument and pass words or an exact model id."
-                    .to_owned(),
-            );
+            return Err(Error::SearchEmptyTerm);
         }
         terms.push(term.clone());
     }
@@ -149,16 +151,13 @@ fn load_rows(
     let selected = catalog::cartridge(record.catalog.as_deref())
         .map_err(|err| cartridge_failure(&record_name(&text, choice), err))?;
     if let Some(path) = &args.catalog_file {
-        let bytes = fs::read(path).map_err(|err| {
-            format!(
-                "could not read catalog file {}. {err}. Nothing was downloaded. The config was not written. Pass a readable --catalog-file, or omit it to use the cache.",
-                path.display()
-            )
+        let bytes = fs::read(path).map_err(|err| Error::SearchCatalogFile {
+            path: path.clone(),
+            source: err,
         })?;
-        return selected.parse(&bytes).map_err(|err| {
-            let message = format!("{err} Nothing was downloaded. The config was not written.");
-            Error::catalog(err, message)
-        });
+        return selected
+            .parse(&bytes)
+            .map_err(|err| Error::SearchCatalogParse { source: err });
     }
 
     let api_key = bearer(&record.env_key)?;
@@ -177,10 +176,9 @@ fn load_rows(
     )
         .map_err(|err| cache_failure(err, &record.env_key))?
     {
-        CachedBodyOrFetch::Cached(bytes) => selected.parse(&bytes).map_err(|err| {
-            let message = format!("{err} The config was not written.");
-            Error::catalog(err, message)
-        }),
+        CachedBodyOrFetch::Cached(bytes) => selected
+            .parse(&bytes)
+            .map_err(|err| Error::CatalogConfigUnwritten { source: err }),
         CachedBodyOrFetch::Fetch(request) => {
             let bytes = catalog::fetch_catalog_bytes(&request, timeout)
                 .map_err(|err| cache_failure(err, &record.env_key))?;
@@ -188,16 +186,11 @@ fn load_rows(
                 .map_err(|err| cache_failure(err, &record.env_key))?;
             if stored != catalog::cache_path_for(&cache_dir, &catalog::models_url(&record.base_url))
             {
-                return Err(Error::command(format!(
-                    "the catalog cache was written to {}, outside {}. The config was not written. Pass --cache-dir.",
-                    stored.display(),
-                    cache_dir.display()
-                )));
+                return Err(Error::CacheOutside { stored, cache_dir });
             }
-            selected.parse(&bytes).map_err(|err| {
-                let message = format!("{err} The config was not written.");
-                Error::catalog(err, message)
-            })
+            selected
+                .parse(&bytes)
+                .map_err(|err| Error::CatalogConfigUnwritten { source: err })
         }
     }
 }
@@ -230,44 +223,34 @@ fn record_name(config: &str, choice: ProviderChoice<'_>) -> String {
 
 /// What failed, why the record was not used, and that nothing was downloaded or written.
 fn resolve_failure(reason: RefuseReason) -> Error {
-    let preserved = "The file was left unchanged. Nothing was downloaded. Nothing was written.";
-    let must_write = match &reason {
-        RefuseReason::InvalidSetting { key, detail }
-            if key == "router"
-                || key == "default_provider"
-                || key == "provider"
-                || detail.contains("[router]") =>
-        {
-            " The operator must write that record."
-        }
-        _ => "",
-    };
-    let message = format!("{reason}.{must_write} {preserved}");
-    Error::refused(reason, message)
+    Error::ProviderResolve { reason }
 }
 
 /// A cartridge refusal names the provider and does not parse or download.
 fn cartridge_failure(provider: &str, err: CartridgeError) -> Error {
-    let next = "Set catalog to openrouter-models or deepseek-list-models, or pass --provider for a record that already has one.";
-    let preserved = "Nothing was downloaded. Nothing was written.";
-    let message = match &err {
-        CartridgeError::Missing => {
-            format!("{provider} has no catalog cartridge configured. {preserved} {next}")
-        }
-        CartridgeError::Unknown { id } => format!(
-            "catalog {id} on {provider} is not a cartridge, so no catalog cartridge is configured. {preserved} {next}"
-        ),
-    };
-    Error::cartridge(err, message)
+    let provider = provider.to_owned();
+    match err {
+        CartridgeError::Missing => Error::CartridgeMissing {
+            provider,
+            source: CartridgeError::Missing,
+        },
+        CartridgeError::Unknown { id } => Error::CartridgeUnknown {
+            provider,
+            source: CartridgeError::Unknown { id },
+        },
+    }
 }
 
 /// Turn a cache or download error into the command's sentence.
 fn cache_failure(err: CatalogError, env_key: &str) -> Error {
-    let message = match &err {
-        CatalogError::MissingKey { .. } => missing_bearer(env_key),
-        other => other.to_string(),
-    };
-    Error::catalog(err, message)
+    if matches!(err, CatalogError::MissingKey { .. }) {
+        Error::MissingBearer {
+            env_key: env_key.to_owned(),
+            source: err,
+        }
+    } else {
+        Error::Catalog(err)
+    }
 }
 
 /// `--config` when it is set. Otherwise [`default_config_path`].
@@ -277,12 +260,9 @@ fn cache_failure(err: CatalogError, env_key: &str) -> Error {
 /// # Errors
 ///
 /// Returns an error when `--config` is empty, or when no default path can be named.
-fn search_config_path(config: Option<&str>) -> Result<PathBuf, String> {
+fn search_config_path(config: Option<&str>) -> Result<PathBuf, Error> {
     match config {
-        Some("") => Err(
-            "--config is empty, so the catalog was not read. Pass --config with the file to read."
-                .to_owned(),
-        ),
+        Some("") => Err(Error::SearchConfigEmpty),
         Some(path) => Ok(PathBuf::from(path)),
         None => default_config_path(),
     }
@@ -293,7 +273,7 @@ fn search_config_path(config: Option<&str>) -> Result<PathBuf, String> {
 /// # Errors
 ///
 /// Returns an error when `GROK_HOME` is unset or empty and `HOME` cannot name a path.
-fn default_config_path() -> Result<PathBuf, String> {
+fn default_config_path() -> Result<PathBuf, Error> {
     if let Some(grok_home) = env::var_os("GROK_HOME") {
         if !grok_home.is_empty() {
             return Ok(PathBuf::from(grok_home).join("config.toml"));
@@ -301,14 +281,8 @@ fn default_config_path() -> Result<PathBuf, String> {
     }
     match env::var_os("HOME") {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".grok").join("config.toml")),
-        Some(_) => Err(
-            "HOME is empty and GROK_HOME is unset, so there is no config path. The catalog was not read. Pass --config."
-                .to_owned(),
-        ),
-        None => Err(
-            "HOME is not set and GROK_HOME is unset, so there is no config path. The catalog was not read. Pass --config."
-                .to_owned(),
-        ),
+        Some(_) => Err(Error::SearchHomeEmpty),
+        None => Err(Error::SearchHomeUnset),
     }
 }
 
@@ -327,33 +301,24 @@ fn read_config_text(path: &Path) -> Result<String, Error> {
             }));
         }
         Err(err) => {
-            return Err(Error::command(format!(
-                "could not read config {}. {err}. The catalog was not read. Nothing was downloaded and the cache was not written. Pass --config pointing at a readable file.",
-                path.display()
-            )));
+            return Err(Error::SearchConfigIo {
+                path: path.to_path_buf(),
+                source: err,
+            });
         }
     };
-    String::from_utf8(bytes).map_err(|_| {
-        Error::command(format!(
-            "config {} is not UTF-8, so the catalog was not read. Nothing was downloaded and the cache was not written. Save it as UTF-8.",
-            path.display()
-        ))
+    String::from_utf8(bytes).map_err(|_| Error::SearchConfigUtf8 {
+        path: path.to_path_buf(),
     })
 }
 
 /// Default cache directory `~/.cache/grok-router`.
-fn default_cache_dir() -> Result<PathBuf, String> {
+fn default_cache_dir() -> Result<PathBuf, Error> {
     let Some(home) = env::var_os("HOME") else {
-        return Err(
-            "HOME is not set, so the catalog cache has no default directory. Pass --cache-dir or --catalog-file."
-                .to_owned(),
-        );
+        return Err(Error::SearchCacheHomeUnset);
     };
     if home.is_empty() {
-        return Err(
-            "HOME is empty, so the catalog cache has no default directory. Pass --cache-dir or --catalog-file."
-                .to_owned(),
-        );
+        return Err(Error::SearchCacheHomeEmpty);
     }
     Ok(PathBuf::from(home).join(".cache").join("grok-router"))
 }
@@ -366,33 +331,39 @@ fn default_cache_dir() -> Result<PathBuf, String> {
 /// # Errors
 ///
 /// Returns an error when the variable is set to non-Unicode bytes.
-fn bearer(env_key: &str) -> Result<String, String> {
+fn bearer(env_key: &str) -> Result<String, Error> {
     match env::var(env_key) {
         Ok(value) => Ok(value),
         Err(env::VarError::NotPresent) => Ok(String::new()),
-        Err(env::VarError::NotUnicode(_)) => Err(format!(
-            "{env_key} is not valid Unicode, so the catalog was not downloaded. Export a Unicode key or pass --catalog-file."
-        )),
+        Err(env::VarError::NotUnicode(_)) => Err(Error::SearchEnvKeyNotUnicode {
+            name: env_key.to_owned(),
+        }),
     }
 }
 
-/// Missing-key sentence. The name is the record's `env_key`.
-fn missing_bearer(env_key: &str) -> String {
-    format!(
-        "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
-    )
+/// `--limit` rejected by clap before search runs.
+#[derive(Debug, thiserror::Error)]
+enum LimitParse {
+    /// The value was not a whole number.
+    #[error("--limit {raw} is not a whole number. Pass --limit 30.")]
+    NotWhole {
+        /// The text that was passed.
+        raw: String,
+    },
+    /// Zero would hide every row.
+    #[error(
+        "--limit 0 would hide every row. Pass --limit 30 or another number greater than zero."
+    )]
+    Zero,
 }
 
-/// Reject zero. Clap prints the returned string and exits.
-fn parse_limit(raw: &str) -> Result<usize, String> {
-    let limit: usize = raw
-        .parse()
-        .map_err(|_| format!("--limit {raw} is not a whole number. Pass --limit 30."))?;
+/// Reject zero. Clap prints the returned error and exits.
+fn parse_limit(raw: &str) -> Result<usize, LimitParse> {
+    let limit: usize = raw.parse().map_err(|_| LimitParse::NotWhole {
+        raw: raw.to_owned(),
+    })?;
     if limit == 0 {
-        return Err(
-            "--limit 0 would hide every row. Pass --limit 30 or another number greater than zero."
-                .to_owned(),
-        );
+        return Err(LimitParse::Zero);
     }
     Ok(limit)
 }
@@ -421,9 +392,9 @@ fn take_rows<'a>(rows: &[&'a CatalogRow], limit: usize) -> Vec<&'a CatalogRow> {
     taken
 }
 
-/// What failed, why, and what to do next when nothing matched.
-fn empty_message(terms: &[String]) -> String {
-    let quoted = if terms.is_empty() {
+/// Terms as the empty-search sentence already quotes them, or `the catalog`.
+fn quoted_terms(terms: &[String]) -> String {
+    if terms.is_empty() {
         "the catalog".to_owned()
     } else {
         terms
@@ -431,14 +402,11 @@ fn empty_message(terms: &[String]) -> String {
             .map(|term| format!("{term:?}"))
             .collect::<Vec<_>>()
             .join(" ")
-    };
-    format!(
-        "no models matched {quoted}. 0 matches. The id, name, and description did not contain every term. Try fewer terms or pass --catalog-file with the catalog you meant."
-    )
+    }
 }
 
 /// JSON array of id, name, and context_length. Nothing else.
-fn format_json(rows: &[&CatalogRow]) -> Result<String, String> {
+fn format_json(rows: &[&CatalogRow]) -> Result<String, Error> {
     let hits = rows
         .iter()
         .map(|row| JsonHit {
@@ -447,10 +415,10 @@ fn format_json(rows: &[&CatalogRow]) -> Result<String, String> {
             context_length: row.context_length(),
         })
         .collect::<Vec<_>>();
-    serde_json::to_string(&hits).map_err(|err| {
-        format!(
-            "could not encode search results as JSON: {err}. Retry the search; report this if it persists."
-        )
+    serde_json::to_string(&hits).map_err(|err| Error::JsonEncode {
+        what: "search results",
+        source: err,
+        retry: "Retry the search; report this if it persists.",
     })
 }
 
@@ -517,9 +485,10 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &Error::command(format!(
-                "could not write search results: {err}. Retry when stdout accepts output."
-            )),
+            &Error::Stdout {
+                what: "search results",
+                source: err,
+            },
         ),
     }
 }

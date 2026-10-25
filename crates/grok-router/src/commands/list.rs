@@ -60,23 +60,20 @@ fn list_models(
     let inventory =
         config_edit::read_configured(&text).map_err(|refused| read_failure(refused.reason))?;
     let rows = limited(display_rows(&inventory), limit)?;
-    render(&rows, mode).map_err(Error::from)
+    render(&rows, mode)
 }
 
 /// `--config` when it was passed. Otherwise `${GROK_HOME:-$HOME/.grok}/config.toml`.
-fn config_path(config: Option<&str>) -> Result<PathBuf, String> {
+fn config_path(config: Option<&str>) -> Result<PathBuf, Error> {
     match config {
-        Some("") => Err(
-            "--config is empty, so the models were not listed. Pass --config with the file to read."
-                .to_owned(),
-        ),
+        Some("") => Err(Error::ListConfigEmpty),
         Some(path) => Ok(PathBuf::from(path)),
         None => default_config_path(),
     }
 }
 
 /// `${GROK_HOME:-$HOME/.grok}/config.toml`. An empty `GROK_HOME` falls through to `HOME`.
-fn default_config_path() -> Result<PathBuf, String> {
+fn default_config_path() -> Result<PathBuf, Error> {
     if let Some(grok_home) = env::var_os("GROK_HOME") {
         if !grok_home.is_empty() {
             return Ok(PathBuf::from(grok_home).join("config.toml"));
@@ -84,48 +81,35 @@ fn default_config_path() -> Result<PathBuf, String> {
     }
     match env::var_os("HOME") {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".grok").join("config.toml")),
-        Some(_) => Err(
-            "HOME is empty and GROK_HOME is unset, so there is no config path. Pass --config with the file to read."
-                .to_owned(),
-        ),
-        None => Err(
-            "HOME is not set and GROK_HOME is unset, so there is no config path. Pass --config with the file to read."
-                .to_owned(),
-        ),
+        Some(_) => Err(Error::ListHomeEmpty),
+        None => Err(Error::ListHomeUnset),
     }
 }
 
 /// Read the named config. A missing file is a failure and not a reason to look elsewhere.
-fn read_config_text(path: &Path) -> Result<String, String> {
+fn read_config_text(path: &Path) -> Result<String, Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Err(format!(
-                "could not read config {}. The file is missing, so the models were not listed. Create the file or pass --config with an existing file.",
-                path.display()
-            ));
+            return Err(Error::ListConfigMissing {
+                path: path.to_path_buf(),
+            });
         }
         Err(err) => {
-            return Err(format!(
-                "could not read config {}. {err}. The models were not listed. Pass --config pointing at a readable file.",
-                path.display()
-            ));
+            return Err(Error::ListConfigIo {
+                path: path.to_path_buf(),
+                source: err,
+            });
         }
     };
-    String::from_utf8(bytes).map_err(|_| {
-        format!(
-            "config {} is not UTF-8, so the models were not listed. Save it as UTF-8 and pass that --config again.",
-            path.display()
-        )
+    String::from_utf8(bytes).map_err(|_| Error::ListConfigUtf8 {
+        path: path.to_path_buf(),
     })
 }
 
 /// What failed, why, and what to do next when the config text cannot be read.
 fn read_failure(reason: RefuseReason) -> Error {
-    let message = format!(
-        "{reason}. The models were not listed. Fix the config so it parses as TOML, or pass --config with a readable file."
-    );
-    Error::refused(reason, message)
+    Error::ListConfigRefused { reason }
 }
 
 /// Keep the first `limit` rows. Omitting the flag keeps every row, in the same order.
@@ -138,14 +122,12 @@ fn limited(rows: Vec<Row>, limit: Option<&str>) -> Result<Vec<Row>, Error> {
         return Ok(rows);
     };
     let Ok(count) = raw.parse::<usize>() else {
-        return Err(Error::command(format!(
-            "--limit {raw} is not a whole number, so nothing was listed. Omit --limit or pass a number greater than zero."
-        )));
+        return Err(Error::LimitNotWhole {
+            raw: raw.to_owned(),
+        });
     };
     if count == 0 {
-        return Err(Error::command(
-            "--limit 0 would hide every row, so nothing was listed. Omit --limit or pass a number greater than zero.",
-        ));
+        return Err(Error::LimitZero);
     }
     Ok(rows.into_iter().take(count).collect())
 }
@@ -174,7 +156,7 @@ fn display_rows(inventory: &ConfiguredInventory) -> Vec<Row> {
 }
 
 /// JSON, one slug per line, or text that marks the default.
-fn render(rows: &[Row], mode: OutputMode) -> Result<String, String> {
+fn render(rows: &[Row], mode: OutputMode) -> Result<String, Error> {
     match mode {
         OutputMode::Json => format_json(rows),
         OutputMode::Quiet => Ok(format_quiet(rows)),
@@ -183,7 +165,7 @@ fn render(rows: &[Row], mode: OutputMode) -> Result<String, String> {
 }
 
 /// JSON array. `provider_id` is omitted when the slug has no block.
-fn format_json(rows: &[Row]) -> Result<String, String> {
+fn format_json(rows: &[Row]) -> Result<String, Error> {
     let hits = rows
         .iter()
         .map(|row| JsonRow {
@@ -192,10 +174,10 @@ fn format_json(rows: &[Row]) -> Result<String, String> {
             default: row.is_default,
         })
         .collect::<Vec<_>>();
-    serde_json::to_string(&hits).map_err(|err| {
-        format!(
-            "could not encode the model list as JSON: {err}. Retry the list; report this if it persists."
-        )
+    serde_json::to_string(&hits).map_err(|err| Error::JsonEncode {
+        what: "the model list",
+        source: err,
+        retry: "Retry the list; report this if it persists.",
     })
 }
 
@@ -238,9 +220,10 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &Error::command(format!(
-                "could not write the model list: {err}. Retry when stdout accepts output."
-            )),
+            &Error::Stdout {
+                what: "the model list",
+                source: err,
+            },
         ),
     }
 }

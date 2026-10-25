@@ -21,11 +21,11 @@ use grok_router::{Cli, Commands, OutputMode, error};
 fn main() {
     let matches = match Cli::command().try_get_matches() {
         Ok(matches) => matches,
-        Err(err) => std::process::exit(clap_exit(&err)),
+        Err(err) => std::process::exit(clap_exit(err)),
     };
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
-        Err(err) => std::process::exit(clap_exit(&err)),
+        Err(err) => std::process::exit(clap_exit(err)),
     };
     let mode = match cli.resolve_output(output_source(&matches)) {
         Ok(mode) => mode,
@@ -88,7 +88,7 @@ fn source_rank(source: ValueSource) -> u8 {
 }
 
 /// Print clap's error, or one JSON value when this invocation asked for JSON.
-fn clap_exit(err: &clap::Error) -> i32 {
+fn clap_exit(err: clap::Error) -> i32 {
     if argv_requests_json() {
         return json_clap_exit(err);
     }
@@ -115,7 +115,7 @@ fn write_stdout_line(body: &str) -> i32 {
 }
 
 /// Help and version are JSON on stdout. Every other clap error is one JSON object on stderr.
-fn json_clap_exit(err: &clap::Error) -> i32 {
+fn json_clap_exit(err: clap::Error) -> i32 {
     match err.kind() {
         ErrorKind::DisplayHelp => {
             let body = serde_json::json!({"command": "help", "format": "json"});
@@ -126,8 +126,8 @@ fn json_clap_exit(err: &clap::Error) -> i32 {
             write_stdout_line(&body.to_string())
         }
         _ => {
-            let usage = error::Error::usage(err.to_string().trim());
             let code = err.exit_code();
+            let usage = error::Error::Usage { source: err };
             grok_router::write_failure(OutputMode::Json, usage_command_name(), &usage);
             code
         }

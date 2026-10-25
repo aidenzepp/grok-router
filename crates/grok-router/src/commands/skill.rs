@@ -177,7 +177,7 @@ fn run_setup(args: &SetupArgs, mode: OutputMode) -> i32 {
     let flags = &args.flags.read;
     let root = match skill_root(flags) {
         Ok(root) => root,
-        Err(message) => return fail_command(mode, &Error::usage(message)),
+        Err(err) => return fail_command(mode, &err),
     };
     finish(mode, "setup", setup(&root, write_mode(args.flags.dry_run)))
 }
@@ -185,7 +185,7 @@ fn run_setup(args: &SetupArgs, mode: OutputMode) -> i32 {
 fn run_status(args: &StatusArgs, mode: OutputMode) -> i32 {
     let root = match skill_root(&args.flags) {
         Ok(root) => root,
-        Err(message) => return fail_command(mode, &Error::usage(message)),
+        Err(err) => return fail_command(mode, &err),
     };
     finish(mode, "status", inspect(&root))
 }
@@ -198,7 +198,7 @@ fn run_remove(args: &RemoveArgs, mode: OutputMode) -> i32 {
     }
     let root = match skill_root(flags) {
         Ok(root) => root,
-        Err(message) => return fail_command(mode, &Error::usage(message)),
+        Err(err) => return fail_command(mode, &err),
     };
     finish(
         mode,
@@ -215,9 +215,11 @@ fn write_guide(mode: OutputMode) -> i32 {
             Err(err) => {
                 return fail_command(
                     mode,
-                    &Error::io(format!(
-                        "could not encode the skill guide as JSON: {err}. Retry the command."
-                    )),
+                    &Error::JsonEncode {
+                        what: "the skill guide",
+                        source: err,
+                        retry: "Retry the command.",
+                    },
                 );
             }
         },
@@ -236,18 +238,12 @@ fn finish(mode: OutputMode, command: &str, result: Result<Report, SkillFailure>)
     }
 }
 
-fn skill_root(flags: &ReadFlags) -> Result<PathBuf, String> {
+fn skill_root(flags: &ReadFlags) -> Result<PathBuf, Error> {
     let Some(path) = &flags.skill_root else {
-        return Err(
-            "no --skill-root was given, so nothing was written. Pass --skill-root with the directory that should hold the grok-router stub."
-                .to_owned(),
-        );
+        return Err(Error::SkillRootOmitted);
     };
     if path.as_os_str().is_empty() {
-        return Err(
-            "--skill-root is empty, so nothing was written. Pass --skill-root with a directory."
-                .to_owned(),
-        );
+        return Err(Error::SkillRootEmpty);
     }
     Ok(path.clone())
 }
@@ -284,10 +280,10 @@ fn render_json(command: &str, report: &Report) -> Result<String, Error> {
         dry_run: report.mode.is_dry_run(),
         path: report.path.display().to_string(),
     };
-    serde_json::to_string(&body).map_err(|err| {
-        Error::io(format!(
-            "could not encode the skill result as JSON: {err}. Retry the command; report this if it persists."
-        ))
+    serde_json::to_string(&body).map_err(|err| Error::JsonEncode {
+        what: "the skill result",
+        source: err,
+        retry: "Retry the command; report this if it persists.",
     })
 }
 
@@ -347,9 +343,10 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail_command(
             mode,
-            &Error::command(format!(
-                "could not write the skill result: {err}. Retry when stdout accepts output."
-            )),
+            &Error::Stdout {
+                what: "the skill result",
+                source: err,
+            },
         ),
     }
 }

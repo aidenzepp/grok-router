@@ -117,9 +117,7 @@ impl Cli {
         let format = if source == clap::parser::ValueSource::CommandLine {
             if json_alias && self.output == OutputFormat::Text {
                 let flag = if self.json { "--json" } else { "--jsonl" };
-                return Err(error::Error::command(format!(
-                    "{flag} conflicts with --output text, so nothing was written. Drop {flag} or pass --output json."
-                )));
+                return Err(error::Error::JsonFlagConflicts { flag });
             }
             self.output
         } else if json_alias {
@@ -128,9 +126,7 @@ impl Cli {
             self.output
         };
         if self.quiet && matches!(format, OutputFormat::Json | OutputFormat::Jsonl) {
-            return Err(error::Error::command(
-                "--quiet conflicts with json output, so nothing was written. Drop --quiet or pass --output text.",
-            ));
+            return Err(error::Error::QuietConflictsJson);
         }
         Ok(match (self.quiet, format) {
             (true, _) => OutputMode::Quiet,
@@ -204,7 +200,7 @@ impl CompletionsArgs {
     #[must_use]
     pub fn run(&self, mode: OutputMode) -> i32 {
         match render_completion(&self.shell, mode) {
-            Ok(body) => write_stdout(mode, &body, "completion script", "completions"),
+            Ok(body) => write_stdout(mode, &body, "the completion script", "completions"),
             Err(err) => fail_message(mode, "completions", &err),
         }
     }
@@ -256,10 +252,10 @@ pub fn write_failure(mode: OutputMode, command: &str, err: &error::Error) {
 fn render_completion(shell: &str, mode: OutputMode) -> Result<String, error::Error> {
     let script = completion_script(shell)?;
     match mode {
-        OutputMode::Json => serde_json::to_string(&script).map_err(|err| {
-            error::Error::command(format!(
-                "could not encode the completion script as JSON: {err}. Retry completions."
-            ))
+        OutputMode::Json => serde_json::to_string(&script).map_err(|err| error::Error::JsonEncode {
+            what: "the completion script",
+            source: err,
+            retry: "Retry completions.",
         }),
         OutputMode::Text | OutputMode::Quiet => Ok(script),
     }
@@ -278,23 +274,19 @@ fn completion_script(shell: &str) -> Result<String, error::Error> {
         "elvish" => clap_complete::Shell::Elvish,
         "powershell" => clap_complete::Shell::PowerShell,
         _ => {
-            return Err(error::Error::command(format!(
-                "unknown shell {shell}. Pass bash, zsh, fish, elvish, or powershell. The config was not read and nothing was written."
-            )));
+            return Err(error::Error::UnknownShell {
+                shell: shell.to_owned(),
+            });
         }
     };
     let mut cmd = command();
     let mut buf = Vec::new();
     clap_complete::generate(clap_shell, &mut cmd, "grok-router", &mut buf);
-    String::from_utf8(buf).map_err(|_| {
-        error::Error::command(
-            "the completion script was not valid UTF-8, so nothing was written. Retry completions.",
-        )
-    })
+    String::from_utf8(buf).map_err(|_| error::Error::CompletionNotUtf8)
 }
 
 /// Write `body` and a trailing newline. A closed pipe is success.
-fn write_stdout(mode: OutputMode, body: &str, what: &str, command: &str) -> i32 {
+fn write_stdout(mode: OutputMode, body: &str, what: &'static str, command: &str) -> i32 {
     let mut stdout = io::stdout().lock();
     let mut bytes = body.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -306,9 +298,10 @@ fn write_stdout(mode: OutputMode, body: &str, what: &str, command: &str) -> i32 
         Err(err) => fail_message(
             mode,
             command,
-            &error::Error::command(format!(
-                "could not write the {what}: {err}. Retry when stdout accepts output."
-            )),
+            &error::Error::Stdout {
+                what,
+                source: err,
+            },
         ),
     }
 }
