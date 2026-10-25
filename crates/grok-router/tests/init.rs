@@ -23,7 +23,6 @@ use std::process::Command;
 const BLOCK: &str = "\
 [router]
 default_provider = \"openrouter\"
-builtins = [\"grok-4.7\", \"grok-4.7-build-fast\", \"grok-4.6\", \"grok-4.5\"]
 
 [router.provider.openrouter]
 base_url = \"https://openrouter.ai/api/v1\"

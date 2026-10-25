@@ -894,22 +894,20 @@ pub fn read_configured(config: &str) -> Result<ConfiguredInventory, Refused> {
 
 /// The `OpenRouter` `[router]` block `init` writes, including its trailing newline.
 ///
-/// `builtins` is [`BUILTIN_SLUGS`] in order. This function does not read a file.
+/// Writes `default_provider` and the openrouter record. Does not write `builtins`.
+/// A missing `builtins` key still uses [`BUILTIN_SLUGS`]. This function does not read a file.
 #[must_use = "the block is the only copy of the bytes init writes"]
 pub fn openrouter_router_block() -> String {
-    let builtins = render_builtin_list();
-    format!(
-        "\
+    "\
 [router]
 default_provider = \"openrouter\"
-builtins = {builtins}
 
 [router.provider.openrouter]
 base_url = \"https://openrouter.ai/api/v1\"
 env_key = \"OPENROUTER_API_KEY\"
 catalog = \"openrouter-models\"
 "
-    )
+    .to_owned()
 }
 
 /// Append the `OpenRouter` router block, or report that `[router]` is already a table.
@@ -959,19 +957,6 @@ pub fn init_router_text(config: &str) -> Result<RouterInit, RouterInitError> {
         return Err(RouterInitError::ChangedTables { tables });
     }
     Ok(RouterInit::Append(spliced))
-}
-
-/// Render [`BUILTIN_SLUGS`] as a TOML array. The names are not copied by hand.
-fn render_builtin_list() -> String {
-    let mut list = String::from("[");
-    for (index, slug) in BUILTIN_SLUGS.iter().enumerate() {
-        if index > 0 {
-            list.push_str(", ");
-        }
-        list.push_str(&toml_basic_string(slug));
-    }
-    list.push(']');
-    list
 }
 
 /// Keep `config` and put `block` after it. A non-empty text without a trailing newline gets one.
@@ -3649,33 +3634,29 @@ env_key = \"EXAMPLE_API_KEY\"
     }
 
     #[test]
-    fn openrouter_router_block_renders_the_compiled_builtins() {
-        let rendered = BUILTIN_SLUGS
-            .iter()
-            .map(|slug| format!("\"{slug}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+    fn openrouter_router_block_omits_builtins() {
         let block = openrouter_router_block();
         assert_eq!(
             block,
-            format!(
-                "\
+            "\
 [router]
 default_provider = \"openrouter\"
-builtins = [{rendered}]
 
 [router.provider.openrouter]
 base_url = \"https://openrouter.ai/api/v1\"
 env_key = \"OPENROUTER_API_KEY\"
 catalog = \"openrouter-models\"
-"
-            ),
-            "the block should be the compiled slugs plus the OpenRouter record"
+",
+            "init should write the provider record and not a builtins key"
+        );
+        assert!(
+            !block.contains("builtins"),
+            "init must not freeze the compiled slug list, got:\n{block}"
         );
         assert_eq!(
             BUILTIN_SLUGS,
             ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"],
-            "init's acceptance block is these four compiled slugs"
+            "a missing builtins key still falls back to these four compiled slugs"
         );
     }
 
