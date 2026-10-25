@@ -1,6 +1,7 @@
 //! Subcommand stubs. Each name is registered only through that module's `augment`.
 
 pub mod add;
+pub mod benchmarks;
 pub mod init;
 pub mod list;
 pub mod remove;

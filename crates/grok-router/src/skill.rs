@@ -19,9 +19,10 @@ const MARKER: &str = "grok-router-skill-stub";
 const GUIDE: &str = "\
 grok-router
 
-Commands: list, search, add, set-default, remove, skill.
+Commands: list, search, benchmarks, add, set-default, remove, skill.
 
-list and search read.
+list, search, and benchmarks read.
+benchmarks prints published price and scores from an openrouter-models catalog. Other catalogs refuse and download nothing.
 add and set-default write.
 remove deletes one saved model and refuses unless --yes is set.
 skill setup writes a short stub.
@@ -37,6 +38,8 @@ The installed stub does not contain this guide. It tells you to run `grok-router
 Examples:
   grok-router list
   grok-router search glm
+  grok-router benchmarks
+  grok-router benchmarks kimi
   grok-router add z-ai/glm-5.3
   grok-router set-default or-glm-5-3
   grok-router remove or-glm-5-3 --yes
@@ -440,7 +443,7 @@ mod tests {
     };
 
     const NEXT_SESSION: &str = "The saved default applies to the next session.";
-    const COMMANDS: &str = "Commands: list, search, add, set-default, remove, skill.";
+    const COMMANDS: &str = "Commands: list, search, benchmarks, add, set-default, remove, skill.";
     const INVOCATION: &str = "grok-router __internal skill";
 
     #[test]
@@ -448,7 +451,7 @@ mod tests {
         let text = guide();
         assert!(
             text.contains(COMMANDS),
-            "the guide should name list, search, add, set-default, remove, and skill; guide: {text}"
+            "the guide should name list, search, benchmarks, add, set-default, remove, and skill; guide: {text}"
         );
         assert!(
             text.contains(NEXT_SESSION),

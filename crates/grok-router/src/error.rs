@@ -6,6 +6,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::benchmarks::BenchmarkParseError;
 use crate::catalog::{CartridgeError, CatalogError, ResolveError, TimeoutError};
 use crate::config_edit::{RefuseReason, ReplaceError, SecretError};
 use crate::skill::SkillFailure;
@@ -523,6 +524,110 @@ pub enum Error {
         /// Terms as the sentence already quotes them, or `the catalog`.
         quoted: String,
     },
+    /// `benchmarks` was given an empty term.
+    #[error(
+        "an empty benchmark term was given. Remove the empty argument and pass words or an exact model id."
+    )]
+    BenchmarkEmptyTerm,
+    /// `benchmarks` could not read `--catalog-file`.
+    #[error(
+        "could not read catalog file {}. {source}. Nothing was downloaded. The config was not written. Pass a readable --catalog-file, or omit it to use the cache.",
+        path.display()
+    )]
+    BenchmarkCatalogFile {
+        /// Path that could not be read.
+        path: PathBuf,
+        /// The filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// `--catalog-file` did not parse as scores. Nothing was downloaded and the config was not written.
+    #[error("{source} Nothing was downloaded. The config was not written.")]
+    BenchmarkCatalogParse {
+        /// The benchmark parse error.
+        #[source]
+        source: BenchmarkParseError,
+    },
+    /// Cached or downloaded bytes did not parse as scores. The config was not written.
+    #[error("{source} The config was not written.")]
+    BenchmarkCacheParse {
+        /// The benchmark parse error.
+        #[source]
+        source: BenchmarkParseError,
+    },
+    /// `benchmarks` was given an empty `--config`.
+    #[error("--config is empty, so the catalog was not read. Pass --config with the file to read.")]
+    BenchmarkConfigEmpty,
+    /// `benchmarks` has no home path.
+    #[error(
+        "HOME is empty and GROK_HOME is unset, so there is no config path. The catalog was not read. Pass --config."
+    )]
+    BenchmarkHomeEmpty,
+    /// `benchmarks` has no home variable.
+    #[error(
+        "HOME is not set and GROK_HOME is unset, so there is no config path. The catalog was not read. Pass --config."
+    )]
+    BenchmarkHomeUnset,
+    /// `benchmarks` could not read the config.
+    #[error(
+        "could not read config {}. {source}. The catalog was not read. Nothing was downloaded and the cache was not written. Pass --config pointing at a readable file.",
+        path.display()
+    )]
+    BenchmarkConfigIo {
+        /// Path that could not be read.
+        path: PathBuf,
+        /// The filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// `benchmarks` read bytes that are not UTF-8.
+    #[error(
+        "config {} is not UTF-8, so the catalog was not read. Nothing was downloaded and the cache was not written. Save it as UTF-8.",
+        path.display()
+    )]
+    BenchmarkConfigUtf8 {
+        /// Path that was not UTF-8.
+        path: PathBuf,
+    },
+    /// `benchmarks` has no home for the default cache directory.
+    #[error(
+        "HOME is not set, so the catalog cache has no default directory. Pass --cache-dir or --catalog-file."
+    )]
+    BenchmarkCacheHomeUnset,
+    /// `benchmarks` has an empty home for the default cache directory.
+    #[error(
+        "HOME is empty, so the catalog cache has no default directory. Pass --cache-dir or --catalog-file."
+    )]
+    BenchmarkCacheHomeEmpty,
+    /// `benchmarks` found a bearer that is not Unicode.
+    #[error(
+        "{name} is not valid Unicode, so the catalog was not downloaded. Export a Unicode key or pass --catalog-file."
+    )]
+    BenchmarkEnvKeyNotUnicode {
+        /// Variable that could not be read.
+        name: String,
+    },
+    /// No catalog row matched the benchmark terms.
+    #[error(
+        "no models matched {quoted}. 0 matches. The id, name, and description did not contain every term. Try fewer terms or pass --catalog-file with the catalog you meant. Nothing was written."
+    )]
+    BenchmarkEmpty {
+        /// Terms as the sentence already quotes them.
+        quoted: String,
+    },
+    /// No row had an intelligence index, so the default ranking is empty.
+    #[error(
+        "no model in this catalog has an artificial analysis intelligence index. 0 rows. Pass a term to list models with blank scores, or pass --catalog-file with an openrouter-models document that includes benchmarks. Nothing was written."
+    )]
+    BenchmarkNoIndex,
+    /// The selected provider does not publish this benchmark feed.
+    #[error("{}", benchmark_no_feed_sentence(provider, catalog.as_deref()))]
+    BenchmarkNoFeed {
+        /// Provider name used in the sentence.
+        provider: String,
+        /// Catalog id. `None` means the provider set no catalog.
+        catalog: Option<String>,
+    },
     /// `skill` was not given `--skill-root`.
     #[error(
         "no --skill-root was given, so nothing was written. Pass --skill-root with the directory that should hold the grok-router stub."
@@ -633,6 +738,10 @@ impl Error {
     /// JSON `error` and `kind` are this name. A transparent domain error uses
     /// that error's own name. [`SkillFailure`] stays `refused` or `io`.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each command failure is one arm so the match stays exhaustive"
+    )]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::JsonFlagConflicts { .. } => "json_flag_conflicts",
@@ -703,6 +812,21 @@ impl Error {
             Self::SearchCacheHomeUnset => "search_cache_home_unset",
             Self::SearchCacheHomeEmpty => "search_cache_home_empty",
             Self::SearchEmpty { .. } => "search_empty",
+            Self::BenchmarkEmptyTerm => "benchmark_empty_term",
+            Self::BenchmarkCatalogFile { .. } => "benchmark_catalog_file",
+            Self::BenchmarkCatalogParse { .. } => "benchmark_catalog_parse",
+            Self::BenchmarkCacheParse { .. } => "benchmark_cache_parse",
+            Self::BenchmarkConfigEmpty => "benchmark_config_empty",
+            Self::BenchmarkHomeEmpty => "benchmark_home_empty",
+            Self::BenchmarkHomeUnset => "benchmark_home_unset",
+            Self::BenchmarkConfigIo { .. } => "benchmark_config_io",
+            Self::BenchmarkConfigUtf8 { .. } => "benchmark_config_utf8",
+            Self::BenchmarkCacheHomeUnset => "benchmark_cache_home_unset",
+            Self::BenchmarkCacheHomeEmpty => "benchmark_cache_home_empty",
+            Self::BenchmarkEnvKeyNotUnicode { .. } => "benchmark_env_key_not_unicode",
+            Self::BenchmarkEmpty { .. } => "benchmark_empty",
+            Self::BenchmarkNoIndex => "benchmark_no_index",
+            Self::BenchmarkNoFeed { .. } => "benchmark_no_feed",
             Self::SkillRootOmitted => "skill_root_omitted",
             Self::SkillRootEmpty => "skill_root_empty",
             Self::InitConfigEmpty => "init_config_empty",
@@ -918,6 +1042,20 @@ fn provider_resolve_sentence(reason: &RefuseReason) -> String {
         | RefuseReason::InvalidSetting { .. } => "",
     };
     format!("{reason}.{must_write} {preserved}")
+}
+
+/// No-feed sentence. Names the provider, the catalog, and the one catalog that has scores.
+fn benchmark_no_feed_sentence(provider: &str, catalog: Option<&str>) -> String {
+    let why = match catalog {
+        None => "No catalog is set on that provider.".to_owned(),
+        Some("deepseek-list-models") => {
+            "deepseek-list-models does not publish these scores.".to_owned()
+        }
+        Some(id) => format!("Catalog id {id:?} is not openrouter-models."),
+    };
+    format!(
+        "{provider} has no benchmark feed. {why} Nothing was downloaded. The config was not written. Use a provider whose catalog is openrouter-models."
+    )
 }
 
 /// Unknown-cartridge sentence. The id comes from the source when it is unknown.

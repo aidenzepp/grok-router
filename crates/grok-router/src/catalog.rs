@@ -1,5 +1,8 @@
 //! Catalog rows, matching, cache decisions, and two catalog cartridges.
 //!
+//! Published scores are [`CatalogCartridge::benchmarks`]. Only `openrouter-models`
+//! implements that read. `deepseek-list-models` refuses without parsing.
+//!
 //! Search reads. It never writes the config. The only write helper here stores
 //! non-empty catalog bytes under a caller-supplied cache directory.
 //! Cache freshness is an age the caller passes in. Nothing in this module
@@ -13,6 +16,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use crate::benchmarks::{self, BenchmarkParseError, BenchmarkRow};
 use crate::config_edit::{CatalogModel, RefuseReason, require_slug};
 
 /// A cache younger than this duration is the answer, unless refresh was asked for.
@@ -435,8 +439,10 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<Vec<CatalogRow>, CatalogError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cartridge {
     /// `openrouter-models`. [`CatalogCartridge::parse`] calls [`parse_catalog`].
+    /// [`CatalogCartridge::benchmarks`] reads Artificial Analysis indexes and price.
     OpenRouter,
     /// `deepseek-list-models`. Reads `id`, `name`, `context_window`, and `input_modalities`.
+    /// [`CatalogCartridge::benchmarks`] refuses. This cartridge has no benchmark feed.
     DeepSeek,
 }
 
@@ -494,6 +500,33 @@ pub trait CatalogCartridge {
     ///
     /// Returns [`RefuseReason`] when `model_id` or `explicit` is not a usable slug.
     fn slug(&self, model_id: &str, explicit: Option<&str>) -> Result<String, RefuseReason>;
+
+    /// Read published scores from `bytes`.
+    ///
+    /// `OpenRouter` parses the models document. `DeepSeek` returns
+    /// [`BenchmarkParseError::NoFeed`] and does not parse `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BenchmarkParseError::NoFeed`] when this cartridge has no feed.
+    /// Returns a parse error when `OpenRouter` bytes are not a models document.
+    fn benchmarks(&self, bytes: &[u8]) -> Result<Vec<BenchmarkRow>, BenchmarkParseError>;
+}
+
+impl Cartridge {
+    /// Whether this cartridge publishes scores. Does not read `bytes` and does not download.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BenchmarkParseError::NoFeed`] for `deepseek-list-models`.
+    pub fn benchmark_feed(self) -> Result<(), BenchmarkParseError> {
+        match self {
+            Self::OpenRouter => Ok(()),
+            Self::DeepSeek => Err(BenchmarkParseError::NoFeed {
+                catalog_id: "deepseek-list-models",
+            }),
+        }
+    }
 }
 
 impl CatalogCartridge for Cartridge {
@@ -508,6 +541,15 @@ impl CatalogCartridge for Cartridge {
         match self {
             Self::OpenRouter => openrouter_slug(model_id, explicit),
             Self::DeepSeek => deepseek_slug(model_id, explicit),
+        }
+    }
+
+    fn benchmarks(&self, bytes: &[u8]) -> Result<Vec<BenchmarkRow>, BenchmarkParseError> {
+        match self {
+            Self::OpenRouter => benchmarks::parse_openrouter(bytes),
+            Self::DeepSeek => Err(BenchmarkParseError::NoFeed {
+                catalog_id: "deepseek-list-models",
+            }),
         }
     }
 }
@@ -2043,6 +2085,34 @@ mod tests {
         assert!(
             !message.contains(&retired),
             "the unknown-id error must not say OpenRouter was not selected; message: {message}"
+        );
+    }
+
+    #[test]
+    fn deepseek_benchmarks_refuse_without_parsing_the_bytes() {
+        let refused = Cartridge::DeepSeek
+            .benchmarks(b"not-json")
+            .expect_err("deepseek has no benchmark feed");
+        assert_eq!(
+            refused,
+            crate::benchmarks::BenchmarkParseError::NoFeed {
+                catalog_id: "deepseek-list-models",
+            }
+        );
+        assert!(
+            Cartridge::DeepSeek.benchmark_feed().is_err(),
+            "the feed check refuses before any bytes are read"
+        );
+        let parsed = Cartridge::OpenRouter
+            .benchmarks(b"not-json")
+            .expect_err("openrouter still parses the bytes");
+        assert!(
+            matches!(parsed, crate::benchmarks::BenchmarkParseError::Json { .. }),
+            "bad openrouter bytes are a JSON error, not a missing feed; error: {parsed}"
+        );
+        assert!(
+            Cartridge::OpenRouter.benchmark_feed().is_ok(),
+            "openrouter-models is the benchmark feed"
         );
     }
 

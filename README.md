@@ -1,6 +1,6 @@
 # grok-router
 
-`grok-router` edits the Grok config that already lives at `$GROK_HOME/config.toml`, or at `~/.grok/config.toml` when `GROK_HOME` is unset. It searches a provider catalog, inserts one `[model.<slug>]` block, and changes the saved default. It does not switch the model of a running Grok session. `/model` and `grok -m` do that.
+`grok-router` edits the Grok config that already lives at `$GROK_HOME/config.toml`, or at `~/.grok/config.toml` when `GROK_HOME` is unset. It searches a provider catalog, shows published scores and price from that catalog, inserts one `[model.<slug>]` block, and changes the saved default. It does not switch the model of a running Grok session. `/model` and `grok -m` do that.
 
 The file stores the name of an environment variable in `env_key`. The key value stays in the environment. A write is refused when that value would be copied into the file.
 
@@ -18,7 +18,7 @@ cargo install --path crates/grok-router --locked
 
 ## Config
 
-`list`, `search`, and `init` read that default path. They do not create it, except `init`, which creates a missing file and any missing parent directory.
+`list`, `search`, `benchmarks`, and `init` read that default path. They do not create it, except `init`, which creates a missing file and any missing parent directory.
 
 `add`, `set-default`, and `remove` require `--config`. They do not open the home file on their own.
 
@@ -26,6 +26,8 @@ cargo install --path crates/grok-router --locked
 grok-router init
 grok-router list
 grok-router search glm
+grok-router benchmarks
+grok-router benchmarks kimi
 grok-router add --config ~/.grok/config.toml moonshotai/kimi-k3.1-pro
 grok-router set-default --config ~/.grok/config.toml or-kimi-k3-1-pro
 grok-router remove --yes --config ~/.grok/config.toml or-kimi-k3-1-pro
@@ -60,6 +62,7 @@ catalog = "deepseek-list-models"
 | --- | --- | --- |
 | `list` | no | Configured models, plus the saved default when that slug has no block. |
 | `search` | no | AND-match on id, name, and description. Default `--limit` is 30. |
+| `benchmarks` | no | Published price and Artificial Analysis indexes from an `openrouter-models` catalog. Other catalogs refuse before a download. Default `--limit` is 30. |
 | `add` | yes | One catalog model, or one direct block. |
 | `set-default` | yes | Sets `[models].default` for the next session. |
 | `remove` | yes | Deletes one model block. Requires `--yes` or `--force`. |
@@ -69,9 +72,19 @@ catalog = "deepseek-list-models"
 
 `--dry-run` on a write command prints what would change and does not touch the file. `remove` without `--yes` refuses and does not delete. There is no prompt.
 
-`list --limit N` prints the first N rows. Omitting it prints every row. `--limit 0` is refused. Search keeps its own limit and its default of 30.
+`list --limit N` prints the first N rows. Omitting it prints every row. `--limit 0` is refused. `search` and `benchmarks` each keep a limit, and that default is 30.
 
-A catalog is cached for one hour under `~/.cache/grok-router/`. `--refresh` downloads again. `--catalog-file` reads a local JSON file and skips the network. `--timeout` is seconds for that download, default 30, from `GROK_ROUTER_TIMEOUT` when the flag is omitted. `0` refuses before any request.
+A catalog is cached for one hour under `~/.cache/grok-router/`. `search` and `benchmarks` share that cache. `--refresh` downloads again. `--catalog-file` reads a local JSON file and skips the network. `--timeout` is seconds for that download, default 30, from `GROK_ROUTER_TIMEOUT` when the flag is omitted. `0` refuses before any request.
+
+## Benchmarks
+
+`benchmarks` reads the catalog `search` already downloads. It does not run prompts and it does not grade answers. With no terms, it prints models that have an Artificial Analysis intelligence index, highest first. Ties stay in catalog order. Terms are the same AND match as `search`, and a match with no score is still shown, in catalog order.
+
+Text columns are the provider id, prompt and completion price in dollars per million tokens, and the intelligence, coding, and agentic indexes. A blank cell is `-`. JSON is an array of those fields plus `name`. Design Arena categories are not in this table.
+
+OpenRouter prices in the document are per token. The table multiplies by one million. A negative price, which OpenRouter uses when a price is not published, prints as `-`.
+
+Only `openrouter-models` has this feed. `deepseek-list-models`, an unknown catalog id, and a provider with no catalog refuse before any download and before `--catalog-file` is read.
 
 ## Adding a model
 
@@ -105,7 +118,7 @@ Catalog blocks are written in this order: `model`, `base_url`, `name`, `env_key`
 
 `GROK_ROUTER_OUTPUT` and `GROK_ROUTER_QUIET` supply the defaults. A command-line `--output` beats the environment. `--json` or `--jsonl` then beats both. `--json` with `--output text` is an error. `--quiet` with JSON is an error.
 
-JSON errors are one object on stderr: `command`, `format`, `error`, `kind`, and `message`. `error` and `kind` are the same snake_case name. Success JSON stays the command's own value. `list` and `search` succeed with an array.
+JSON errors are one object on stderr: `command`, `format`, `error`, `kind`, and `message`. `error` and `kind` are the same snake_case name. Success JSON stays the command's own value. `list`, `search`, and `benchmarks` succeed with an array.
 
 ## Skill stub
 

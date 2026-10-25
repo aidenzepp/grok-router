@@ -18,6 +18,7 @@ use std::io::{self, Write};
 
 use clap::{ArgAction, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
 
+pub mod benchmarks;
 pub mod catalog;
 pub mod commands;
 pub mod config_edit;
@@ -55,7 +56,7 @@ pub enum OutputMode {
     version,
     disable_help_subcommand = true,
     about = "Manage the grok model router config.",
-    long_about = "Manage the grok model router config.\n\nRead models, search a provider catalog, and edit the saved config.",
+    long_about = "Manage the grok model router config.\n\nRead models, search a provider catalog, compare published scores, and edit the saved config.",
     after_help = "Examples:\n  grok-router list --config config.toml\n  grok-router list --config config.toml --output json"
 )]
 pub struct Cli {
@@ -149,6 +150,7 @@ impl Cli {
         match &self.command {
             None | Some(Commands::List(_)) => "list",
             Some(Commands::Search(_)) => "search",
+            Some(Commands::Benchmarks(_)) => "benchmarks",
             Some(Commands::Add(_)) => "add",
             Some(Commands::SetDefault(_)) => "set-default",
             Some(Commands::Remove(_)) => "remove",
@@ -170,6 +172,9 @@ pub enum Commands {
     /// Search the selected provider catalog. This command does not modify the config.
     #[command(verbatim_doc_comment)]
     Search(commands::search::SearchArgs),
+    /// Show published price and benchmark scores from an openrouter-models catalog. This command does not modify the config. Other catalogs refuse before a download.
+    #[command(verbatim_doc_comment)]
+    Benchmarks(commands::benchmarks::BenchmarkArgs),
     /// Add one model from the selected provider record, or write one block from --model, --base-url, --env-key, and --api-backend without resolving a provider. This command writes unless --dry-run is set.
     #[command(verbatim_doc_comment)]
     Add(commands::add::AddArgs),
