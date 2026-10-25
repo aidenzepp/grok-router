@@ -55,14 +55,8 @@ fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Resul
         false
     } else {
         config_edit::refuse_named_secrets(&edited, &[])?;
-        config_edit::replace_file(&path, Backup::Sibling, edited.as_bytes(), "").map_err(
-            |err| {
-                let message = format!(
-                    "{err}. The saved default was not changed. Retry with a writable --config, or pass --dry-run to preview the slug."
-                );
-                Error::replace(err, message)
-            },
-        )?;
+        config_edit::replace_file(&path, Backup::Sibling, edited.as_bytes(), "")
+            .map_err(|err| Error::SetDefaultReplace { source: err })?;
         true
     };
     let report = SetDefaultReport {
@@ -71,99 +65,50 @@ fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Resul
         dry_run,
         unchanged,
     };
-    render(mode, &report).map_err(Error::from)
+    render(mode, &report)
 }
 
 /// `--config` from the global flag. Never a home path.
-fn configured_path(config: Option<&str>) -> Result<PathBuf, String> {
+fn configured_path(config: Option<&str>) -> Result<PathBuf, Error> {
     match config {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
-        Some(_) => Err(
-            "--config is empty, so the saved default was not changed. Pass --config with the file to edit."
-                .to_owned(),
-        ),
-        None => Err(
-            "no --config path was given, so the saved default was not changed. Pass --config with the file to edit."
-                .to_owned(),
-        ),
+        Some(_) => Err(Error::SetDefaultConfigEmpty),
+        None => Err(Error::SetDefaultConfigOmitted),
     }
 }
 
 /// The required slug. An empty string is a usage failure.
-fn requested_slug(slug: &str) -> Result<String, String> {
+fn requested_slug(slug: &str) -> Result<String, Error> {
     if slug.is_empty() {
-        Err(
-            "the slug is empty, so the saved default was not changed. Pass a built-in or configured slug."
-                .to_owned(),
-        )
+        Err(Error::SetDefaultSlugEmpty)
     } else {
         Ok(slug.to_owned())
     }
 }
 
 /// Read the named config. A missing file is a failure and not a reason to look elsewhere.
-fn read_config_text(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|err| {
-        format!(
-            "could not read config {}. {err}. The saved default was not changed. Pass --config pointing at an existing file.",
-            path.display()
-        )
+fn read_config_text(path: &Path) -> Result<String, Error> {
+    let bytes = fs::read(path).map_err(|err| Error::SetDefaultConfigIo {
+        path: path.to_path_buf(),
+        source: err,
     })?;
-    String::from_utf8(bytes).map_err(|_| {
-        format!(
-            "config {} is not UTF-8. The saved default was not changed. Save it as UTF-8 and pass that --config again.",
-            path.display()
-        )
+    String::from_utf8(bytes).map_err(|_| Error::SetDefaultConfigUtf8 {
+        path: path.to_path_buf(),
     })
 }
 
 /// What failed, why, and what to do next. The file was not written.
 fn edit_failure(reason: RefuseReason) -> Error {
-    let message = format!(
-        "{reason}. The file was left unchanged. {}",
-        next_step(&reason)
-    );
-    Error::refused(reason, message)
-}
-
-/// The next action for a refused edit.
-fn next_step(reason: &RefuseReason) -> &'static str {
-    match reason {
-        RefuseReason::UnknownSlug { .. } => {
-            "Pass a built-in slug (grok-4.7, grok-4.7-build-fast, grok-4.6, grok-4.5) or a slug already in the config."
-        }
-        RefuseReason::InvalidSlug { .. } => {
-            "Pass a slug that starts with a letter or digit and contains only letters, digits, dots, underscores, and hyphens."
-        }
-        RefuseReason::MultipleModelsTables => "Leave one [models] table in the config and retry.",
-        RefuseReason::DuplicateSlugHeader { .. } => "Leave one header for that slug and retry.",
-        RefuseReason::Parse { .. } => "Fix the config so it parses as TOML and retry.",
-        RefuseReason::EmptyProviderId
-        | RefuseReason::EmptySlugLeaf { .. }
-        | RefuseReason::NonPositiveContext { .. }
-        | RefuseReason::DuplicateProvider { .. }
-        | RefuseReason::SlugInUse { .. }
-        | RefuseReason::NotConfigured { .. }
-        | RefuseReason::BuiltIn { .. }
-        | RefuseReason::IsDefault { .. }
-        | RefuseReason::DroppedTables { .. }
-        | RefuseReason::ChangedProvider { .. }
-        | RefuseReason::AddMissing { .. }
-        | RefuseReason::RemoveFailed { .. }
-        | RefuseReason::DefaultMismatch { .. }
-        | RefuseReason::InvalidSetting { .. } => {
-            "Retry with --dry-run after fixing the config. This command did not replace the file."
-        }
-    }
+    Error::SetDefaultEdit { reason }
 }
 
 /// Human text, the slug, or one JSON object.
-fn render(mode: OutputMode, report: &SetDefaultReport) -> Result<String, String> {
+fn render(mode: OutputMode, report: &SetDefaultReport) -> Result<String, Error> {
     if mode == OutputMode::Json {
-        return serde_json::to_string(report).map_err(|err| {
-            format!(
-                "could not encode the set-default result as JSON: {err}. Retry the command; report this if it persists."
-            )
+        return serde_json::to_string(report).map_err(|err| Error::JsonEncode {
+            what: "the set-default result",
+            source: err,
+            retry: "Retry the command; report this if it persists.",
         });
     }
     if mode == OutputMode::Quiet {
@@ -190,9 +135,10 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &Error::command(format!(
-                "could not write the set-default result: {err}. Retry when stdout accepts output."
-            )),
+            &Error::Stdout {
+                what: "the set-default result",
+                source: err,
+            },
         ),
     }
 }

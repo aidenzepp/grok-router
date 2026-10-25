@@ -102,28 +102,37 @@ impl CatalogRow {
 }
 
 /// Why a catalog load, match, or cache write stopped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CatalogError {
     /// The API key was missing or blank. `env_key` is the variable that was required.
     ///
     /// An empty `env_key` names no provider. Nothing was downloaded or cached.
+    #[error("{}", missing_key_sentence(env_key))]
     MissingKey {
         /// Environment variable the caller asked to read. Empty names no provider.
         env_key: String,
     },
     /// The models URL was empty or only whitespace. No request was built.
+    #[error(
+        "the models URL is empty or only whitespace, so no catalog request was built. Pass a non-blank models URL. Nothing was downloaded and the cache was not written."
+    )]
     EmptyUrl,
     /// The bytes were not JSON.
+    #[error(
+        "the catalog JSON could not be parsed: {detail}. Pass an OpenRouter /api/v1/models document via --catalog-file, or pass --refresh."
+    )]
     Json {
         /// Parser detail.
         detail: String,
     },
     /// The JSON was not an OpenRouter models document.
+    #[error("{detail}. Pass an OpenRouter /api/v1/models document via --catalog-file.")]
     Shape {
         /// What was missing.
         detail: String,
     },
     /// One `data` element could not be turned into a row.
+    #[error("catalog data[{index}] {detail}. Fix that element or remove it from the file.")]
     Row {
         /// Index in the `data` array.
         index: usize,
@@ -131,11 +140,13 @@ pub enum CatalogError {
         detail: String,
     },
     /// The download returned no bytes. The cache was not written.
+    #[error("{}", empty_body_sentence(env_key))]
     EmptyBody {
         /// Environment variable whose value was sent. Empty names no provider.
         env_key: String,
     },
     /// The download failed. The cache was not written.
+    #[error("{}", http_sentence(detail, env_key))]
     Http {
         /// Failure detail, with the API key removed.
         detail: String,
@@ -143,6 +154,9 @@ pub enum CatalogError {
         env_key: String,
     },
     /// The cache file could not be read or written.
+    #[error(
+        "the catalog cache at {path} could not be used: {detail}. Pass --cache-dir or --catalog-file."
+    )]
     CacheIo {
         /// Path that failed.
         path: String,
@@ -150,13 +164,20 @@ pub enum CatalogError {
         detail: String,
     },
     /// A caller asked to store an empty body. No file was written.
+    #[error(
+        "refusing to write an empty catalog cache. 0 bytes. Pass --catalog-file or retry the download."
+    )]
     EmptyCacheWrite,
     /// Direct-catalog bytes were not JSON. This is not an OpenRouter document error.
+    #[error(
+        "the catalog JSON could not be parsed: {detail}. Pass a deepseek-list-models document. Nothing was written."
+    )]
     DirectJson {
         /// Parser detail.
         detail: String,
     },
     /// Direct-catalog JSON was not a `data` array of model objects.
+    #[error("{detail}. Pass a deepseek-list-models document. Nothing was written.")]
     DirectShape {
         /// What was missing.
         detail: String,
@@ -173,85 +194,61 @@ impl CatalogError {
     }
 }
 
-impl fmt::Display for CatalogError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl CatalogError {
+    /// Snake_case name of this catalog failure.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
         match self {
-            Self::MissingKey { env_key } => {
-                if env_key.is_empty() {
-                    write!(
-                        formatter,
-                        "the API key is missing, so the catalog was not downloaded. Pass --catalog-file. The config was not written and an empty cache was not written."
-                    )
-                } else {
-                    write!(
-                        formatter,
-                        "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
-                    )
-                }
-            }
-            Self::EmptyUrl => write!(
-                formatter,
-                "the models URL is empty or only whitespace, so no catalog request was built. Pass a non-blank models URL. Nothing was downloaded and the cache was not written."
-            ),
-            Self::Json { detail } => write!(
-                formatter,
-                "the catalog JSON could not be parsed: {detail}. Pass an OpenRouter /api/v1/models document via --catalog-file, or pass --refresh."
-            ),
-            Self::Shape { detail } => write!(
-                formatter,
-                "{detail}. Pass an OpenRouter /api/v1/models document via --catalog-file."
-            ),
-            Self::Row { index, detail } => write!(
-                formatter,
-                "catalog data[{index}] {detail}. Fix that element or remove it from the file."
-            ),
-            Self::EmptyBody { env_key } => {
-                if env_key.is_empty() {
-                    write!(
-                        formatter,
-                        "the catalog download was empty. 0 bytes. Nothing was cached. Pass --catalog-file."
-                    )
-                } else {
-                    write!(
-                        formatter,
-                        "the catalog download was empty. 0 bytes. Nothing was cached. Check {env_key} or pass --catalog-file."
-                    )
-                }
-            }
-            Self::Http { detail, env_key } => {
-                if env_key.is_empty() {
-                    write!(
-                        formatter,
-                        "the catalog download failed: {detail}. Nothing was cached. Check the network, or pass --catalog-file."
-                    )
-                } else {
-                    write!(
-                        formatter,
-                        "the catalog download failed: {detail}. Nothing was cached. Check the network and {env_key}, or pass --catalog-file."
-                    )
-                }
-            }
-            Self::CacheIo { path, detail } => write!(
-                formatter,
-                "the catalog cache at {path} could not be used: {detail}. Pass --cache-dir or --catalog-file."
-            ),
-            Self::EmptyCacheWrite => write!(
-                formatter,
-                "refusing to write an empty catalog cache. 0 bytes. Pass --catalog-file or retry the download."
-            ),
-            Self::DirectJson { detail } => write!(
-                formatter,
-                "the catalog JSON could not be parsed: {detail}. Pass a deepseek-list-models document. Nothing was written."
-            ),
-            Self::DirectShape { detail } => write!(
-                formatter,
-                "{detail}. Pass a deepseek-list-models document. Nothing was written."
-            ),
+            Self::MissingKey { .. } => "missing_key",
+            Self::EmptyUrl => "empty_url",
+            Self::Json { .. } => "json",
+            Self::Shape { .. } => "shape",
+            Self::Row { .. } => "row",
+            Self::EmptyBody { .. } => "empty_body",
+            Self::Http { .. } => "http",
+            Self::CacheIo { .. } => "cache_io",
+            Self::EmptyCacheWrite => "empty_cache_write",
+            Self::DirectJson { .. } => "direct_json",
+            Self::DirectShape { .. } => "direct_shape",
         }
     }
 }
 
-impl std::error::Error for CatalogError {}
+/// Missing-key sentence. An empty name does not say `Export`.
+fn missing_key_sentence(env_key: &str) -> String {
+    if env_key.is_empty() {
+        "the API key is missing, so the catalog was not downloaded. Pass --catalog-file. The config was not written and an empty cache was not written.".to_owned()
+    } else {
+        format!(
+            "{env_key} is missing, so the catalog was not downloaded. Export {env_key} or pass --catalog-file. The config was not written and an empty cache was not written."
+        )
+    }
+}
+
+/// Empty-download sentence. An empty name does not say `Check {env_key}`.
+fn empty_body_sentence(env_key: &str) -> String {
+    if env_key.is_empty() {
+        "the catalog download was empty. 0 bytes. Nothing was cached. Pass --catalog-file."
+            .to_owned()
+    } else {
+        format!(
+            "the catalog download was empty. 0 bytes. Nothing was cached. Check {env_key} or pass --catalog-file."
+        )
+    }
+}
+
+/// HTTP-failure sentence. An empty name does not name a variable.
+fn http_sentence(detail: &str, env_key: &str) -> String {
+    if env_key.is_empty() {
+        format!(
+            "the catalog download failed: {detail}. Nothing was cached. Check the network, or pass --catalog-file."
+        )
+    } else {
+        format!(
+            "the catalog download failed: {detail}. Nothing was cached. Check the network and {env_key}, or pass --catalog-file."
+        )
+    }
+}
 
 /// GET request for the models catalog. Building it does not send it.
 #[derive(Clone, PartialEq, Eq)]
@@ -303,14 +300,19 @@ pub enum CacheChoice {
 }
 
 /// Zero matches, or more than one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {
     /// No row contained every term.
+    #[error(
+        "no catalog row matched {}. 0 matches. Try fewer terms or pass --catalog-file with the catalog you meant.",
+        display_terms(terms)
+    )]
     None {
         /// Terms that matched nothing.
         terms: Vec<String>,
     },
     /// More than one row matched.
+    #[error("{}", many_sentence(*count, terms, *exact_id))]
     Many {
         /// How many rows matched.
         count: usize,
@@ -332,37 +334,30 @@ impl ResolveError {
     }
 }
 
-impl fmt::Display for ResolveError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl ResolveError {
+    /// Snake_case name of this match failure.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
         match self {
-            Self::None { terms } => write!(
-                formatter,
-                "no catalog row matched {}. 0 matches. Try fewer terms or pass --catalog-file with the catalog you meant.",
-                display_terms(terms)
-            ),
-            Self::Many {
-                count,
-                terms,
-                exact_id: true,
-            } => write!(
-                formatter,
-                "{count} catalog rows matched the exact id {}. {count} matches. Pass more terms to tell them apart.",
-                display_terms(terms)
-            ),
-            Self::Many {
-                count,
-                terms,
-                exact_id: false,
-            } => write!(
-                formatter,
-                "{count} catalog rows matched {}. {count} matches. Pass the exact provider id.",
-                display_terms(terms)
-            ),
+            Self::None { .. } => "none",
+            Self::Many { .. } => "many",
         }
     }
 }
 
-impl std::error::Error for ResolveError {}
+/// Many-match sentence. An exact id asks for more terms; anything else asks for the id.
+fn many_sentence(count: usize, terms: &[String], exact_id: bool) -> String {
+    let listed = display_terms(terms);
+    if exact_id {
+        format!(
+            "{count} catalog rows matched the exact id {listed}. {count} matches. Pass more terms to tell them apart."
+        )
+    } else {
+        format!(
+            "{count} catalog rows matched {listed}. {count} matches. Pass the exact provider id."
+        )
+    }
+}
 
 /// Build the models GET. A blank key or a blank URL does not build a request.
 ///
@@ -438,33 +433,40 @@ pub enum Cartridge {
 }
 
 /// Why [`cartridge`] did not return a cartridge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CartridgeError {
     /// The catalog id was absent or empty.
+    #[error(
+        "the catalog id is missing. Pass openrouter-models or deepseek-list-models. No cartridge was selected and nothing was written."
+    )]
     Missing,
     /// `id` is not a known cartridge. No cartridge was selected.
+    #[error(
+        "catalog id {id:?} is not a cartridge. No cartridge was selected. Pass openrouter-models or deepseek-list-models. Nothing was written."
+    )]
     Unknown {
         /// Catalog id that was refused.
         id: String,
     },
 }
 
-impl fmt::Display for CartridgeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl CartridgeError {
+    /// Snake_case name of this cartridge failure.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
         match self {
-            Self::Missing => write!(
-                formatter,
-                "the catalog id is missing. Pass openrouter-models or deepseek-list-models. No cartridge was selected and nothing was written."
-            ),
-            Self::Unknown { id } => write!(
-                formatter,
-                "catalog id {id:?} is not a cartridge. No cartridge was selected. Pass openrouter-models or deepseek-list-models. Nothing was written."
-            ),
+            Self::Missing => "missing",
+            Self::Unknown { .. } => "unknown",
         }
     }
 }
 
-impl std::error::Error for CartridgeError {}
+/// `--timeout` was not a whole number of seconds greater than zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "--timeout must be a whole number of seconds greater than 0. Nothing was downloaded and nothing was written. Pass --timeout with a positive number, such as 30."
+)]
+pub struct TimeoutError;
 
 /// Parse catalog bytes and choose a config slug.
 ///
@@ -705,13 +707,10 @@ fn fresh_bytes_or_fetch(
 ///
 /// Returns the refusal when `raw` is not a whole number of seconds greater than 0.
 /// Nothing was downloaded and nothing was written.
-pub(crate) fn require_timeout(raw: &str) -> Result<Duration, String> {
+pub(crate) fn require_timeout(raw: &str) -> Result<Duration, TimeoutError> {
     match raw.parse::<u64>() {
         Ok(seconds) if seconds > 0 => Ok(Duration::from_secs(seconds)),
-        Ok(_) | Err(_) => Err(
-            "--timeout must be a whole number of seconds greater than 0. Nothing was downloaded and nothing was written. Pass --timeout with a positive number, such as 30."
-                .to_owned(),
-        ),
+        Ok(_) | Err(_) => Err(TimeoutError),
     }
 }
 

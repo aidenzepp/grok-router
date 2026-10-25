@@ -75,26 +75,33 @@ pub enum ProviderChoice<'a> {
 }
 
 /// Why a text edit was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RefuseReason {
     /// The catalog row did not include a provider id.
+    #[error("catalog row has no id")]
     EmptyProviderId,
     /// The provider id's last path segment did not yield a slug.
+    #[error("cannot derive a slug from {provider_id:?}; pass --as")]
     EmptySlugLeaf {
         /// Provider id that could not be turned into a slug.
         provider_id: String,
     },
     /// The slug does not match the allowed shape.
+    #[error(
+        "slug {slug:?} must start with a letter or digit and contain only letters, digits, dots, underscores, and hyphens"
+    )]
     InvalidSlug {
         /// Slug that was rejected.
         slug: String,
     },
     /// `context_window` was missing or not greater than zero.
+    #[error("{provider_id} has no positive context window")]
     NonPositiveContext {
         /// Provider id whose context window was rejected.
         provider_id: String,
     },
     /// The provider id is already configured under a different slug.
+    #[error("{provider_id} is already {existing_slug}")]
     DuplicateProvider {
         /// Provider id that is already present.
         provider_id: String,
@@ -102,63 +109,80 @@ pub enum RefuseReason {
         existing_slug: String,
     },
     /// The slug is already a configured model or a built-in.
+    #[error("slug {slug} is already in use; pass --as")]
     SlugInUse {
         /// Slug that is already taken.
         slug: String,
     },
     /// Remove was asked for a slug that has no config block.
+    #[error("{slug} is not in the config")]
     NotConfigured {
         /// Slug that is absent from the config.
         slug: String,
     },
     /// Remove was asked for a built-in slug.
+    #[error("{slug} is a built-in and has no config block")]
     BuiltIn {
         /// Built-in slug that has no block to delete.
         slug: String,
     },
     /// Remove was asked for the saved default.
+    #[error("{slug} is the saved default")]
     IsDefault {
         /// Slug that is `[models].default`.
         slug: String,
     },
     /// `set-default` was asked for a slug that is neither built-in nor configured.
+    #[error("{slug} is not a built-in or a configured model")]
     UnknownSlug {
         /// Slug that cannot become the default.
         slug: String,
     },
     /// The document has more than one `[models]` header.
+    #[error("more than one [models] table")]
     MultipleModelsTables,
     /// The document has more than one header for the same model slug.
+    #[error("{slug} appears more than once")]
     DuplicateSlugHeader {
         /// Slug whose header appears more than once.
         slug: String,
     },
     /// The document, or the spliced text, did not parse.
+    #[error("config.toml did not parse: {detail}")]
     Parse {
         /// Parser message. The original text is returned separately.
         detail: String,
     },
     /// Re-parse showed a top-level table that the splice dropped.
+    #[error("edit dropped config tables: {}", joined_tables(tables))]
     DroppedTables {
         /// Table names present before the splice and absent after it.
         tables: Vec<String>,
     },
     /// Re-parse showed an existing model whose provider id changed.
+    #[error("edit changed the existing model {slug}")]
     ChangedProvider {
         /// Slug whose provider id was not preserved.
         slug: String,
     },
     /// Re-parse did not find the model the splice claimed to add.
+    #[error("edit did not add {slug}")]
     AddMissing {
         /// Slug that should have been added.
         slug: String,
     },
     /// Re-parse still found the model the splice claimed to remove.
+    #[error("edit did not remove {slug}")]
     RemoveFailed {
         /// Slug that should have been removed.
         slug: String,
     },
     /// Re-parse showed a different saved default than the splice required.
+    #[error(
+        "default is {}, expected {}",
+        display_optional(actual),
+        display_optional(expected)
+    )]
     DefaultMismatch {
         /// Default the splice required, if any.
         expected: Option<String>,
@@ -166,6 +190,7 @@ pub enum RefuseReason {
         actual: Option<String>,
     },
     /// A present `[grok_router]` key cannot be used.
+    #[error("{key} is invalid: {detail}")]
     InvalidSetting {
         /// `builtins`, `base_url`, `env_key`, `catalog`, `default_provider`,
         /// `router`, `provider`, or a provider name.
@@ -175,65 +200,38 @@ pub enum RefuseReason {
     },
 }
 
-impl fmt::Display for RefuseReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl RefuseReason {
+    /// Snake_case name of this refusal.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
         match self {
-            Self::EmptyProviderId => write!(formatter, "catalog row has no id"),
-            Self::EmptySlugLeaf { provider_id } => write!(
-                formatter,
-                "cannot derive a slug from {provider_id:?}; pass --as"
-            ),
-            Self::InvalidSlug { slug } => write!(
-                formatter,
-                "slug {slug:?} must start with a letter or digit and contain only letters, digits, dots, underscores, and hyphens"
-            ),
-            Self::NonPositiveContext { provider_id } => {
-                write!(formatter, "{provider_id} has no positive context window")
-            }
-            Self::DuplicateProvider {
-                provider_id,
-                existing_slug,
-            } => write!(formatter, "{provider_id} is already {existing_slug}"),
-            Self::SlugInUse { slug } => {
-                write!(formatter, "slug {slug} is already in use; pass --as")
-            }
-            Self::NotConfigured { slug } => write!(formatter, "{slug} is not in the config"),
-            Self::BuiltIn { slug } => {
-                write!(formatter, "{slug} is a built-in and has no config block")
-            }
-            Self::IsDefault { slug } => write!(formatter, "{slug} is the saved default"),
-            Self::UnknownSlug { slug } => {
-                write!(formatter, "{slug} is not a built-in or a configured model")
-            }
-            Self::MultipleModelsTables => write!(formatter, "more than one [models] table"),
-            Self::DuplicateSlugHeader { slug } => {
-                write!(formatter, "{slug} appears more than once")
-            }
-            Self::Parse { detail } => write!(formatter, "config.toml did not parse: {detail}"),
-            Self::DroppedTables { tables } => write!(
-                formatter,
-                "edit dropped config tables: {}",
-                tables.join(", ")
-            ),
-            Self::ChangedProvider { slug } => {
-                write!(formatter, "edit changed the existing model {slug}")
-            }
-            Self::AddMissing { slug } => write!(formatter, "edit did not add {slug}"),
-            Self::RemoveFailed { slug } => write!(formatter, "edit did not remove {slug}"),
-            Self::DefaultMismatch { expected, actual } => write!(
-                formatter,
-                "default is {}, expected {}",
-                display_optional(actual),
-                display_optional(expected)
-            ),
-            Self::InvalidSetting { key, detail } => {
-                write!(formatter, "{key} is invalid: {detail}")
-            }
+            Self::EmptyProviderId => "empty_provider_id",
+            Self::EmptySlugLeaf { .. } => "empty_slug_leaf",
+            Self::InvalidSlug { .. } => "invalid_slug",
+            Self::NonPositiveContext { .. } => "non_positive_context",
+            Self::DuplicateProvider { .. } => "duplicate_provider",
+            Self::SlugInUse { .. } => "slug_in_use",
+            Self::NotConfigured { .. } => "not_configured",
+            Self::BuiltIn { .. } => "built_in",
+            Self::IsDefault { .. } => "is_default",
+            Self::UnknownSlug { .. } => "unknown_slug",
+            Self::MultipleModelsTables => "multiple_models_tables",
+            Self::DuplicateSlugHeader { .. } => "duplicate_slug_header",
+            Self::Parse { .. } => "parse",
+            Self::DroppedTables { .. } => "dropped_tables",
+            Self::ChangedProvider { .. } => "changed_provider",
+            Self::AddMissing { .. } => "add_missing",
+            Self::RemoveFailed { .. } => "remove_failed",
+            Self::DefaultMismatch { .. } => "default_mismatch",
+            Self::InvalidSetting { .. } => "invalid_setting",
         }
     }
 }
 
-impl std::error::Error for RefuseReason {}
+/// Join dropped table names the way the refusal sentence lists them.
+fn joined_tables(tables: &[String]) -> String {
+    tables.join(", ")
+}
 
 /// A refused text edit, together with the unchanged config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +279,8 @@ pub enum ReplaceKind {
 }
 
 /// A file replace that did not leave the new bytes in place.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
 pub struct ReplaceError {
     /// Which step failed.
     pub kind: ReplaceKind,
@@ -289,13 +288,51 @@ pub struct ReplaceError {
     pub detail: String,
 }
 
-impl fmt::Display for ReplaceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.detail)
+impl ReplaceError {
+    /// Snake_case name of the failed replace step.
+    #[must_use]
+    pub const fn failure_kind(&self) -> &'static str {
+        match self.kind {
+            ReplaceKind::SecretInReplacement => "secret_in_replacement",
+            ReplaceKind::Read => "read",
+            ReplaceKind::Backup => "backup",
+            ReplaceKind::Temp => "temp",
+            ReplaceKind::Rename => "rename",
+        }
     }
 }
 
-impl std::error::Error for ReplaceError {}
+/// A named environment value blocked the write. The value itself is not stored.
+#[derive(Debug, thiserror::Error)]
+pub enum SecretError {
+    /// The variable is set to bytes that are not Unicode. The file was left unchanged.
+    #[error(
+        "{name} is not valid Unicode, so the config was not written. Export a Unicode value or unset {name}. The file was left unchanged."
+    )]
+    NotUnicode {
+        /// Variable that could not be read.
+        name: String,
+    },
+    /// The new text contains the variable's value. The file was left unchanged.
+    #[error(
+        "the new config contains the value of {name}. The file was left unchanged. Remove that value from the text before writing."
+    )]
+    ValueInConfig {
+        /// Variable whose value appeared in the text.
+        name: String,
+    },
+}
+
+impl SecretError {
+    /// Snake_case name of this secret refusal.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::NotUnicode { .. } => "not_unicode",
+            Self::ValueInConfig { .. } => "value_in_config",
+        }
+    }
+}
 
 /// Which saved default the re-parse must observe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -833,7 +870,7 @@ pub fn read_configured(config: &str) -> Result<ConfiguredInventory, Refused> {
 /// # Errors
 ///
 /// Returns an error when a scanned name is not Unicode or its value occurs in `text`.
-pub fn refuse_named_secrets(text: &str, also: &[&str]) -> Result<(), String> {
+pub fn refuse_named_secrets(text: &str, also: &[&str]) -> Result<(), SecretError> {
     let mut names = BTreeSet::new();
     if let Ok(root) = text.parse::<toml::Table>() {
         collect_env_keys(&toml::Value::Table(root), &mut names);
@@ -847,14 +884,10 @@ pub fn refuse_named_secrets(text: &str, also: &[&str]) -> Result<(), String> {
         match std::env::var(&name) {
             Err(std::env::VarError::NotPresent) => {}
             Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(format!(
-                    "{name} is not valid Unicode, so the config was not written. Export a Unicode value or unset {name}. The file was left unchanged."
-                ));
+                return Err(SecretError::NotUnicode { name });
             }
             Ok(value) if !value.is_empty() && text.contains(&value) => {
-                return Err(format!(
-                    "the new config contains the value of {name}. The file was left unchanged. Remove that value from the text before writing."
-                ));
+                return Err(SecretError::ValueInConfig { name });
             }
             Ok(_) => {}
         }

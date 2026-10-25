@@ -742,8 +742,8 @@ fn json_error_carries_command_format_and_the_text_sentence() {
         .expect("a json failure should be one JSON object");
     assert_eq!(body["command"], "list");
     assert_eq!(body["format"], "json");
-    assert_eq!(body["error"], "error");
-    assert_eq!(body["kind"], "error");
+    assert_eq!(body["error"], "list_config_missing");
+    assert_eq!(body["kind"], "list_config_missing");
     assert_eq!(
         body["message"].as_str(),
         Some(sentence.trim()),
