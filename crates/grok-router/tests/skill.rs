@@ -23,7 +23,7 @@ use std::process::{Command, Output, Stdio};
 
 const INVOCATION: &str = "grok-router __internal skill";
 const NEXT_SESSION: &str = "The saved default applies to the next session.";
-const COMMANDS: &str = "Commands: list, search, add, set-default, remove, skill.";
+const COMMANDS: &str = "Commands: list, show, search, add, edit, set-default, remove, skill.";
 const MARKER: &str = "grok-router-skill-stub";
 
 #[derive(Debug, PartialEq, Eq)]

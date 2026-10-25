@@ -558,6 +558,7 @@ pub fn insert_model(
         None,
         DefaultExpectation::Unchanged,
         Some(model.id),
+        None,
     )
 }
 
@@ -634,6 +635,7 @@ pub fn insert_direct(config: &str, block: DirectBlock<'_>) -> Result<String, Ref
                 None,
                 DefaultExpectation::Unchanged,
                 Some(block.model),
+                None,
             )
         }
         Err(reason) => Err(refuse(config, reason)),
@@ -815,10 +817,14 @@ pub fn set_default(config: &str, slug: &str) -> Result<String, Refused> {
         None,
         DefaultExpectation::Set(slug),
         None,
+        None,
     )
 }
 
-/// Delete one model table span.
+/// Delete one model table span and any child tables under that slug.
+///
+/// A child header is `[model.<slug>.<rest>]` or `[model."<slug>".<rest>]`.
+/// A different slug that merely contains this slug as a prefix is left in place.
 ///
 /// # Errors
 ///
@@ -867,7 +873,554 @@ pub fn remove_model(config: &str, slug: &str) -> Result<String, Refused> {
         Some(slug),
         DefaultExpectation::Unchanged,
         None,
+        None,
     )
+}
+
+/// Keys `edit` may set or clear. `model` may be set and may not be cleared.
+const EDITABLE_FIELDS: [&str; 13] = [
+    "model",
+    "base_url",
+    "name",
+    "description",
+    "env_key",
+    "api_key",
+    "api_backend",
+    "context_window",
+    "max_completion_tokens",
+    "reasoning_effort",
+    "vision",
+    "stream_tool_calls",
+    "supports_reasoning_effort",
+];
+
+/// Whether `key` is a field [`edit_model`] can set or clear.
+#[must_use]
+pub fn is_editable_field(key: &str) -> bool {
+    EDITABLE_FIELDS.contains(&key)
+}
+
+/// One field to set or clear inside an existing model block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldChange {
+    /// Bare assignment key, such as `name` or `context_window`.
+    pub key: String,
+    /// The new value, or [`FieldAction::Clear`].
+    pub action: FieldAction,
+}
+
+/// What to do with one key inside a model block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldAction {
+    /// Write a TOML string. The value is not trimmed.
+    SetText(String),
+    /// Write a TOML integer.
+    SetInt(i64),
+    /// Write `true` or `false`.
+    SetBool(bool),
+    /// Delete the assignment line. `model` cannot be cleared.
+    Clear,
+}
+
+/// One model as stored, or a built-in that has no block.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShownModel {
+    /// Slug that was asked for.
+    pub slug: String,
+    /// True when the slug is a built-in and has no `[model]` block.
+    pub builtin: bool,
+    /// True when `[models].default` is this slug.
+    #[serde(rename = "default")]
+    pub is_default: bool,
+    /// Exact block text, including child tables. Empty when [`Self::builtin`] is true.
+    pub body: String,
+}
+
+/// Read one configured model, or a built-in that has no block.
+///
+/// The body is the original header span plus any child tables. Comments and
+/// unrelated keys inside that span stay. This function does not write.
+///
+/// # Errors
+///
+/// Returns [`Refused`] when the slug is neither configured nor built-in, or the
+/// document cannot be read. The original text is returned with the refusal.
+pub fn show_model(config: &str, slug: &str) -> Result<ShownModel, Refused> {
+    let builtins = require_builtins(config)?;
+    if let Err(reason) = require_slug(slug) {
+        return Err(refuse(config, reason));
+    }
+    let root = read_config(config)?;
+    let is_default = saved_default(&root) == Some(slug);
+    let configured = configured_models(&root).contains_key(slug);
+    if !configured && !is_builtin(&builtins, slug) {
+        return Err(refuse(
+            config,
+            RefuseReason::NotConfigured {
+                slug: slug.to_owned(),
+            },
+        ));
+    }
+    if !configured {
+        return Ok(ShownModel {
+            slug: slug.to_owned(),
+            builtin: true,
+            is_default,
+            body: String::new(),
+        });
+    }
+    let located = match locate_model(config, slug) {
+        Ok(located) => located,
+        Err(reason) => return Err(refuse(config, reason)),
+    };
+    let mut ranges = vec![located.parent];
+    ranges.extend(located.children);
+    Ok(ShownModel {
+        slug: slug.to_owned(),
+        builtin: false,
+        is_default,
+        body: ranges_text(&located.lines, &ranges),
+    })
+}
+
+/// Replace or clear fields inside one existing model block.
+///
+/// Only the parent span is rewritten. Child tables, comments on other lines,
+/// and every other table stay. A missing key is appended before the span's
+/// trailing blank lines. A key that already has the rendered assignment is left
+/// byte-identical. `model` may change the provider id and may not be cleared.
+///
+/// # Errors
+///
+/// Returns [`Refused`] and the original text when the slug has no block, a field
+/// is unusable, or the splice would not preserve the document.
+pub fn edit_model(config: &str, slug: &str, changes: &[FieldChange]) -> Result<String, Refused> {
+    if let Err(reason) = validate_changes(changes) {
+        return Err(refuse(config, reason));
+    }
+    let builtins = require_builtins(config)?;
+    if let Err(reason) = require_slug(slug) {
+        return Err(refuse(config, reason));
+    }
+    let root = read_config(config)?;
+    if is_builtin(&builtins, slug) && !configured_models(&root).contains_key(slug) {
+        return Err(refuse(
+            config,
+            RefuseReason::BuiltIn {
+                slug: slug.to_owned(),
+            },
+        ));
+    }
+    if !configured_models(&root).contains_key(slug) {
+        return Err(refuse(
+            config,
+            RefuseReason::NotConfigured {
+                slug: slug.to_owned(),
+            },
+        ));
+    }
+    let spliced = match rewrite_model_fields(config, slug, changes) {
+        Ok(text) => text,
+        Err(reason) => return Err(refuse(config, reason)),
+    };
+    let edited_provider = changes.iter().find_map(|change| match &change.action {
+        FieldAction::SetText(value) if change.key == "model" => Some((slug, value.as_str())),
+        _ => None,
+    });
+    finish(
+        config,
+        &root,
+        spliced,
+        None,
+        None,
+        DefaultExpectation::Unchanged,
+        None,
+        edited_provider,
+    )
+}
+
+/// Refuse an empty edit, an unknown key, a cleared `model`, or a value of the wrong shape.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when a change cannot be written.
+fn validate_changes(changes: &[FieldChange]) -> Result<(), RefuseReason> {
+    if changes.is_empty() {
+        return Err(invalid_setting(
+            "edit",
+            "pass a field to change, or --clear a field",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for change in changes {
+        if !seen.insert(change.key.as_str()) {
+            return Err(invalid_setting(&change.key, "was passed more than once"));
+        }
+        validate_change(change)?;
+    }
+    Ok(())
+}
+
+/// Refuse one change whose key or value cannot be written.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] for an unknown key, a cleared `model`,
+/// or a value that fails that field's constraint.
+fn validate_change(change: &FieldChange) -> Result<(), RefuseReason> {
+    if !is_editable_field(&change.key) {
+        return Err(invalid_setting(
+            &change.key,
+            "is not an editable model field",
+        ));
+    }
+    if matches!(change.action, FieldAction::Clear) {
+        if change.key == "model" {
+            return Err(invalid_setting(
+                "model",
+                "cannot be cleared; pass --model with the provider id",
+            ));
+        }
+        return Ok(());
+    }
+    match change.key.as_str() {
+        "context_window" | "max_completion_tokens" => validate_positive_int(change),
+        "vision" | "stream_tool_calls" | "supports_reasoning_effort" => validate_bool(change),
+        "base_url" => validate_base_url(change),
+        "env_key" => validate_env_key_change(change),
+        _ => validate_non_empty_text(change),
+    }
+}
+
+/// Refuse a window or token limit that is not an integer greater than zero.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when the action is not [`FieldAction::SetInt`]
+/// or the integer is not greater than zero.
+fn validate_positive_int(change: &FieldChange) -> Result<(), RefuseReason> {
+    match change.action {
+        FieldAction::SetInt(value) if value > 0 => Ok(()),
+        FieldAction::SetInt(value) => Err(invalid_setting(
+            &change.key,
+            &format!("must be greater than zero, got {value}"),
+        )),
+        _ => Err(invalid_setting(&change.key, "must be an integer")),
+    }
+}
+
+/// Refuse a boolean field written as text or an integer.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when the action is not [`FieldAction::SetBool`].
+fn validate_bool(change: &FieldChange) -> Result<(), RefuseReason> {
+    if matches!(change.action, FieldAction::SetBool(_)) {
+        Ok(())
+    } else {
+        Err(invalid_setting(&change.key, "must be true or false"))
+    }
+}
+
+/// Refuse a base URL that is not `http://` or `https://` plus non-whitespace.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when the value fails [`is_http_base`].
+fn validate_base_url(change: &FieldChange) -> Result<(), RefuseReason> {
+    match &change.action {
+        FieldAction::SetText(value) if is_http_base(value) => Ok(()),
+        FieldAction::SetText(_) => Err(invalid_setting(
+            "base_url",
+            "must match ^https?://\\S+$ with no trim",
+        )),
+        _ => Err(invalid_setting("base_url", "must be a string")),
+    }
+}
+
+/// Refuse an environment variable name that is not a shell identifier.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when the value fails [`is_env_key`].
+fn validate_env_key_change(change: &FieldChange) -> Result<(), RefuseReason> {
+    match &change.action {
+        FieldAction::SetText(value) if is_env_key(value) => Ok(()),
+        FieldAction::SetText(_) => Err(invalid_setting(
+            "env_key",
+            "must match ^[A-Za-z_][A-Za-z0-9_]*$ with no trim",
+        )),
+        _ => Err(invalid_setting("env_key", "must be a string")),
+    }
+}
+
+/// Refuse an empty string on a text field. The value is not trimmed.
+///
+/// # Errors
+///
+/// Returns [`RefuseReason::InvalidSetting`] when the text is empty or not text.
+fn validate_non_empty_text(change: &FieldChange) -> Result<(), RefuseReason> {
+    match &change.action {
+        FieldAction::SetText(value) if !value.is_empty() => Ok(()),
+        FieldAction::SetText(_) => Err(invalid_setting(
+            &change.key,
+            "must be non-empty; the value is not trimmed",
+        )),
+        _ => Err(invalid_setting(&change.key, "must be a string")),
+    }
+}
+
+/// Splice the parent span. Child tables are not part of that span.
+///
+/// # Errors
+///
+/// Returns a refusal when the header is missing or a key cannot be rewritten.
+fn rewrite_model_fields(
+    config: &str,
+    slug: &str,
+    changes: &[FieldChange],
+) -> Result<String, RefuseReason> {
+    let located = locate_model(config, slug)?;
+    let (start, end) = located.parent;
+    let mut span = Vec::new();
+    for index in start..end {
+        if let Some(line) = located.lines.get(index) {
+            span.push((*line).to_owned());
+        }
+    }
+    apply_field_changes(&mut span, changes)?;
+    let mut out = String::new();
+    for (index, line) in located.lines.iter().enumerate() {
+        if index == start {
+            for span_line in &span {
+                out.push_str(span_line);
+            }
+        }
+        if index < start || index >= end {
+            out.push_str(line);
+        }
+    }
+    Ok(out)
+}
+
+/// Apply each change to the parent span. Indexes are found again after each change.
+///
+/// # Errors
+///
+/// Returns a refusal when a key is assigned twice, or a clear names a missing key.
+fn apply_field_changes(
+    span: &mut Vec<String>,
+    changes: &[FieldChange],
+) -> Result<(), RefuseReason> {
+    let mut additions = Vec::new();
+    for change in changes {
+        let hits = assignment_indexes(span, &change.key);
+        match hits.as_slice() {
+            [] => match &change.action {
+                FieldAction::Clear => {
+                    return Err(invalid_setting(&change.key, "is not set on this model"));
+                }
+                _ => additions.push(render_assignment(change)?),
+            },
+            [index] if matches!(change.action, FieldAction::Clear) => {
+                let _removed = span.remove(*index);
+            }
+            [index] => replace_assignment(span, *index, change)?,
+            _ => {
+                return Err(invalid_setting(
+                    &change.key,
+                    "is assigned more than once in this model block",
+                ));
+            }
+        }
+    }
+    for addition in additions {
+        insert_before_trailing_blanks(span, addition);
+    }
+    Ok(())
+}
+
+/// Replace the assignment at `index` and keep that line's trailing newline.
+///
+/// # Errors
+///
+/// Returns a refusal when the replacement cannot be rendered.
+fn replace_assignment(
+    span: &mut [String],
+    index: usize,
+    change: &FieldChange,
+) -> Result<(), RefuseReason> {
+    let ends_with_newline = span.get(index).is_some_and(|line| line.ends_with('\n'));
+    let mut rendered = render_assignment(change)?;
+    if !ends_with_newline {
+        let _newline = rendered.pop();
+    }
+    if let Some(line) = span.get_mut(index) {
+        *line = rendered;
+    }
+    Ok(())
+}
+
+/// Render `key = value` with a trailing newline.
+///
+/// # Errors
+///
+/// Returns a refusal when the action is [`FieldAction::Clear`], which has no value to render.
+fn render_assignment(change: &FieldChange) -> Result<String, RefuseReason> {
+    let value = match &change.action {
+        FieldAction::SetText(text) => toml_basic_string(text),
+        FieldAction::SetInt(number) => number.to_string(),
+        FieldAction::SetBool(true) => "true".to_owned(),
+        FieldAction::SetBool(false) => "false".to_owned(),
+        FieldAction::Clear => {
+            return Err(invalid_setting(&change.key, "has no value to write"));
+        }
+    };
+    Ok(format!("{} = {value}\n", change.key))
+}
+
+/// Indexes of bare assignments to `key` after the header line.
+fn assignment_indexes(span: &[String], key: &str) -> Vec<usize> {
+    let mut hits = Vec::new();
+    for (index, line) in span.iter().enumerate() {
+        if index > 0 && assigns_key(line, key) {
+            hits.push(index);
+        }
+    }
+    hits
+}
+
+/// Whether `line` assigns `key` and not a longer key that starts with those characters.
+fn assigns_key(line: &str, key: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix(key) else {
+        return false;
+    };
+    rest.trim_start().starts_with('=')
+}
+
+/// Insert `addition` after the last content line and before trailing blank lines.
+fn insert_before_trailing_blanks(span: &mut Vec<String>, addition: String) {
+    let mut end = span.len();
+    while end > 1 {
+        let blank = span
+            .get(end.saturating_sub(1))
+            .is_some_and(|line| line.trim().is_empty());
+        if !blank {
+            break;
+        }
+        end = end.saturating_sub(1);
+    }
+    if let Some(previous) = span.get_mut(end.saturating_sub(1))
+        && !previous.ends_with('\n')
+    {
+        previous.push('\n');
+    }
+    let line = if addition.ends_with('\n') {
+        addition
+    } else {
+        format!("{addition}\n")
+    };
+    span.insert(end, line);
+}
+
+/// Parent span and child spans for one slug. The line slices borrow `text`.
+struct LocatedModel<'a> {
+    /// Keepends lines of the whole document.
+    lines: Vec<&'a str>,
+    /// The single `[model.<slug>]` span.
+    parent: (usize, usize),
+    /// `[model.<slug>.…]` spans, in file order.
+    children: Vec<(usize, usize)>,
+}
+
+/// Find the parent header and any child headers for `slug`.
+///
+/// # Errors
+///
+/// Returns a refusal when the parent header is missing or repeated.
+fn locate_model<'a>(text: &'a str, slug: &str) -> Result<LocatedModel<'a>, RefuseReason> {
+    let lines = split_keepends(text);
+    let spans = table_spans(&lines);
+    let mut parents = Vec::new();
+    let mut children = Vec::new();
+    for span in &spans {
+        if let Some(header_slug) = model_slug_from_header(&span.name)? {
+            if header_slug == slug {
+                parents.push((span.start, span.end));
+            }
+        } else if is_child_header(&span.name, slug) {
+            children.push((span.start, span.end));
+        }
+    }
+    let parent = match parents.as_slice() {
+        [(start, end)] => (*start, *end),
+        [] => {
+            return Err(RefuseReason::NotConfigured {
+                slug: slug.to_owned(),
+            });
+        }
+        _ => {
+            return Err(RefuseReason::DuplicateSlugHeader {
+                slug: slug.to_owned(),
+            });
+        }
+    };
+    Ok(LocatedModel {
+        lines,
+        parent,
+        children,
+    })
+}
+
+/// Whether `header` is a child table of `slug` rather than another model slug.
+fn is_child_header(header: &str, slug: &str) -> bool {
+    let Some(rest) = header.strip_prefix("model.") else {
+        return false;
+    };
+    let prefix = if is_bare_slug(slug) {
+        format!("{slug}.")
+    } else {
+        format!("{}.", toml_basic_string(slug))
+    };
+    rest.starts_with(&prefix) && rest.len() > prefix.len()
+}
+
+/// Copy every line that does not fall inside `ranges`.
+fn delete_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
+    let mut kept = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let inside = ranges
+            .iter()
+            .any(|(start, end)| index >= *start && index < *end);
+        if !inside {
+            kept.push_str(line);
+        }
+    }
+    kept
+}
+
+/// Join the named spans in file order and drop blank lines after the last content line.
+fn ranges_text(lines: &[&str], ranges: &[(usize, usize)]) -> String {
+    let mut ordered = ranges.to_vec();
+    ordered.sort_by_key(|(start, _)| *start);
+    let mut body = String::new();
+    let mut previous_end = None;
+    for (start, end) in ordered {
+        let separated = previous_end.is_some_and(|previous| start != previous);
+        if separated && !body.ends_with("\n\n") {
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push('\n');
+        }
+        for index in start..end {
+            if let Some(line) = lines.get(index) {
+                body.push_str(line);
+            }
+        }
+        previous_end = Some(end);
+    }
+    without_trailing_blank_lines(&body)
 }
 
 /// Read the saved default and each configured slug with its provider id.
@@ -1582,22 +2135,56 @@ fn toml_unquote(quoted: &str) -> Result<String, RefuseReason> {
 
 /// Read a model slug from a header body such as `model.or-glm-5-3` or `model."or.vision"`.
 ///
+/// A quoted key with another segment after it, such as
+/// `model."or.vision".extra_headers`, is a child table and returns [`None`].
+///
 /// # Errors
 ///
-/// Returns a refusal when a `model.` header key cannot be decoded.
+/// Returns a refusal when a `model.` header key starts with `"` and the basic string
+/// never closes, or the closed string is not a legal slug.
 fn model_slug_from_header(name: &str) -> Result<Option<String>, RefuseReason> {
     let Some(rest) = name.strip_prefix("model.") else {
         return Ok(None);
     };
-    if rest.starts_with('"') {
-        let slug = toml_unquote(rest)?;
+    if let Some(quoted) = leading_basic_string(rest) {
+        if rest.len() != quoted.len() {
+            return Ok(None);
+        }
+        let slug = toml_unquote(quoted)?;
         require_slug(&slug)?;
         return Ok(Some(slug));
+    }
+    if rest.starts_with('"') {
+        return Err(RefuseReason::Parse {
+            detail: format!("expected a quoted TOML string, got {rest:?}"),
+        });
     }
     if is_bare_slug(rest) {
         return Ok(Some(rest.to_owned()));
     }
     Ok(None)
+}
+
+/// The leading TOML basic string in `text`, including its quotes, when the quote closes.
+///
+/// Escaped quotes do not end the string. An unclosed quote returns [`None`].
+fn leading_basic_string(text: &str) -> Option<&str> {
+    if !text.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, ch) in text.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return text.get(..=index),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Reject duplicate `[models]` headers and duplicate model slugs before editing.
@@ -1650,9 +2237,15 @@ fn read_config(config: &str) -> Result<toml::Table, Refused> {
 
 /// Re-parse `spliced` and keep it only when the edit invariants hold.
 ///
+/// `edited_provider` is the one existing slug whose `model` id may change, and the id it must have.
+///
 /// # Errors
 ///
 /// Returns [`Refused`] when the spliced text does not re-parse or breaks an edit invariant.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the splice contract names each preserved fact separately"
+)]
 fn finish(
     original: &str,
     before: &toml::Table,
@@ -1661,6 +2254,7 @@ fn finish(
     removed: Option<&str>,
     default: DefaultExpectation<'_>,
     expected_provider: Option<&str>,
+    edited_provider: Option<(&str, &str)>,
 ) -> Result<String, Refused> {
     if let Err(reason) = structural_problem(&spliced) {
         return Err(refuse(original, reason));
@@ -1676,7 +2270,15 @@ fn finish(
             ));
         }
     };
-    if let Err(reason) = preserve(before, &after, added, removed, default, expected_provider) {
+    if let Err(reason) = preserve(
+        before,
+        &after,
+        added,
+        removed,
+        default,
+        expected_provider,
+        edited_provider,
+    ) {
         return Err(refuse(original, reason));
     }
     Ok(spliced)
@@ -1687,6 +2289,10 @@ fn finish(
 /// # Errors
 ///
 /// Returns a refusal when the splice dropped a table, changed a provider id, or missed the edit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the splice contract names each preserved fact separately"
+)]
 fn preserve(
     before: &toml::Table,
     after: &toml::Table,
@@ -1694,6 +2300,7 @@ fn preserve(
     removed: Option<&str>,
     default: DefaultExpectation<'_>,
     expected_provider: Option<&str>,
+    edited_provider: Option<(&str, &str)>,
 ) -> Result<(), RefuseReason> {
     let before_models = configured_models(before);
     let after_models = configured_models(after);
@@ -1714,6 +2321,9 @@ fn preserve(
         }
         match after_models.get(slug) {
             Some(current) if current == provider => {}
+            Some(current)
+                if edited_provider
+                    .is_some_and(|(edited, next)| edited == slug.as_str() && current == next) => {}
             _ => {
                 return Err(RefuseReason::ChangedProvider { slug: slug.clone() });
             }
@@ -1998,46 +2608,20 @@ fn append_models_table(text: &str, slug: &str) -> String {
     body
 }
 
-/// Delete the header span for `slug`.
+/// Delete the header span for `slug` and every child table under that slug.
 ///
-/// The span runs from its header through the line before the next header,
-/// including blank lines that sit in that span. Bytes outside the span are
-/// copied unchanged. Other gaps are not restyled.
+/// The parent span runs from its header through the line before the next header.
+/// A child header is removed the same way. Bytes outside those spans are copied
+/// unchanged.
 ///
 /// # Errors
 ///
 /// Returns a refusal when `slug` has no single model header to delete.
 fn delete_span(text: &str, slug: &str) -> Result<String, RefuseReason> {
-    let lines_ref = split_keepends(text);
-    let spans = table_spans(&lines_ref);
-    let mut found = Vec::new();
-    for span in &spans {
-        if let Some(header_slug) = model_slug_from_header(&span.name)?
-            && header_slug == slug
-        {
-            found.push((span.start, span.end));
-        }
-    }
-    let (start, end) = match found.as_slice() {
-        [] => {
-            return Err(RefuseReason::NotConfigured {
-                slug: slug.to_owned(),
-            });
-        }
-        [(start, end)] => (*start, *end),
-        _ => {
-            return Err(RefuseReason::DuplicateSlugHeader {
-                slug: slug.to_owned(),
-            });
-        }
-    };
-    let mut kept = String::new();
-    for (index, line) in lines_ref.iter().enumerate() {
-        if index < start || index >= end {
-            kept.push_str(line);
-        }
-    }
-    Ok(kept)
+    let located = locate_model(text, slug)?;
+    let mut ranges = vec![located.parent];
+    ranges.extend(located.children);
+    Ok(delete_ranges(&located.lines, &ranges))
 }
 
 /// Join keepends lines without adding separators of our own.
@@ -3742,6 +4326,45 @@ catalog = \"openrouter-models\"
         assert!(
             !config.with_file_name("config.toml.prev").exists(),
             "a new file has nothing to back up"
+        );
+    }
+
+    #[test]
+    fn remove_model_deletes_a_quoted_slug_and_its_child_table() {
+        let config = "\
+[model.\"zai-glm-5.3\"]
+model = \"glm-5.3\"
+base_url = \"https://example.test/v1\"
+name = \"GLM\"
+env_key = \"ZAI_API_KEY\"
+context_window = 600000
+
+[model.\"zai-glm-5.3\".extra_headers]
+anthropic-version = \"2023-06-01\"
+
+[model.hub-default]
+model = \"default\"
+base_url = \"http://hub.example/v1\"
+name = \"Hub\"
+env_key = \"VIVI_PROXY_TOKEN\"
+context_window = 131072
+
+[models]
+default = \"grok-4.7\"
+";
+        let edited =
+            remove_model(config, "zai-glm-5.3").expect("the quoted slug should be removed");
+        assert!(
+            !edited.contains("zai-glm-5.3"),
+            "the quoted slug and its child table should be gone; config: {edited}"
+        );
+        assert!(
+            edited.contains("[model.hub-default]"),
+            "the next model should stay; config: {edited}"
+        );
+        assert!(
+            edited.contains("default = \"grok-4.7\""),
+            "the saved default should stay; config: {edited}"
         );
     }
 

@@ -133,6 +133,59 @@ pub enum Error {
         "--limit 0 would hide every row, so nothing was listed. Omit --limit or pass a number greater than zero."
     )]
     LimitZero,
+    /// `show` was given an empty slug.
+    #[error("the slug is empty, so the model was not shown. Pass a configured or built-in slug.")]
+    ShowSlugEmpty,
+    /// `show` was given an empty `--config`.
+    #[error("--config is empty, so the model was not shown. Pass --config with the file to read.")]
+    ShowConfigEmpty,
+    /// `show` has no home path.
+    #[error(
+        "HOME is empty and GROK_HOME is unset, so there is no config path. Pass --config with the file to read."
+    )]
+    ShowHomeEmpty,
+    /// `show` has no home variable.
+    #[error(
+        "HOME is not set and GROK_HOME is unset, so there is no config path. Pass --config with the file to read."
+    )]
+    ShowHomeUnset,
+    /// `show` was pointed at a file that is not there.
+    #[error(
+        "could not read config {}. The file is missing, so the model was not shown. Create the file or pass --config with an existing file.",
+        path.display()
+    )]
+    ShowConfigMissing {
+        /// Path that was not found.
+        path: PathBuf,
+    },
+    /// `show` could not read the config.
+    #[error(
+        "could not read config {}. {source}. The model was not shown. Pass --config pointing at a readable file.",
+        path.display()
+    )]
+    ShowConfigIo {
+        /// Path that could not be read.
+        path: PathBuf,
+        /// The filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// `show` read bytes that are not UTF-8.
+    #[error(
+        "config {} is not UTF-8, so the model was not shown. Save it as UTF-8 and pass that --config again.",
+        path.display()
+    )]
+    ShowConfigUtf8 {
+        /// Path that was not UTF-8.
+        path: PathBuf,
+    },
+    /// `show` could not use the config text.
+    #[error("{}", show_refused_sentence(reason))]
+    ShowConfigRefused {
+        /// Why the model was not shown.
+        #[source]
+        reason: RefuseReason,
+    },
     /// `set-default` was given an empty `--config`.
     #[error(
         "--config is empty, so the saved default was not changed. Pass --config with the file to edit."
@@ -237,6 +290,85 @@ pub enum Error {
         "{source}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the deletion."
     )]
     RemoveReplace {
+        /// The replace that failed.
+        #[source]
+        source: ReplaceError,
+    },
+    /// `edit` was given an empty `--config`.
+    #[error("--config is empty, so nothing was written. Pass --config with the file to edit.")]
+    EditConfigEmpty,
+    /// `edit` was not given `--config`.
+    #[error(
+        "no --config path was given, so nothing was written. Pass --config with the file to edit."
+    )]
+    EditConfigOmitted,
+    /// `edit` was given an empty slug.
+    #[error("the slug is empty, so nothing was written. Pass the slug of a model block.")]
+    EditSlugEmpty,
+    /// `edit` was given no field to change.
+    #[error(
+        "no field was given, so nothing was written. Pass a field to change, or --clear a field. The file was left unchanged."
+    )]
+    EditNoFields,
+    /// A boolean edit flag was not `true` or `false`.
+    #[error(
+        "--{flag} {raw} is not true or false, so nothing was written. Pass true or false. The file was left unchanged."
+    )]
+    EditBool {
+        /// Flag name without the leading dashes.
+        flag: &'static str,
+        /// The text that was passed.
+        raw: String,
+    },
+    /// `--clear` named a field this command does not edit.
+    #[error(
+        "--clear {key} is not an editable model field, so nothing was written. The file was left unchanged."
+    )]
+    EditClearUnknown {
+        /// Key that was not recognized.
+        key: String,
+    },
+    /// One key was both set and cleared.
+    #[error(
+        "{key} was both set and cleared, so nothing was written. Pass the new value or --clear, not both. The file was left unchanged."
+    )]
+    EditClearAndSet {
+        /// Key that was given two actions.
+        key: String,
+    },
+    /// `edit` could not read the config.
+    #[error(
+        "could not read config {}. {source}. Nothing was written. Pass --config pointing at an existing file.",
+        path.display()
+    )]
+    EditConfigIo {
+        /// Path that could not be read.
+        path: PathBuf,
+        /// The filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// `edit` read bytes that are not UTF-8.
+    #[error(
+        "config {} is not UTF-8. Nothing was written. Save it as UTF-8 and pass that --config again.",
+        path.display()
+    )]
+    EditConfigUtf8 {
+        /// Path that was not UTF-8.
+        path: PathBuf,
+    },
+    /// `edit` refused the text edit.
+    #[error("{}", edit_edit_sentence(reason))]
+    EditEdit {
+        /// Why the edit was refused.
+        #[source]
+        reason: RefuseReason,
+    },
+    /// `edit` could not replace the file.
+    #[error(
+        "{source}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the edit."
+    )]
+    EditReplace {
         /// The replace that failed.
         #[source]
         source: ReplaceError,
@@ -633,6 +765,10 @@ impl Error {
     /// JSON `error` and `kind` are this name. A transparent domain error uses
     /// that error's own name. [`SkillFailure`] stays `refused` or `io`.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per error variant keeps a missing kind string a compile error"
+    )]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::JsonFlagConflicts { .. } => "json_flag_conflicts",
@@ -651,6 +787,14 @@ impl Error {
             Self::ListConfigRefused { .. } => "list_config_refused",
             Self::LimitNotWhole { .. } => "limit_not_whole",
             Self::LimitZero => "limit_zero",
+            Self::ShowSlugEmpty => "show_slug_empty",
+            Self::ShowConfigEmpty => "show_config_empty",
+            Self::ShowHomeEmpty => "show_home_empty",
+            Self::ShowHomeUnset => "show_home_unset",
+            Self::ShowConfigMissing { .. } => "show_config_missing",
+            Self::ShowConfigIo { .. } => "show_config_io",
+            Self::ShowConfigUtf8 { .. } => "show_config_utf8",
+            Self::ShowConfigRefused { .. } => "show_config_refused",
             Self::SetDefaultConfigEmpty => "set_default_config_empty",
             Self::SetDefaultConfigOmitted => "set_default_config_omitted",
             Self::SetDefaultSlugEmpty => "set_default_slug_empty",
@@ -666,6 +810,17 @@ impl Error {
             Self::RemoveConfigUtf8 { .. } => "remove_config_utf8",
             Self::RemoveEdit { .. } => "remove_edit",
             Self::RemoveReplace { .. } => "remove_replace",
+            Self::EditConfigEmpty => "edit_config_empty",
+            Self::EditConfigOmitted => "edit_config_omitted",
+            Self::EditSlugEmpty => "edit_slug_empty",
+            Self::EditNoFields => "edit_no_fields",
+            Self::EditBool { .. } => "edit_bool",
+            Self::EditClearUnknown { .. } => "edit_clear_unknown",
+            Self::EditClearAndSet { .. } => "edit_clear_and_set",
+            Self::EditConfigIo { .. } => "edit_config_io",
+            Self::EditConfigUtf8 { .. } => "edit_config_utf8",
+            Self::EditEdit { .. } => "edit_edit",
+            Self::EditReplace { .. } => "edit_replace",
             Self::PartialDirect { .. } => "partial_direct",
             Self::CatalogFlags { .. } => "catalog_flags",
             Self::DirectConflict { .. } => "direct_conflict",
@@ -755,6 +910,83 @@ fn init_changed_sentence(tables: &[String]) -> String {
 /// Trim clap's display the way the JSON usage sentence already does.
 fn clap_sentence(err: &clap::Error) -> String {
     err.to_string().trim().to_owned()
+}
+
+/// `show` refusal, including the next action.
+fn show_refused_sentence(reason: &RefuseReason) -> String {
+    format!("{reason}. The model was not shown. {}", show_next(reason))
+}
+
+/// The next action for a refused `show`.
+fn show_next(reason: &RefuseReason) -> &'static str {
+    match reason {
+        RefuseReason::NotConfigured { .. } => "Pass a slug from list, or a built-in slug.",
+        RefuseReason::InvalidSlug { .. } => {
+            "Pass a slug that starts with a letter or digit and contains only letters, digits, dots, underscores, and hyphens."
+        }
+        RefuseReason::DuplicateSlugHeader { .. } => "Leave one header for that slug and retry.",
+        RefuseReason::Parse { .. } | RefuseReason::MultipleModelsTables => {
+            "Fix the config so it parses as TOML and retry."
+        }
+        RefuseReason::EmptyProviderId
+        | RefuseReason::EmptySlugLeaf { .. }
+        | RefuseReason::NonPositiveContext { .. }
+        | RefuseReason::DuplicateProvider { .. }
+        | RefuseReason::SlugInUse { .. }
+        | RefuseReason::BuiltIn { .. }
+        | RefuseReason::IsDefault { .. }
+        | RefuseReason::UnknownSlug { .. }
+        | RefuseReason::DroppedTables { .. }
+        | RefuseReason::ChangedProvider { .. }
+        | RefuseReason::AddMissing { .. }
+        | RefuseReason::RemoveFailed { .. }
+        | RefuseReason::DefaultMismatch { .. }
+        | RefuseReason::InvalidSetting { .. } => "Fix the config and retry show.",
+    }
+}
+
+/// `edit` refusal, including the next action.
+fn edit_edit_sentence(reason: &RefuseReason) -> String {
+    format!(
+        "{reason}. The file was left unchanged. {}",
+        edit_next(reason)
+    )
+}
+
+/// The next action for a refused `edit`.
+fn edit_next(reason: &RefuseReason) -> &'static str {
+    match reason {
+        RefuseReason::NotConfigured { .. } => {
+            "Pass a slug that appears as a [model.<slug>] block in this file."
+        }
+        RefuseReason::BuiltIn { .. } => {
+            "Pass a configured slug. Built-ins have no config block to edit."
+        }
+        RefuseReason::InvalidSlug { .. } => {
+            "Pass a slug that starts with a letter or digit and contains only letters, digits, dots, underscores, and hyphens."
+        }
+        RefuseReason::InvalidSetting { .. } => {
+            "Fix that field and retry. Pass --dry-run to preview a valid edit."
+        }
+        RefuseReason::DuplicateSlugHeader { .. } => "Leave one header for that slug and retry.",
+        RefuseReason::Parse { .. } | RefuseReason::MultipleModelsTables => {
+            "Fix the config so it parses as TOML and retry."
+        }
+        RefuseReason::EmptyProviderId
+        | RefuseReason::EmptySlugLeaf { .. }
+        | RefuseReason::NonPositiveContext { .. }
+        | RefuseReason::DuplicateProvider { .. }
+        | RefuseReason::SlugInUse { .. }
+        | RefuseReason::IsDefault { .. }
+        | RefuseReason::UnknownSlug { .. }
+        | RefuseReason::DroppedTables { .. }
+        | RefuseReason::ChangedProvider { .. }
+        | RefuseReason::AddMissing { .. }
+        | RefuseReason::RemoveFailed { .. }
+        | RefuseReason::DefaultMismatch { .. } => {
+            "Retry with --dry-run after fixing the config. This command did not replace the file."
+        }
+    }
 }
 
 /// `set-default` refusal, including the next action.

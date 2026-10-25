@@ -19,7 +19,7 @@ use std::io::{self, Write};
 use clap::error::ErrorKind;
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
-use grok_router::commands::{add, init, list, remove, search, set_default, skill};
+use grok_router::commands::{add, edit, init, list, remove, search, set_default, show, skill};
 use grok_router::{Cli, Commands, OutputMode, error};
 
 /// Runs the `grok-router` binary.
@@ -56,6 +56,8 @@ fn dispatch(cli: &Cli, mode: OutputMode) -> i32 {
         }
         Some(Commands::Search(args)) => search::run(config, args, mode),
         Some(Commands::Add(args)) => add::run(config, args, mode),
+        Some(Commands::Show(args)) => show::run(config, args, mode),
+        Some(Commands::Edit(args)) => edit::run(config, args, mode),
         Some(Commands::SetDefault(args)) => set_default::run(config, args, mode),
         Some(Commands::Remove(args)) => remove::run(config, args, mode),
         Some(Commands::Init(args)) => init::run(config, args, mode),
@@ -198,6 +200,8 @@ fn usage_command_name() -> &'static str {
             "list" => "list",
             "search" => "search",
             "add" => "add",
+            "show" => "show",
+            "edit" => "edit",
             "set-default" => "set-default",
             "remove" => "remove",
             "init" => "init",
@@ -235,7 +239,15 @@ fn takes_value(arg: &str) -> bool {
                 | "env-key"
                 | "api-backend"
                 | "name"
+                | "description"
+                | "api-key"
                 | "context-window"
+                | "max-completion-tokens"
+                | "reasoning-effort"
+                | "vision"
+                | "stream-tool-calls"
+                | "supports-reasoning-effort"
+                | "clear"
         )
     )
 }

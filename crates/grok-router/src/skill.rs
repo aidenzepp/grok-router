@@ -19,11 +19,11 @@ const MARKER: &str = "grok-router-skill-stub";
 const GUIDE: &str = "\
 grok-router
 
-Commands: list, search, add, set-default, remove, skill.
+Commands: list, show, search, add, edit, set-default, remove, skill.
 
-list and search read.
-add and set-default write.
-remove deletes one saved model and refuses unless --yes is set.
+list, show, and search read.
+add, edit, and set-default write.
+remove deletes one saved model, including its child tables, and refuses unless --yes is set.
 skill setup writes a short stub.
 skill remove deletes that stub directory only when it carries the grok-router marker and --yes is set.
 skill status and skill show read.
@@ -440,7 +440,7 @@ mod tests {
     };
 
     const NEXT_SESSION: &str = "The saved default applies to the next session.";
-    const COMMANDS: &str = "Commands: list, search, add, set-default, remove, skill.";
+    const COMMANDS: &str = "Commands: list, show, search, add, edit, set-default, remove, skill.";
     const INVOCATION: &str = "grok-router __internal skill";
 
     #[test]
@@ -448,7 +448,7 @@ mod tests {
         let text = guide();
         assert!(
             text.contains(COMMANDS),
-            "the guide should name list, search, add, set-default, remove, and skill; guide: {text}"
+            "the guide should name list, show, search, add, edit, set-default, remove, and skill; guide: {text}"
         );
         assert!(
             text.contains(NEXT_SESSION),
