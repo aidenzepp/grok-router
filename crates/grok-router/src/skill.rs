@@ -36,8 +36,10 @@ The installed stub does not contain this guide. It tells you to run `grok-router
 
 Examples:
   grok-router list
+  grok-router show kimi-k3
   grok-router search glm
   grok-router add z-ai/glm-5.3
+  grok-router edit --config config.toml kimi-k3 --reasoning-effort high
   grok-router set-default or-glm-5-3
   grok-router remove or-glm-5-3 --yes
   grok-router skill setup --skill-root /tmp/skills
@@ -449,6 +451,14 @@ mod tests {
         assert!(
             text.contains(COMMANDS),
             "the guide should name list, show, search, add, edit, set-default, remove, and skill; guide: {text}"
+        );
+        assert!(
+            text.contains("grok-router show kimi-k3"),
+            "the guide examples should include show; guide: {text}"
+        );
+        assert!(
+            text.contains("grok-router edit --config config.toml kimi-k3 --reasoning-effort high"),
+            "the guide examples should include edit; guide: {text}"
         );
         assert!(
             text.contains(NEXT_SESSION),
