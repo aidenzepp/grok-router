@@ -61,7 +61,7 @@ pub enum OutputMode {
 pub struct Cli {
     /// Reads default to `$GROK_HOME/config.toml` or ~/.grok/config.toml.
     /// init writes that file when --config is omitted.
-    /// add, set-default, and remove still require --config.
+    /// add, edit, set-default, and remove still require --config.
     #[arg(long, global = true, value_name = "PATH", verbatim_doc_comment)]
     pub config: Option<String>,
 

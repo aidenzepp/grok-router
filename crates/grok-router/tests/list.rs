@@ -490,7 +490,7 @@ fn root_help_shows_global_output_flags_and_a_shorter_short_help() {
     assert!(
         long_text.contains("$GROK_HOME")
             && long_text.contains("~/.grok")
-            && long_text.contains("require --config"),
+            && long_text.contains("add, edit, set-default, and remove still require --config"),
         "config help should name the default read path and the write requirement; help: {long_text}"
     );
     assert!(
