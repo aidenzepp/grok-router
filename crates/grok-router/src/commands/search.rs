@@ -12,7 +12,7 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use clap::{ArgAction, Args};
 
@@ -20,6 +20,7 @@ use crate::catalog::{
     self, CachedBodyOrFetch, CartridgeError, CatalogCartridge, CatalogError, CatalogRow,
 };
 use crate::config_edit::{self, ProviderChoice, RefuseReason};
+use crate::OutputMode;
 
 /// Search the selected provider catalog. This command does not modify the config.
 #[derive(Debug, Args)]
@@ -58,51 +59,55 @@ pub struct SearchArgs {
     )]
     limit: usize,
 
-    /// Print a JSON array of id, name, and context_length.
-    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
-    json: bool,
-
-    /// Print one model id per line and no header.
-    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
-    quiet: bool,
+    /// Seconds to wait for a catalog GET. 0 refuses before any download or write.
+    #[arg(
+        long = "timeout",
+        env = "GROK_ROUTER_TIMEOUT",
+        value_name = "SECONDS",
+        default_value = "30",
+        verbatim_doc_comment
+    )]
+    timeout: String,
 }
 
 /// Runs `search`.
 ///
 /// Returns `0` when at least one row was printed and `1` when the search failed.
 #[must_use]
-pub fn run(config: Option<&str>, args: &SearchArgs) -> i32 {
-    run_search(config, args)
+pub fn run(config: Option<&str>, args: &SearchArgs, mode: OutputMode) -> i32 {
+    let timeout = match catalog::require_timeout(&args.timeout) {
+        Ok(timeout) => timeout,
+        Err(message) => return fail(mode, &message),
+    };
+    run_search(config, args, mode, timeout)
 }
 
 /// Collect flags, load rows, and print the matches.
-fn run_search(config: Option<&str>, args: &SearchArgs) -> i32 {
+fn run_search(config: Option<&str>, args: &SearchArgs, mode: OutputMode, timeout: Duration) -> i32 {
     let terms = match collect_terms(&args.terms) {
         Ok(terms) => terms,
-        Err(message) => return fail(&message),
+        Err(message) => return fail(mode, &message),
     };
-    let rows = match load_rows(config, args) {
+    let rows = match load_rows(config, args, timeout) {
         Ok(rows) => rows,
-        Err(message) => return fail(&message),
+        Err(message) => return fail(mode, &message),
     };
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let matched = catalog::matching(&rows, &term_refs);
     if matched.is_empty() {
-        return fail(&empty_message(&terms));
+        return fail(mode, &empty_message(&terms));
     }
     let shown = take_rows(&matched, args.limit);
     let color = allow_color(io::stdout().is_terminal(), no_color_is_set());
-    let body = if args.json {
-        match format_json(&shown) {
+    let body = match mode {
+        OutputMode::Json => match format_json(&shown) {
             Ok(body) => body,
-            Err(message) => return fail(&message),
-        }
-    } else if args.quiet {
-        format_quiet(&shown, color)
-    } else {
-        format_table(&shown, color)
+            Err(message) => return fail(mode, &message),
+        },
+        OutputMode::Quiet => format_quiet(&shown, color),
+        OutputMode::Text => format_table(&shown, color),
     };
-    write_stdout(&body)
+    write_stdout(mode, &body)
 }
 
 /// Terms from the positional arguments. An empty term is a usage failure.
@@ -130,7 +135,11 @@ fn collect_terms(values: &[String]) -> Result<Vec<String>, String> {
 /// # Errors
 ///
 /// Returns an error when the config, the cartridge, the catalog file, or the cache cannot be used.
-fn load_rows(config: Option<&str>, args: &SearchArgs) -> Result<Vec<CatalogRow>, String> {
+fn load_rows(
+    config: Option<&str>,
+    args: &SearchArgs,
+    timeout: Duration,
+) -> Result<Vec<CatalogRow>, String> {
     let config_path = search_config_path(config)?;
     let text = read_config_text(&config_path)?;
     let choice = provider_choice(args);
@@ -170,7 +179,7 @@ fn load_rows(config: Option<&str>, args: &SearchArgs) -> Result<Vec<CatalogRow>,
             .parse(&bytes)
             .map_err(|err| format!("{err} The config was not written.")),
         CachedBodyOrFetch::Fetch(request) => {
-            let bytes = catalog::fetch_catalog_bytes(&request)
+            let bytes = catalog::fetch_catalog_bytes(&request, timeout)
                 .map_err(|err| cache_failure(&err, &record.env_key))?;
             let stored = catalog::write_cache(&cache_dir, &record.base_url, &bytes)
                 .map_err(|err| cache_failure(&err, &record.env_key))?;
@@ -490,7 +499,7 @@ fn column_width(rows: &[&CatalogRow], field: fn(&CatalogRow) -> &str, header: &s
 }
 
 /// Write the body and a trailing newline. A closed pipe is success.
-fn write_stdout(body: &str) -> i32 {
+fn write_stdout(mode: OutputMode, body: &str) -> i32 {
     let mut stdout = io::stdout().lock();
     let mut bytes = body.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -499,16 +508,16 @@ fn write_stdout(body: &str) -> i32 {
     match stdout.write_all(&bytes) {
         Ok(()) => 0,
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
-        Err(err) => fail(&format!(
-            "could not write search results: {err}. Retry when stdout accepts output."
-        )),
+        Err(err) => fail(
+            mode,
+            &format!("could not write search results: {err}. Retry when stdout accepts output."),
+        ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(message: &str) -> i32 {
-    eprintln!("{message}");
-    1
+fn fail(mode: OutputMode, message: &str) -> i32 {
+    crate::fail_message(mode, message)
 }
 
 /// One JSON object in the search array.

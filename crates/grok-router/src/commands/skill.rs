@@ -12,6 +12,7 @@ use clap::{Args, Subcommand};
 use crate::skill::{
     Confirmation, Effect, Presence, Report, SkillFailure, WriteMode, guide, inspect, remove, setup,
 };
+use crate::OutputMode;
 
 /// Install, check, or remove the skill stub, or print its guide. setup and remove write; status and show do not.
 #[derive(Debug, Args)]
@@ -121,24 +122,6 @@ struct ReadFlags {
     /// Directory that will contain the grok-router stub. Required. Does not read or write the home directory.
     #[arg(long, value_name = "DIR", verbatim_doc_comment)]
     skill_root: Option<PathBuf>,
-
-    /// text, json, or jsonl. json and jsonl print the same one JSON object. --json selects json.
-    #[arg(
-        long,
-        value_name = "FORMAT",
-        value_parser = clap::builder::PossibleValuesParser::new(["text", "json", "jsonl"]),
-        conflicts_with_all = ["json", "quiet"],
-        verbatim_doc_comment
-    )]
-    output: Option<String>,
-
-    /// Print one JSON object and nothing else. Same as --output json.
-    #[arg(long, conflicts_with_all = ["quiet", "output"], verbatim_doc_comment)]
-    json: bool,
-
-    /// Print only the answer line.
-    #[arg(long, conflicts_with_all = ["json", "output"], verbatim_doc_comment)]
-    quiet: bool,
 }
 
 /// Flags for `skill setup` and `skill remove`, including [`ReadFlags`].
@@ -157,12 +140,12 @@ struct WriteFlags {
 ///
 /// Returns `0` when the command finished and `1` when it refused or failed.
 #[must_use]
-pub fn run(args: &SkillArgs) -> i32 {
+pub fn run(args: &SkillArgs, mode: OutputMode) -> i32 {
     match &args.command {
-        SkillCommand::Setup(setup) => run_setup(setup),
-        SkillCommand::Status(status) => run_status(status),
-        SkillCommand::Remove(remove_args) => run_remove(remove_args),
-        SkillCommand::Show(_) => write_stdout(guide()),
+        SkillCommand::Setup(setup) => run_setup(setup, mode),
+        SkillCommand::Status(status) => run_status(status, mode),
+        SkillCommand::Remove(remove_args) => run_remove(remove_args, mode),
+        SkillCommand::Show(_) => write_guide(mode),
     }
 }
 
@@ -170,18 +153,14 @@ pub fn run(args: &SkillArgs) -> i32 {
 ///
 /// Returns `0` when the guide was printed.
 #[must_use]
-pub fn run_internal(args: &InternalArgs) -> i32 {
+pub fn run_internal(args: &InternalArgs, mode: OutputMode) -> i32 {
     match args.command {
-        InternalCommand::Skill => write_stdout(guide()),
+        InternalCommand::Skill => write_guide(mode),
     }
 }
 
-fn run_setup(args: &SetupArgs) -> i32 {
+fn run_setup(args: &SetupArgs, mode: OutputMode) -> i32 {
     let flags = &args.flags.read;
-    let mode = match output_mode(flags) {
-        Ok(mode) => mode,
-        Err(message) => return fail_text(&message),
-    };
     let root = match skill_root(flags) {
         Ok(root) => root,
         Err(message) => return fail_for(mode, "usage", &message),
@@ -189,11 +168,7 @@ fn run_setup(args: &SetupArgs) -> i32 {
     finish(mode, "setup", setup(&root, write_mode(args.flags.dry_run)))
 }
 
-fn run_status(args: &StatusArgs) -> i32 {
-    let mode = match output_mode(&args.flags) {
-        Ok(mode) => mode,
-        Err(message) => return fail_text(&message),
-    };
+fn run_status(args: &StatusArgs, mode: OutputMode) -> i32 {
     let root = match skill_root(&args.flags) {
         Ok(root) => root,
         Err(message) => return fail_for(mode, "usage", &message),
@@ -201,12 +176,8 @@ fn run_status(args: &StatusArgs) -> i32 {
     finish(mode, "status", inspect(&root))
 }
 
-fn run_remove(args: &RemoveArgs) -> i32 {
+fn run_remove(args: &RemoveArgs, mode: OutputMode) -> i32 {
     let flags = &args.flags.read;
-    let mode = match output_mode(flags) {
-        Ok(mode) => mode,
-        Err(message) => return fail_text(&message),
-    };
     let confirmation = confirmation(args.yes);
     if confirmation == Confirmation::No {
         return fail_for(
@@ -224,6 +195,26 @@ fn run_remove(args: &RemoveArgs) -> i32 {
         "remove",
         remove(&root, confirmation, write_mode(args.flags.dry_run)),
     )
+}
+
+/// `skill show` and `__internal skill` print the guide. JSON modes print that text as one JSON string.
+fn write_guide(mode: OutputMode) -> i32 {
+    let body = match mode {
+        OutputMode::Json => match serde_json::to_string(guide()) {
+            Ok(json) => json,
+            Err(err) => {
+                return fail_for(
+                    mode,
+                    "io",
+                    &format!(
+                        "could not encode the skill guide as JSON: {err}. Retry the command."
+                    ),
+                );
+            }
+        },
+        OutputMode::Text | OutputMode::Quiet => guide().to_owned(),
+    };
+    write_stdout(&body)
 }
 
 fn finish(mode: OutputMode, command: &str, result: Result<Report, SkillFailure>) -> i32 {
@@ -265,32 +256,6 @@ fn confirmation(yes: bool) -> Confirmation {
         Confirmation::Yes
     } else {
         Confirmation::No
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OutputMode {
-    /// Human sentences.
-    Text,
-    /// One answer line.
-    Quiet,
-    /// One JSON object.
-    Json,
-}
-
-fn output_mode(flags: &ReadFlags) -> Result<OutputMode, String> {
-    if flags.json {
-        return Ok(OutputMode::Json);
-    }
-    if flags.quiet {
-        return Ok(OutputMode::Quiet);
-    }
-    match flags.output.as_deref() {
-        None | Some("text") => Ok(OutputMode::Text),
-        Some("json" | "jsonl") => Ok(OutputMode::Json),
-        Some(other) => Err(format!(
-            "--output {other} is not text, json, or jsonl, so nothing was written. Pass --output json or --json."
-        )),
     }
 }
 

@@ -699,12 +699,32 @@ fn fresh_bytes_or_fetch(
     catalog_request(api_key, &url, env_key).map(FreshBytesOrFetch::Fetch)
 }
 
-/// Download the catalog body. Does not write the cache or the config.
+/// Parse `--timeout` seconds. Zero and any non-integer refuse before a GET or a write.
+///
+/// # Errors
+///
+/// Returns the refusal when `raw` is not a whole number of seconds greater than 0.
+/// Nothing was downloaded and nothing was written.
+pub(crate) fn require_timeout(raw: &str) -> Result<Duration, String> {
+    match raw.parse::<u64>() {
+        Ok(seconds) if seconds > 0 => Ok(Duration::from_secs(seconds)),
+        Ok(_) | Err(_) => Err(
+            "--timeout must be a whole number of seconds greater than 0. Nothing was downloaded and nothing was written. Pass --timeout with a positive number, such as 30."
+                .to_owned(),
+        ),
+    }
+}
+
+/// Download the catalog body for one GET. `--timeout` is the ureq agent's global wait.
+/// Does not write the cache or the config.
 ///
 /// # Errors
 ///
 /// Returns [`CatalogError::Http`] or [`CatalogError::EmptyBody`] without writing a file.
-pub fn fetch_catalog_bytes(request: &CatalogRequest) -> Result<Vec<u8>, CatalogError> {
+pub fn fetch_catalog_bytes(
+    request: &CatalogRequest,
+    timeout: Duration,
+) -> Result<Vec<u8>, CatalogError> {
     // A non-default models URL is sent. Only a non-GET is refused.
     if request.method() != "GET" {
         return Err(CatalogError::Http {
@@ -713,7 +733,12 @@ pub fn fetch_catalog_bytes(request: &CatalogRequest) -> Result<Vec<u8>, CatalogE
         });
     }
     let authorization = request.authorization();
-    let mut response = ureq::get(request.url())
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .build()
+        .new_agent();
+    let mut response = agent
+        .get(request.url())
         .header("Authorization", &authorization)
         .call()
         .map_err(|err| CatalogError::Http {

@@ -150,6 +150,9 @@ fn run(dir: &Path, args: &[&str]) -> std::process::Output {
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("DEEPSEEK_API_KEY")
         .env_remove("ZAI_API_KEY")
+        .env_remove("GROK_ROUTER_OUTPUT")
+        .env_remove("GROK_ROUTER_QUIET")
+        .env_remove("GROK_ROUTER_TIMEOUT")
         .env("HOME", dir)
         .env("NO_COLOR", "1")
         .env("GROK_HOME", dir)
@@ -1078,6 +1081,59 @@ fn a_deepseek_base_reads_its_hex_cache_and_not_models_json() {
     assert_eq!(
         fs::read(&decoy).expect("models.json should still exist"),
         decoy_before
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn timeout_zero_or_a_non_integer_refuses_before_a_download_or_a_write() {
+    let dir = temp_root("timeout");
+    let config = write_config(&dir, &openrouter_config());
+    let catalog = write_named(&dir, "models.json", FIXTURE);
+    let before = fs::read(&config).expect("the config should be readable");
+    for bad in ["0", "no"] {
+        let output = run(
+            &dir,
+            &[
+                "search",
+                "--timeout",
+                bad,
+                "--catalog-file",
+                &utf8_arg(&catalog, "the catalog path should be UTF-8"),
+                "--config",
+                &utf8_arg(&config, "the config path should be UTF-8"),
+                "gpt-4",
+            ],
+        );
+        let stderr = stderr_text(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "search --timeout {bad} should exit 1; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("--timeout"),
+            "stderr should name --timeout; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("Nothing was downloaded"),
+            "stderr should say nothing was downloaded; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("nothing was written"),
+            "stderr should say nothing was written; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read(&config).expect("the config should still exist"),
+            before,
+            "search --timeout {bad} should write nothing"
+        );
+    }
+    let help = stdout_text(&run(&dir, &["search", "--help"]));
+    assert!(help.contains("--timeout"), "search help should show --timeout");
+    assert!(
+        help.contains("30"),
+        "search help should show the 30 second default"
     );
     remove_temp(&dir);
 }

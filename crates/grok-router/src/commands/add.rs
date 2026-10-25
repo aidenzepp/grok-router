@@ -15,12 +15,13 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use clap::{ArgAction, Args};
 
 use crate::catalog::{self, CachedBodyOrFetch, Cartridge, CartridgeError, CatalogCartridge};
 use crate::config_edit::{self, Backup, ProviderChoice, RefuseReason};
+use crate::OutputMode;
 
 /// Add one model from the selected provider record, or write one block from --model, --base-url, --env-key, and --api-backend without resolving a provider. This command writes unless --dry-run is set.
 #[derive(Debug, Args)]
@@ -94,13 +95,15 @@ pub struct AddArgs {
     #[arg(long, verbatim_doc_comment)]
     dry_run: bool,
 
-    /// Print one JSON object and nothing else.
-    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
-    json: bool,
-
-    /// Print the slug only.
-    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
-    quiet: bool,
+    /// Seconds to wait for a catalog GET. 0 refuses before any download or write.
+    #[arg(
+        long = "timeout",
+        env = "GROK_ROUTER_TIMEOUT",
+        value_name = "SECONDS",
+        default_value = "30",
+        verbatim_doc_comment
+    )]
+    timeout: String,
 }
 
 /// Runs `add`.
@@ -108,10 +111,14 @@ pub struct AddArgs {
 /// Returns `0` when the model is present in the config (or would be, under `--dry-run`).
 /// Returns `1` when the add did not apply.
 #[must_use]
-pub fn run(config: Option<&str>, args: &AddArgs) -> i32 {
-    match run_add(config, args) {
-        Ok(body) => write_stdout(&body),
-        Err(message) => fail(&message),
+pub fn run(config: Option<&str>, args: &AddArgs, mode: OutputMode) -> i32 {
+    let timeout = match catalog::require_timeout(&args.timeout) {
+        Ok(timeout) => timeout,
+        Err(message) => return fail(mode, &message),
+    };
+    match run_add(config, args, mode, timeout) {
+        Ok(body) => write_stdout(mode, &body),
+        Err(message) => fail(mode, &message),
     }
 }
 
@@ -119,7 +126,12 @@ pub fn run(config: Option<&str>, args: &AddArgs) -> i32 {
 const DIRECT_FLAGS: [&str; 4] = ["--model", "--base-url", "--env-key", "--api-backend"];
 
 /// Resolve one provider record, or write one direct block, and write once.
-fn run_add(config: Option<&str>, args: &AddArgs) -> Result<String, String> {
+fn run_add(
+    config: Option<&str>,
+    args: &AddArgs,
+    mode: OutputMode,
+    timeout: Duration,
+) -> Result<String, String> {
     let config_path = configured_path(config)?;
     let original = read_config_text(&config_path)?;
     let present = direct_flags_present(args);
@@ -129,12 +141,12 @@ fn run_add(config: Option<&str>, args: &AddArgs) -> Result<String, String> {
         if !extras.is_empty() {
             return Err(catalog_flag_refusal(&extras));
         }
-        return run_catalog_add(&config_path, &original, args);
+        return run_catalog_add(&config_path, &original, args, mode, timeout);
     }
     if !missing.is_empty() {
         return Err(partial_direct_refusal(&present, &missing));
     }
-    run_direct_add(&config_path, &original, args)
+    run_direct_add(&config_path, &original, args, mode)
 }
 
 /// Which of [`DIRECT_FLAGS`] were passed, including an empty value.
@@ -261,7 +273,12 @@ fn required_direct_slug(args: &AddArgs) -> Result<&str, String> {
 /// Write one block from the four direct flags. Does not resolve a provider or download a catalog.
 ///
 /// `--default` sets `[models].default` in the same `replace_file`. A refused default writes nothing.
-fn run_direct_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<String, String> {
+fn run_direct_add(
+    config_path: &Path,
+    original: &str,
+    args: &AddArgs,
+    mode: OutputMode,
+) -> Result<String, String> {
     let conflicts = direct_conflicts(args);
     if !conflicts.is_empty() {
         return Err(direct_conflict_refusal(&conflicts));
@@ -329,11 +346,17 @@ fn run_direct_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<
         unchanged,
         default: args.set_default,
     };
-    render(args, &report, config_path)
+    render(mode, &report, config_path)
 }
 
 /// Resolve one provider record, parse with its cartridge, and write once.
-fn run_catalog_add(config_path: &Path, original: &str, args: &AddArgs) -> Result<String, String> {
+fn run_catalog_add(
+    config_path: &Path,
+    original: &str,
+    args: &AddArgs,
+    mode: OutputMode,
+    timeout: Duration,
+) -> Result<String, String> {
     let choice = provider_choice(args);
     let record = config_edit::resolve_provider(original, choice)
         .map_err(|reason| resolve_failure(&reason))?;
@@ -342,7 +365,7 @@ fn run_catalog_add(config_path: &Path, original: &str, args: &AddArgs) -> Result
     let _builtins =
         config_edit::builtins_from(original).map_err(|reason| early_refusal(&reason))?;
     let terms = query_terms(&args.query)?;
-    let rows = load_rows(args, &selected, &record.base_url, &record.env_key)?;
+    let rows = load_rows(args, &selected, &record.base_url, &record.env_key, timeout)?;
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let row =
         catalog::resolve(&rows, &term_refs).map_err(|err| format!("{err} Nothing was written."))?;
@@ -380,7 +403,7 @@ fn run_catalog_add(config_path: &Path, original: &str, args: &AddArgs) -> Result
         unchanged,
         default: args.set_default,
     };
-    render(args, &report, config_path)
+    render(mode, &report, config_path)
 }
 
 /// `--config` from the global flag. Never a home path.
@@ -485,6 +508,7 @@ fn load_rows(
     cartridge: &Cartridge,
     base_url: &str,
     env_key: &str,
+    timeout: Duration,
 ) -> Result<Vec<crate::catalog::CatalogRow>, String> {
     if let Some(path) = &args.catalog_file {
         let bytes = fs::read(path).map_err(|err| {
@@ -511,7 +535,7 @@ fn load_rows(
             .parse(&bytes)
             .map_err(|err| format!("{err} Nothing was written.")),
         CachedBodyOrFetch::Fetch(request) => {
-            let bytes = catalog::fetch_catalog_bytes(&request)
+            let bytes = catalog::fetch_catalog_bytes(&request, timeout)
                 .map_err(|err| format!("{err} Nothing was written."))?;
             let stored = catalog::write_cache(&cache_dir, base_url, &bytes)
                 .map_err(|err| format!("{err} Nothing was written."))?;
@@ -650,15 +674,15 @@ fn next_step(reason: &RefuseReason) -> String {
 }
 
 /// Human text, the slug, or one JSON object.
-fn render(args: &AddArgs, report: &AddReport, path: &Path) -> Result<String, String> {
-    if args.json {
+fn render(mode: OutputMode, report: &AddReport, path: &Path) -> Result<String, String> {
+    if mode == OutputMode::Json {
         return serde_json::to_string(report).map_err(|err| {
             format!(
                 "could not encode the add result as JSON: {err}. Retry the add; report this if it persists."
             )
         });
     }
-    if args.quiet {
+    if mode == OutputMode::Quiet {
         return Ok(report.slug.clone());
     }
     if report.dry_run {
@@ -671,7 +695,7 @@ fn render(args: &AddArgs, report: &AddReport, path: &Path) -> Result<String, Str
 }
 
 /// Write the body and a trailing newline. A closed pipe is success.
-fn write_stdout(body: &str) -> i32 {
+fn write_stdout(mode: OutputMode, body: &str) -> i32 {
     let mut stdout = io::stdout().lock();
     let mut bytes = body.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -680,16 +704,16 @@ fn write_stdout(body: &str) -> i32 {
     match stdout.write_all(&bytes) {
         Ok(()) => 0,
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
-        Err(err) => fail(&format!(
-            "could not write the add result: {err}. Retry when stdout accepts output."
-        )),
+        Err(err) => fail(
+            mode,
+            &format!("could not write the add result: {err}. Retry when stdout accepts output."),
+        ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(message: &str) -> i32 {
-    eprintln!("{message}");
-    1
+fn fail(mode: OutputMode, message: &str) -> i32 {
+    crate::fail_message(mode, message)
 }
 
 /// One JSON object for a finished add.

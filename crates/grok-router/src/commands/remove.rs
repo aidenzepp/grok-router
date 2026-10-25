@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use crate::config_edit::{self, Backup, RefuseReason};
+use crate::OutputMode;
 
 /// Delete one model block from the config. This command deletes a model block.
 #[derive(Debug, Args)]
@@ -29,14 +30,6 @@ pub struct RemoveArgs {
     /// Print the slug that would be deleted and do not change the file.
     #[arg(long, verbatim_doc_comment)]
     dry_run: bool,
-
-    /// Print one JSON object and nothing else.
-    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
-    json: bool,
-
-    /// Print the slug only.
-    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
-    quiet: bool,
 }
 
 /// Runs `remove`.
@@ -44,15 +37,15 @@ pub struct RemoveArgs {
 /// Returns `0` when the block was deleted, or when `--dry-run` would delete it.
 /// Returns `1` when the file was left unchanged.
 #[must_use]
-pub fn run(config: Option<&str>, args: &RemoveArgs) -> i32 {
-    match run_remove(config, args) {
-        Ok(body) => write_stdout(&body),
-        Err(message) => fail(&message),
+pub fn run(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> i32 {
+    match run_remove(config, args, mode) {
+        Ok(body) => write_stdout(mode, &body),
+        Err(message) => fail(mode, &message),
     }
 }
 
 /// Delete one slug, or preview that deletion. Does not prompt.
-fn run_remove(config: Option<&str>, args: &RemoveArgs) -> Result<String, String> {
+fn run_remove(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> Result<String, String> {
     let slug = required_slug(&args.slug)?;
     let config_path = configured_path(config)?;
     let original = read_config_text(&config_path)?;
@@ -82,7 +75,7 @@ fn run_remove(config: Option<&str>, args: &RemoveArgs) -> Result<String, String>
         removed,
         dry_run,
     };
-    render(args, &report)
+    render(mode, &report)
 }
 
 /// The positional slug. An empty slug is a usage failure and deletes nothing.
@@ -177,15 +170,15 @@ fn next_step(reason: &RefuseReason) -> String {
 }
 
 /// Human text, the slug, or one JSON object.
-fn render(args: &RemoveArgs, report: &RemoveReport) -> Result<String, String> {
-    if args.json {
+fn render(mode: OutputMode, report: &RemoveReport) -> Result<String, String> {
+    if mode == OutputMode::Json {
         return serde_json::to_string(report).map_err(|err| {
             format!(
                 "could not encode the remove result as JSON: {err}. Retry the remove; report this if it persists."
             )
         });
     }
-    if args.quiet {
+    if mode == OutputMode::Quiet {
         return Ok(report.slug.clone());
     }
     if report.dry_run {
@@ -195,7 +188,7 @@ fn render(args: &RemoveArgs, report: &RemoveReport) -> Result<String, String> {
 }
 
 /// Write the body and a trailing newline. A closed pipe is success.
-fn write_stdout(body: &str) -> i32 {
+fn write_stdout(mode: OutputMode, body: &str) -> i32 {
     let mut stdout = io::stdout().lock();
     let mut bytes = body.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -204,16 +197,16 @@ fn write_stdout(body: &str) -> i32 {
     match stdout.write_all(&bytes) {
         Ok(()) => 0,
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
-        Err(err) => fail(&format!(
-            "could not write the remove result: {err}. Retry when stdout accepts output."
-        )),
+        Err(err) => fail(
+            mode,
+            &format!("could not write the remove result: {err}. Retry when stdout accepts output."),
+        ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(message: &str) -> i32 {
-    eprintln!("{message}");
-    1
+fn fail(mode: OutputMode, message: &str) -> i32 {
+    crate::fail_message(mode, message)
 }
 
 /// One JSON object for a finished remove.

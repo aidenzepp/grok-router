@@ -1,3 +1,8 @@
+---
+name: grok-router
+description: Command line for the grok model router config.
+---
+
 # Rust Workspace Template
 
 This repository is a stable Rust workspace. It is a foundation for future projects, not a sample application. Create only the crates the project needs under `crates/`; do not pre-create shared or FFI crates.

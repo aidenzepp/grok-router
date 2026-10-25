@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use crate::config_edit::{self, ConfiguredInventory, RefuseReason};
+use crate::OutputMode;
 
 /// List configured models and the saved default. This command does not modify the config.
 #[derive(Debug, Args)]
@@ -18,39 +19,29 @@ use crate::config_edit::{self, ConfiguredInventory, RefuseReason};
     verbatim_doc_comment,
     after_help = "Examples:\n  grok-router list --config config.toml"
 )]
-pub struct ListArgs {
-    /// Print a JSON array of slug, provider id, and whether it is the default.
-    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
-    json: bool,
-
-    /// Print one slug per line.
-    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
-    quiet: bool,
-}
+pub struct ListArgs {}
 
 /// Runs `list`, including the no-args path.
 ///
-/// `args` is absent when no subcommand was given. That path has neither `--json` nor `--quiet`.
+/// No subcommand uses the same read. `mode` is the resolved global output.
 ///
 /// Returns `0` when the inventory was printed and `1` when the config could not be read.
 #[must_use]
-pub fn run(config: Option<&str>, args: Option<&ListArgs>) -> i32 {
-    match list_models(config, args) {
-        Ok(body) => write_stdout(&body),
-        Err(message) => fail(&message),
+pub fn run(config: Option<&str>, mode: OutputMode) -> i32 {
+    match list_models(config, mode) {
+        Ok(body) => write_stdout(mode, &body),
+        Err(message) => fail(mode, &message),
     }
 }
 
 /// Read the config and render the inventory. Does not write the file.
-fn list_models(config: Option<&str>, args: Option<&ListArgs>) -> Result<String, String> {
+fn list_models(config: Option<&str>, mode: OutputMode) -> Result<String, String> {
     let path = config_path(config)?;
     let text = read_config_text(&path)?;
     let inventory =
         config_edit::read_configured(&text).map_err(|refused| read_failure(&refused.reason))?;
     let rows = display_rows(&inventory);
-    let json = args.is_some_and(|args| args.json);
-    let quiet = args.is_some_and(|args| args.quiet);
-    render(&rows, json, quiet)
+    render(&rows, mode)
 }
 
 /// `--config` when it was passed. Otherwise `${GROK_HOME:-$HOME/.grok}/config.toml`.
@@ -141,14 +132,12 @@ fn display_rows(inventory: &ConfiguredInventory) -> Vec<Row> {
 }
 
 /// JSON, one slug per line, or text that marks the default.
-fn render(rows: &[Row], json: bool, quiet: bool) -> Result<String, String> {
-    if json {
-        return format_json(rows);
+fn render(rows: &[Row], mode: OutputMode) -> Result<String, String> {
+    match mode {
+        OutputMode::Json => format_json(rows),
+        OutputMode::Quiet => Ok(format_quiet(rows)),
+        OutputMode::Text => Ok(format_text(rows)),
     }
-    if quiet {
-        return Ok(format_quiet(rows));
-    }
-    Ok(format_text(rows))
 }
 
 /// JSON array. `provider_id` is omitted when the slug has no block.
@@ -196,7 +185,7 @@ fn text_line(row: &Row) -> String {
 }
 
 /// Write the body and a trailing newline. A closed pipe is success.
-fn write_stdout(body: &str) -> i32 {
+fn write_stdout(mode: OutputMode, body: &str) -> i32 {
     let mut stdout = io::stdout().lock();
     let mut bytes = body.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -205,16 +194,16 @@ fn write_stdout(body: &str) -> i32 {
     match stdout.write_all(&bytes) {
         Ok(()) => 0,
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
-        Err(err) => fail(&format!(
-            "could not write the model list: {err}. Retry when stdout accepts output."
-        )),
+        Err(err) => fail(
+            mode,
+            &format!("could not write the model list: {err}. Retry when stdout accepts output."),
+        ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(message: &str) -> i32 {
-    eprintln!("{message}");
-    1
+fn fail(mode: OutputMode, message: &str) -> i32 {
+    crate::fail_message(mode, message)
 }
 
 /// One printed model.

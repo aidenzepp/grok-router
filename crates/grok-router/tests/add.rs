@@ -132,6 +132,9 @@ fn run_with(dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> std::proces
             .env_remove("DEEPSEEK_API_KEY")
             .env_remove("ANTHROPIC_AUTH_TOKEN")
             .env_remove("EXAMPLE_API_KEY")
+            .env_remove("GROK_ROUTER_OUTPUT")
+            .env_remove("GROK_ROUTER_QUIET")
+            .env_remove("GROK_ROUTER_TIMEOUT")
             .env("HOME", dir)
             .env("NO_COLOR", "1")
             .current_dir(dir),
@@ -1634,6 +1637,9 @@ fn a_pasted_secret_refuses_before_a_write() {
         ])
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("DEEPSEEK_API_KEY")
+        .env_remove("GROK_ROUTER_OUTPUT")
+        .env_remove("GROK_ROUTER_QUIET")
+        .env_remove("GROK_ROUTER_TIMEOUT")
         .env(
             "MIRROR_API_KEY",
             std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
@@ -2145,5 +2151,79 @@ fn direct_default_refusal_writes_nothing() {
         !config.with_file_name("config.toml.prev").exists(),
         "a refused default should not write a backup"
     );
+    remove_temp(&dir);
+}
+
+#[test]
+fn timeout_zero_or_a_non_integer_writes_nothing_on_catalog_and_direct_adds() {
+    let dir = temp_root("timeout");
+    let (config, catalog, _cache) = write_fixture(&dir);
+    let before = fs::read(&config).expect("the config should be readable");
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let catalog_arg = utf8_arg(&catalog, "the catalog path should be UTF-8");
+    for bad in ["0", "no"] {
+        let catalog_add = run(
+            &dir,
+            &[
+                "add",
+                "--timeout",
+                bad,
+                "--catalog-file",
+                &catalog_arg,
+                "--config",
+                &config_arg,
+                "acme/widget.v2",
+            ],
+        );
+        let stderr = stderr_text(&catalog_add);
+        assert_eq!(
+            exit_code(&catalog_add),
+            1,
+            "catalog add --timeout {bad} should exit 1; stderr: {stderr}"
+        );
+        assert!(stderr.contains("--timeout"), "stderr should name --timeout; stderr: {stderr}");
+        assert!(
+            stderr.contains("Nothing was downloaded"),
+            "stderr should say nothing was downloaded; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("nothing was written"),
+            "stderr should say nothing was written; stderr: {stderr}"
+        );
+        let direct = run(
+            &dir,
+            &[
+                "add",
+                "--timeout",
+                bad,
+                "--config",
+                &config_arg,
+                "--as",
+                "example-model",
+                "--model",
+                "example-model",
+                "--base-url",
+                "https://example.test/v1",
+                "--api-backend",
+                "messages",
+                "--env-key",
+                "EXAMPLE_API_KEY",
+            ],
+        );
+        let direct_err = stderr_text(&direct);
+        assert_eq!(
+            exit_code(&direct),
+            1,
+            "direct add --timeout {bad} should exit 1; stderr: {direct_err}"
+        );
+        assert_eq!(
+            fs::read(&config).expect("the config should still exist"),
+            before,
+            "add --timeout {bad} should write nothing"
+        );
+    }
+    let help = stdout_text(&run(&dir, &["add", "--help"]));
+    assert!(help.contains("--timeout"), "add help should show --timeout");
+    assert!(help.contains("30"), "add help should show the 30 second default");
     remove_temp(&dir);
 }

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use crate::config_edit::{self, Backup, RefuseReason};
+use crate::OutputMode;
 
 /// Set [models].default for the next session. This does not switch the running session. This command writes the saved default unless --dry-run is set.
 #[derive(Debug, Args)]
@@ -26,14 +27,6 @@ pub struct SetDefaultArgs {
     /// Print the slug that would be saved, then do not change the file.
     #[arg(long, verbatim_doc_comment)]
     dry_run: bool,
-
-    /// Print one JSON object and nothing else.
-    #[arg(long, conflicts_with = "quiet", verbatim_doc_comment)]
-    json: bool,
-
-    /// Print the slug only.
-    #[arg(long, conflicts_with = "json", verbatim_doc_comment)]
-    quiet: bool,
 }
 
 /// Runs `set-default`.
@@ -41,15 +34,15 @@ pub struct SetDefaultArgs {
 /// Returns `0` when the saved default is the requested slug, or would be under `--dry-run`.
 /// Returns `1` when the default was not changed.
 #[must_use]
-pub fn run(config: Option<&str>, args: &SetDefaultArgs) -> i32 {
-    match apply(config, args) {
-        Ok(body) => write_stdout(&body),
-        Err(message) => fail(&message),
+pub fn run(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> i32 {
+    match apply(config, args, mode) {
+        Ok(body) => write_stdout(mode, &body),
+        Err(message) => fail(mode, &message),
     }
 }
 
 /// Read `--config`, set the default in that text, and replace the file unless this is `--dry-run`.
-fn apply(config: Option<&str>, args: &SetDefaultArgs) -> Result<String, String> {
+fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Result<String, String> {
     let path = configured_path(config)?;
     let slug = requested_slug(&args.slug)?;
     let original = read_config_text(&path)?;
@@ -76,7 +69,7 @@ fn apply(config: Option<&str>, args: &SetDefaultArgs) -> Result<String, String> 
         dry_run,
         unchanged,
     };
-    render(args, &report)
+    render(mode, &report)
 }
 
 /// `--config` from the global flag. Never a home path.
@@ -162,15 +155,15 @@ fn next_step(reason: &RefuseReason) -> &'static str {
 }
 
 /// Human text, the slug, or one JSON object.
-fn render(args: &SetDefaultArgs, report: &SetDefaultReport) -> Result<String, String> {
-    if args.json {
+fn render(mode: OutputMode, report: &SetDefaultReport) -> Result<String, String> {
+    if mode == OutputMode::Json {
         return serde_json::to_string(report).map_err(|err| {
             format!(
                 "could not encode the set-default result as JSON: {err}. Retry the command; report this if it persists."
             )
         });
     }
-    if args.quiet {
+    if mode == OutputMode::Quiet {
         return Ok(report.slug.clone());
     }
     if report.dry_run {
@@ -183,7 +176,7 @@ fn render(args: &SetDefaultArgs, report: &SetDefaultReport) -> Result<String, St
 }
 
 /// Write the body and a trailing newline. A closed pipe is success.
-fn write_stdout(body: &str) -> i32 {
+fn write_stdout(mode: OutputMode, body: &str) -> i32 {
     let mut stdout = io::stdout().lock();
     let mut bytes = body.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -192,16 +185,18 @@ fn write_stdout(body: &str) -> i32 {
     match stdout.write_all(&bytes) {
         Ok(()) => 0,
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
-        Err(err) => fail(&format!(
-            "could not write the set-default result: {err}. Retry when stdout accepts output."
-        )),
+        Err(err) => fail(
+            mode,
+            &format!(
+                "could not write the set-default result: {err}. Retry when stdout accepts output."
+            ),
+        ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(message: &str) -> i32 {
-    eprintln!("{message}");
-    1
+fn fail(mode: OutputMode, message: &str) -> i32 {
+    crate::fail_message(mode, message)
 }
 
 /// One JSON object for a finished `set-default`.

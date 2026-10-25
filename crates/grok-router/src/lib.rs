@@ -9,38 +9,132 @@
 
 //! Library for the `grok-router` command.
 
-use clap::{Command, CommandFactory, Parser, Subcommand};
+use std::io::{self, Write};
+
+use clap::{ArgAction, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
 
 pub mod catalog;
 pub mod commands;
 pub mod config_edit;
 pub mod skill;
 
+/// Format named by `--output`. `Json` and `Jsonl` render the same one JSON value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Human text.
+    Text,
+    /// One JSON value.
+    Json,
+    /// One JSON value, the same bytes as [`OutputFormat::Json`].
+    Jsonl,
+}
+
+/// How a command renders after `--output`, `--json`, `--jsonl`, and `--quiet` resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputMode {
+    /// Human text.
+    Text,
+    /// One answer line and no extra labels.
+    Quiet,
+    /// One JSON value. `json` and `jsonl` both use this mode.
+    Json,
+}
+
 /// Root command for `grok-router`.
 ///
-/// No subcommand runs `list`. The doc comment is not the help text: help stays
-/// the version, the global config path, and the subcommands.
+/// No subcommand runs `list`.
 #[derive(Debug, Parser)]
 #[command(
     name = "grok-router",
     version,
     disable_help_subcommand = true,
-    about = None,
-    long_about = None
+    about = "Manage the grok model router config.",
+    long_about = "Manage the grok model router config.\n\nRead models, search a provider catalog, and edit the saved config.",
+    after_help = "Examples:\n  grok-router list --config config.toml\n  grok-router list --config config.toml --output json"
 )]
 pub struct Cli {
-    /// Path to the config file
+    /// Reads default to $GROK_HOME/config.toml or ~/.grok/config.toml.
+    /// add, set-default, and remove still require --config.
     #[arg(long, global = true, value_name = "PATH", verbatim_doc_comment)]
     pub config: Option<String>,
+
+    /// text, json, or jsonl. json and jsonl print the same one JSON value.
+    #[arg(
+        long = "output",
+        global = true,
+        env = "GROK_ROUTER_OUTPUT",
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        verbatim_doc_comment
+    )]
+    pub output: OutputFormat,
+
+    /// Print one JSON value and nothing else.
+    #[arg(long = "json", global = true, action = ArgAction::SetTrue, verbatim_doc_comment)]
+    pub json: bool,
+
+    /// Print one JSON value and nothing else.
+    #[arg(long = "jsonl", global = true, action = ArgAction::SetTrue, verbatim_doc_comment)]
+    pub jsonl: bool,
+
+    /// Print only the answer line.
+    #[arg(
+        long = "quiet",
+        global = true,
+        env = "GROK_ROUTER_QUIET",
+        action = ArgAction::SetTrue,
+        verbatim_doc_comment
+    )]
+    pub quiet: bool,
 
     /// Selected subcommand. Absent means `list`.
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
 
+impl Cli {
+    /// Resolve output after clap has recorded where `--output` came from.
+    ///
+    /// A command-line `--output` wins over `GROK_ROUTER_OUTPUT`. `--json` and
+    /// `--jsonl` then win over the environment and over the default. `--json`
+    /// with `--output text` is an error. `--quiet` with either JSON value is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when the flags disagree. Nothing was written.
+    pub fn resolve_output(
+        &self,
+        source: clap::parser::ValueSource,
+    ) -> Result<OutputMode, String> {
+        let json_alias = self.json || self.jsonl;
+        let format = if source == clap::parser::ValueSource::CommandLine {
+            if json_alias && self.output == OutputFormat::Text {
+                let flag = if self.json { "--json" } else { "--jsonl" };
+                return Err(format!(
+                    "{flag} conflicts with --output text, so nothing was written. Drop {flag} or pass --output json."
+                ));
+            }
+            self.output
+        } else if json_alias {
+            OutputFormat::Json
+        } else {
+            self.output
+        };
+        if self.quiet && matches!(format, OutputFormat::Json | OutputFormat::Jsonl) {
+            return Err(
+                "--quiet conflicts with json output, so nothing was written. Drop --quiet or pass --output text."
+                    .to_owned(),
+            );
+        }
+        Ok(match (self.quiet, format) {
+            (true, _) => OutputMode::Quiet,
+            (_, OutputFormat::Json | OutputFormat::Jsonl) => OutputMode::Json,
+            (_, OutputFormat::Text) => OutputMode::Text,
+        })
+    }
+}
+
 /// Subcommands. Each variant names the args struct that owns that command's flags.
-///
-/// The about text is cleared here so this doc does not become the root help.
 #[derive(Debug, Subcommand)]
 #[command(about = None, long_about = None)]
 pub enum Commands {
@@ -62,13 +156,165 @@ pub enum Commands {
     /// Install, check, or remove the skill stub, or print its guide. setup and remove write; status and show do not.
     #[command(verbatim_doc_comment)]
     Skill(commands::skill::SkillArgs),
+    /// Print a shell completion script. This command does not read a config and does not use the network.
+    #[command(verbatim_doc_comment)]
+    Completions(CompletionsArgs),
+    /// Print the JSON Schema (draft 2020-12) for this command's JSON output. This command does not read a config and does not use the network.
+    #[command(verbatim_doc_comment)]
+    Schema(SchemaArgs),
     /// Print the built-in skill guide. Not a human command. This command does not modify anything.
     #[command(name = "__internal", hide = true, verbatim_doc_comment)]
     Internal(commands::skill::InternalArgs),
+}
+
+/// Print a shell completion script. This command does not read a config and does not use the network.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router completions bash\n  grok-router completions bash --output json"
+)]
+pub struct CompletionsArgs {
+    /// bash, zsh, fish, elvish, or powershell.
+    #[arg(value_name = "SHELL", verbatim_doc_comment)]
+    shell: String,
+}
+
+impl CompletionsArgs {
+    /// Print the completion script. Does not read a config and does not use the network.
+    #[must_use]
+    pub fn run(&self, mode: OutputMode) -> i32 {
+        match render_completion(&self.shell, mode) {
+            Ok(body) => write_stdout(mode, &body, "completion script"),
+            Err(message) => fail_message(mode, &message),
+        }
+    }
+}
+
+/// Print the JSON Schema (draft 2020-12) for this command's JSON output. This command does not read a config and does not use the network.
+#[derive(Debug, Args)]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router schema\n  grok-router schema --output json"
+)]
+pub struct SchemaArgs;
+
+impl SchemaArgs {
+    /// Print the schema. Does not read a config and does not use the network.
+    #[must_use]
+    pub fn run(&self, mode: OutputMode) -> i32 {
+        match schema_document() {
+            Ok(body) => write_stdout(mode, &body, "schema"),
+            Err(message) => fail_message(mode, &message),
+        }
+    }
 }
 
 /// Builds the root command named `grok-router`.
 #[must_use]
 pub fn command() -> Command {
     Cli::command()
+}
+
+/// Print `message` to stderr and return `1`.
+///
+/// JSON mode prints one object with `error`, `kind`, and `message`.
+#[must_use]
+pub fn fail_message(mode: OutputMode, message: &str) -> i32 {
+    match mode {
+        OutputMode::Json => {
+            let body = serde_json::json!({
+                "error": "error",
+                "kind": "error",
+                "message": message,
+            });
+            eprintln!("{body}");
+        }
+        OutputMode::Text | OutputMode::Quiet => {
+            eprintln!("{message}");
+        }
+    }
+    1
+}
+
+/// Completion script for one shell, or the refusal that names the five shells.
+///
+/// # Errors
+///
+/// Returns the refusal when `shell` is not one of the five names. The config was not read.
+fn render_completion(shell: &str, mode: OutputMode) -> Result<String, String> {
+    let script = completion_script(shell)?;
+    match mode {
+        OutputMode::Json => serde_json::to_string(&script).map_err(|err| {
+            format!(
+                "could not encode the completion script as JSON: {err}. Retry completions."
+            )
+        }),
+        OutputMode::Text | OutputMode::Quiet => Ok(script),
+    }
+}
+
+/// Raw completion script. Does not read a config and does not use the network.
+///
+/// # Errors
+///
+/// Returns the refusal when `shell` is not bash, zsh, fish, elvish, or powershell.
+fn completion_script(shell: &str) -> Result<String, String> {
+    let clap_shell = match shell {
+        "bash" => clap_complete::Shell::Bash,
+        "zsh" => clap_complete::Shell::Zsh,
+        "fish" => clap_complete::Shell::Fish,
+        "elvish" => clap_complete::Shell::Elvish,
+        "powershell" => clap_complete::Shell::PowerShell,
+        _ => {
+            return Err(format!(
+                "unknown shell {shell}. Pass bash, zsh, fish, elvish, or powershell. The config was not read and nothing was written."
+            ));
+        }
+    };
+    let mut cmd = command();
+    let mut buf = Vec::new();
+    clap_complete::generate(clap_shell, &mut cmd, "grok-router", &mut buf);
+    String::from_utf8(buf).map_err(|_| {
+        "the completion script was not valid UTF-8, so nothing was written. Retry completions."
+            .to_owned()
+    })
+}
+
+/// JSON Schema (draft 2020-12) for the JSON values this command prints.
+///
+/// # Errors
+///
+/// Returns an error when the document cannot be encoded.
+fn schema_document() -> Result<String, String> {
+    let body = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://grok-router.local/output.schema.json",
+        "title": "grok-router JSON output",
+        "description": "One JSON value. json and jsonl print this same value.",
+        "oneOf": [
+            {"type": "array"},
+            {"type": "object"},
+            {"type": "string"}
+        ]
+    });
+    serde_json::to_string(&body).map_err(|err| {
+        format!("could not encode the output schema as JSON: {err}. Retry schema.")
+    })
+}
+
+/// Write `body` and a trailing newline. A closed pipe is success.
+fn write_stdout(mode: OutputMode, body: &str, what: &str) -> i32 {
+    let mut stdout = io::stdout().lock();
+    let mut bytes = body.as_bytes().to_vec();
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    match stdout.write_all(&bytes) {
+        Ok(()) => 0,
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
+        Err(err) => fail_message(
+            mode,
+            &format!("could not write the {what}: {err}. Retry when stdout accepts output."),
+        ),
+    }
 }
