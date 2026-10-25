@@ -18,15 +18,17 @@ cargo install --path crates/grok-router --locked
 
 ## Config
 
-`list`, `search`, and `init` read that default path. They do not create it, except `init`, which creates a missing file and any missing parent directory.
+`list`, `show`, `search`, and `init` read that default path. They do not create it, except `init`, which creates a missing file and any missing parent directory.
 
-`add`, `set-default`, and `remove` require `--config`. They do not open the home file on their own.
+`add`, `edit`, `set-default`, and `remove` require `--config`. They do not open the home file on their own.
 
 ```bash
 grok-router init
 grok-router list
+grok-router show kimi-k3
 grok-router search glm
 grok-router add --config ~/.grok/config.toml moonshotai/kimi-k3.1-pro
+grok-router edit --config ~/.grok/config.toml kimi-k3 --name "Kimi K3" --reasoning-effort high
 grok-router set-default --config ~/.grok/config.toml or-kimi-k3-1-pro
 grok-router remove --yes --config ~/.grok/config.toml or-kimi-k3-1-pro
 ```
@@ -59,10 +61,12 @@ catalog = "deepseek-list-models"
 | Command | Writes | What it does |
 | --- | --- | --- |
 | `list` | no | Configured models, plus the saved default when that slug has no block. |
+| `show` | no | One configured block, including its child tables, or a built-in that has no block. |
 | `search` | no | AND-match on id, name, and description. Default `--limit` is 30. |
 | `add` | yes | One catalog model, or one direct block. |
+| `edit` | yes | Changes fields inside one existing block. Child tables stay. |
 | `set-default` | yes | Sets `[models].default` for the next session. |
-| `remove` | yes | Deletes one model block. Requires `--yes` or `--force`. |
+| `remove` | yes | Deletes one model block and its child tables. Requires `--yes` or `--force`. |
 | `init` | yes | Writes the OpenRouter `[router]` table when the file has none. |
 | `skill` | setup and remove | Installs or removes the agent skill stub. |
 | `completions` | no | Prints a completion script for bash, zsh, fish, elvish, or powershell. |
@@ -95,9 +99,23 @@ On that path all four of `--model`, `--base-url`, `--env-key`, and `--api-backen
 
 Catalog blocks are written in this order: `model`, `base_url`, `name`, `env_key`, `api_backend`, `context_window`, and `vision = true` only when the catalog says the model accepts images. `vision = false` is not written.
 
+## Managing a model that is already in the file
+
+`show` prints the stored block. A built-in with no block prints the slug, `built-in`, and `default` when that slug is the saved default.
+
+`edit` changes fields inside that block. Omitted flags stay as they are. A missing key is appended. `--clear KEY` deletes that assignment. `--model` changes the provider id and cannot be cleared. The editable fields are `model`, `base_url`, `name`, `description`, `env_key`, `api_key`, `api_backend`, `context_window`, `max_completion_tokens`, `reasoning_effort`, `vision`, `stream_tool_calls`, and `supports_reasoning_effort`.
+
+`api_key` writes the literal you pass. A write is still refused when that text, or any other new text, contains the value of an `env_key` named in the file. Child tables such as `[model.<slug>.env_http_headers]` are not edited. `remove` deletes them with the parent block. A trailing comment on a line you change is not kept. Every other line stays.
+
+```bash
+grok-router show kimi-k3
+grok-router edit --config ~/.grok/config.toml kimi-k3 --description "kimi-code oauth"
+grok-router edit --dry-run --config ~/.grok/config.toml kimi-k3 --clear max_completion_tokens
+```
+
 ## Saved default
 
-`set-default` accepts a built-in slug or a configured slug. When `[router]` has no `builtins` key, the built-ins are `grok-4.7`, `grok-4.7-build-fast`, `grok-4.6`, and `grok-4.5`. `list` does not print those four unless one of them is the saved default and has no block of its own. `remove` refuses a built-in because there is no block to delete.
+`set-default` accepts a built-in slug or a configured slug. When `[router]` has no `builtins` key, the built-ins are `grok-4.7`, `grok-4.7-build-fast`, `grok-4.6`, and `grok-4.5`. `list` does not print those four unless one of them is the saved default and has no block of its own. `remove` refuses a built-in because there is no block to delete. When it deletes a configured slug, it also deletes child tables under that slug, such as `[model.<slug>.env_http_headers]`.
 
 ## Output
 
