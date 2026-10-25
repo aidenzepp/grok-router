@@ -180,15 +180,17 @@ fn field_changes(args: &EditArgs) -> Result<Vec<FieldChange>, Error> {
         "max_completion_tokens",
         args.max_completion_tokens,
     );
-    push_bool(&mut changes, "vision", args.vision.as_deref())?;
+    push_bool(&mut changes, "vision", "vision", args.vision.as_deref())?;
     push_bool(
         &mut changes,
         "stream_tool_calls",
+        "stream-tool-calls",
         args.stream_tool_calls.as_deref(),
     )?;
     push_bool(
         &mut changes,
         "supports_reasoning_effort",
+        "supports-reasoning-effort",
         args.supports_reasoning_effort.as_deref(),
     )?;
     for key in &args.clear {
@@ -234,7 +236,12 @@ fn push_int(changes: &mut Vec<FieldChange>, key: &str, value: Option<i64>) {
 /// # Errors
 ///
 /// Returns an error when the text is not `true` or `false`.
-fn push_bool(changes: &mut Vec<FieldChange>, key: &str, value: Option<&str>) -> Result<(), Error> {
+fn push_bool(
+    changes: &mut Vec<FieldChange>,
+    key: &str,
+    flag: &'static str,
+    value: Option<&str>,
+) -> Result<(), Error> {
     let Some(value) = value else {
         return Ok(());
     };
@@ -243,7 +250,7 @@ fn push_bool(changes: &mut Vec<FieldChange>, key: &str, value: Option<&str>) -> 
         "false" => false,
         _ => {
             return Err(Error::EditBool {
-                flag: flag_name(key),
+                flag,
                 raw: value.to_owned(),
             });
         }
@@ -253,15 +260,6 @@ fn push_bool(changes: &mut Vec<FieldChange>, key: &str, value: Option<&str>) -> 
         action: FieldAction::SetBool(parsed),
     });
     Ok(())
-}
-
-/// The command-line flag for a boolean field.
-fn flag_name(key: &str) -> &'static str {
-    match key {
-        "stream_tool_calls" => "stream-tool-calls",
-        "supports_reasoning_effort" => "supports-reasoning-effort",
-        _ => "vision",
-    }
 }
 
 /// Read the named config. A missing file is a failure and not a reason to look elsewhere.

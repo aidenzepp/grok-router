@@ -295,6 +295,40 @@ fn edit_can_change_the_provider_id() {
 }
 
 #[test]
+fn edit_rejects_a_boolean_that_is_not_true_or_false() {
+    let dir = temp_root("bad-bool");
+    let config = write_fixture(&dir);
+    let before = fs::read(&config).expect("the config fixture should be readable");
+    let output = run(
+        &dir,
+        &[
+            "edit",
+            "--config",
+            "config.toml",
+            "kimi-k3",
+            "--stream-tool-calls",
+            "yes",
+        ],
+    );
+    let stderr = stderr_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        1,
+        "a boolean other than true or false should fail; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--stream-tool-calls yes"),
+        "stderr should name the flag and the text that was passed; stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&config).expect("the config should still be readable"),
+        before,
+        "a refused edit should leave the bytes identical"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
 fn edit_without_a_field_exits_1_and_leaves_the_file_unchanged() {
     let dir = temp_root("empty");
     let config = write_fixture(&dir);
