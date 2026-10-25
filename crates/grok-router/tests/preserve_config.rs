@@ -517,8 +517,8 @@ fn init_appends_the_openrouter_block_and_keeps_lived_in_bytes() {
     let block = grok_router::config_edit::openrouter_router_block();
     assert_eq!(
         edited,
-        format!("{LIVED_IN}{block}"),
-        "init should keep every lived-in byte and append the router block"
+        format!("{LIVED_IN}\n{block}"),
+        "init should keep every lived-in byte and append the router block after one blank line"
     );
     assert_lived_in_outside_models(&edited);
     assert_eq!(

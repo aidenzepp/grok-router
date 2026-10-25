@@ -79,7 +79,7 @@ pub enum ProviderChoice<'a> {
 /// What `init` should do with config text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouterInit {
-    /// Append these bytes. Earlier bytes stay, plus one newline when the text did not end in one.
+    /// Append these bytes. Earlier bytes stay. A non-empty file gains one blank line before the block.
     Append(String),
     /// `[router]` is already a table. Do not write.
     AlreadyPresent,
@@ -913,9 +913,10 @@ catalog = \"openrouter-models\"
 /// Append the `OpenRouter` router block, or report that `[router]` is already a table.
 ///
 /// A missing `[router]` key appends [`openrouter_router_block`]. Every earlier byte
-/// stays. When `config` is non-empty and does not end in a newline, one newline is
-/// inserted before the block. The document is not reserialized. After the append,
-/// a top-level table that was already there must still compare equal.
+/// stays. A non-empty file gets one blank line before the block, after a trailing
+/// newline when the text did not already end in one. The document is not
+/// reserialized. After the append, a top-level table that was already there
+/// must still compare equal.
 ///
 /// # Errors
 ///
@@ -942,7 +943,7 @@ pub fn init_router_text(config: &str) -> Result<RouterInit, RouterInitError> {
         Some(_) => return Err(RouterInitError::NotTable),
         None => {}
     }
-    let spliced = append_router_block(config, &openrouter_router_block());
+    let spliced = append_block(config, &openrouter_router_block());
     let after = match spliced.parse::<toml::Table>() {
         Ok(root) => root,
         Err(error) => {
@@ -957,17 +958,6 @@ pub fn init_router_text(config: &str) -> Result<RouterInit, RouterInitError> {
         return Err(RouterInitError::ChangedTables { tables });
     }
     Ok(RouterInit::Append(spliced))
-}
-
-/// Keep `config` and put `block` after it. A non-empty text without a trailing newline gets one.
-fn append_router_block(config: &str, block: &str) -> String {
-    let mut spliced = String::new();
-    spliced.push_str(config);
-    if !config.is_empty() && !config.ends_with('\n') {
-        spliced.push('\n');
-    }
-    spliced.push_str(block);
-    spliced
 }
 
 /// Top-level tables in `before` whose parsed value is missing or different in `after`.
@@ -3673,8 +3663,22 @@ catalog = \"openrouter-models\"
         };
         assert_eq!(
             text,
-            format!("{original}\n{}", openrouter_router_block()),
-            "a file that does not end in a newline should gain one newline and then the block"
+            format!("{original}\n\n{}", openrouter_router_block()),
+            "a file that does not end in a newline should end its last line, then leave one blank line before [router]"
+        );
+        let already_separated = format!("{original}\n\n");
+        let separated = match init_router_text(&already_separated)
+            .expect("a file that already ends with a blank line should accept the block")
+        {
+            RouterInit::Append(text) => text,
+            RouterInit::AlreadyPresent => {
+                panic!("a trailing blank line is not an existing [router] table")
+            }
+        };
+        assert_eq!(
+            separated,
+            format!("{already_separated}{}", openrouter_router_block()),
+            "a file that already ends with a blank line should not gain a second one"
         );
         let before = original
             .parse::<toml::Table>()

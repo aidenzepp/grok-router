@@ -230,8 +230,8 @@ fn init_appends_to_a_comment_and_models_table_and_resolves_openrouter() {
     let edited = fs::read_to_string(&config).expect("the appended config should stay UTF-8");
     assert_eq!(
         edited,
-        format!("{ORIGINAL}{BLOCK}"),
-        "the comment and [models] table should stay, then the block"
+        format!("{ORIGINAL}\n{BLOCK}"),
+        "the comment and [models] table should stay, then a blank line, then the block"
     );
     assert_eq!(
         fs::read_to_string(backup_path(&config)).expect("an existing file should be backed up"),
