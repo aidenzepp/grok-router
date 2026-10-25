@@ -1373,16 +1373,23 @@ fn locate_model<'a>(text: &'a str, slug: &str) -> Result<LocatedModel<'a>, Refus
 }
 
 /// Whether `header` is a child table of `slug` rather than another model slug.
+///
+/// A bare slug matches `model.<slug>.…` and `model."<slug>".…`. A dotted slug
+/// matches only the quoted form, so `model.a.b.c` is not a child of `a.b`.
+/// The prefix includes the separating dot, so a longer slug is not a child.
 fn is_child_header(header: &str, slug: &str) -> bool {
     let Some(rest) = header.strip_prefix("model.") else {
         return false;
     };
-    let prefix = if is_bare_slug(slug) {
-        format!("{slug}.")
-    } else {
-        format!("{}.", toml_basic_string(slug))
-    };
-    rest.starts_with(&prefix) && rest.len() > prefix.len()
+    if is_bare_slug(slug) && rest_continues(&format!("{slug}."), rest) {
+        return true;
+    }
+    rest_continues(&format!("{}.", toml_basic_string(slug)), rest)
+}
+
+/// `rest` is another key segment when it is longer than `prefix` and starts with it.
+fn rest_continues(prefix: &str, rest: &str) -> bool {
+    rest.starts_with(prefix) && rest.len() > prefix.len()
 }
 
 /// Copy every line that does not fall inside `ranges`.
@@ -4365,6 +4372,86 @@ default = \"grok-4.7\"
         assert!(
             edited.contains("default = \"grok-4.7\""),
             "the saved default should stay; config: {edited}"
+        );
+    }
+
+    #[test]
+    fn remove_model_keeps_a_slug_that_only_prefixes_the_target() {
+        let config = "\
+[model.or-glm]
+model = \"glm\"
+
+[model.or-glm-5-3]
+model = \"glm-5-3\"
+
+[model.or-glm-5-3.extra_headers]
+anthropic-version = \"2023-06-01\"
+
+[models]
+default = \"grok-4.7\"
+";
+        let edited = remove_model(config, "or-glm").expect("the shorter slug should be removed");
+        assert!(
+            !edited.contains("[model.or-glm]\n"),
+            "the target header should be gone; config: {edited}"
+        );
+        assert!(
+            edited.contains("[model.or-glm-5-3]\n"),
+            "a longer slug should stay; config: {edited}"
+        );
+        assert!(
+            edited.contains("[model.or-glm-5-3.extra_headers]\n"),
+            "the longer slug's child table should stay; config: {edited}"
+        );
+    }
+
+    #[test]
+    fn remove_model_deletes_a_quoted_child_of_a_bare_slug() {
+        let config = "\
+[model.kimi-k3]
+model = \"kimi-k3\"
+
+[model.\"kimi-k3\".extra_headers]
+anthropic-version = \"2023-06-01\"
+
+[model.hub-default]
+model = \"default\"
+
+[models]
+default = \"grok-4.7\"
+";
+        let edited = remove_model(config, "kimi-k3").expect("the bare slug should be removed");
+        assert!(
+            !edited.contains("kimi-k3"),
+            "the bare header and the quoted child should be gone; config: {edited}"
+        );
+        assert!(
+            edited.contains("[model.hub-default]"),
+            "the next model should stay; config: {edited}"
+        );
+    }
+
+    #[test]
+    fn show_model_includes_a_quoted_child_of_a_bare_slug() {
+        let config = "\
+[model.kimi-k3]
+model = \"kimi-k3\"
+
+[model.\"kimi-k3\".extra_headers]
+anthropic-version = \"2023-06-01\"
+
+[models]
+default = \"grok-4.7\"
+";
+        let shown = show_model(config, "kimi-k3").expect("the bare slug should be shown");
+        assert!(
+            shown.body.contains("[model.\"kimi-k3\".extra_headers]"),
+            "a quoted child of a bare slug should be part of the body; body: {}",
+            shown.body
+        );
+        assert!(
+            !shown.builtin,
+            "a configured slug should not be reported as a built-in with no block"
         );
     }
 
