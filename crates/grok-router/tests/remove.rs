@@ -509,3 +509,66 @@ default_reasoning_effort = \"high\"
     assert_file_unchanged(&config, &before);
     remove_temp(&dir);
 }
+
+#[test]
+fn remove_with_yes_deletes_child_tables_and_leaves_the_next_model() {
+    let dir = temp_root("children");
+    let config = dir.join("config.toml");
+    let text = "\
+# kept comment
+
+[model.or-glm-5-3]
+model = \"z-ai/glm-5.3\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"GLM 5.3\"
+env_key = \"OPENROUTER_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 600000
+
+[model.or-glm-5-3.env_http_headers]
+x-api-key = \"OPENROUTER_API_KEY\"
+
+[model.or-glm-5-3.extra_headers]
+anthropic-version = \"2023-06-01\"
+
+[model.or-deepseek-flash]
+model = \"deepseek/deepseek-v4.1-flash-1017\"
+base_url = \"https://openrouter.ai/api/v1\"
+name = \"DeepSeek Flash\"
+env_key = \"OPENROUTER_API_KEY\"
+api_backend = \"chat_completions\"
+context_window = 1000000
+
+[models]
+default = \"grok-4.7\"
+";
+    fs::write(&config, text).expect("the child-table fixture should be written");
+    let output = run(
+        &dir,
+        &["remove", "--yes", "--config", "config.toml", "or-glm-5-3"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "remove --yes should delete a model that has child tables; stderr: {}",
+        stderr_text(&output)
+    );
+    let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
+    assert!(
+        after.contains("# kept comment"),
+        "the comment should stay; config: {after}"
+    );
+    assert!(
+        !after.contains("or-glm-5-3"),
+        "the parent slug and its child headers should be gone; config: {after}"
+    );
+    assert!(
+        after.contains("[model.or-deepseek-flash]"),
+        "the next model should stay; config: {after}"
+    );
+    assert!(
+        after.contains("default = \"grok-4.7\""),
+        "the saved default should stay; config: {after}"
+    );
+    remove_temp(&dir);
+}

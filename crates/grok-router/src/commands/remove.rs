@@ -13,7 +13,7 @@ use crate::OutputMode;
 use crate::config_edit::{self, Backup, RefuseReason};
 use crate::error::Error;
 
-/// Delete one model block from the config. This command deletes a model block.
+/// Delete one model block and its child tables from the config. This command deletes a model block.
 #[derive(Debug, Args)]
 #[command(
     verbatim_doc_comment,

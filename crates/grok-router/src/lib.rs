@@ -150,6 +150,8 @@ impl Cli {
             None | Some(Commands::List(_)) => "list",
             Some(Commands::Search(_)) => "search",
             Some(Commands::Add(_)) => "add",
+            Some(Commands::Show(_)) => "show",
+            Some(Commands::Edit(_)) => "edit",
             Some(Commands::SetDefault(_)) => "set-default",
             Some(Commands::Remove(_)) => "remove",
             Some(Commands::Init(_)) => "init",
@@ -173,10 +175,16 @@ pub enum Commands {
     /// Add one model from the selected provider record, or write one block from --model, --base-url, --env-key, and --api-backend without resolving a provider. This command writes unless --dry-run is set.
     #[command(verbatim_doc_comment)]
     Add(commands::add::AddArgs),
+    /// Show one configured model, or a built-in that has no block. This command does not modify the config.
+    #[command(verbatim_doc_comment)]
+    Show(commands::show::ShowArgs),
+    /// Change fields inside one configured model block. This command writes unless --dry-run is set.
+    #[command(verbatim_doc_comment)]
+    Edit(commands::edit::EditArgs),
     /// Set [models].default for the next session. This does not switch the running session. This command writes the saved default unless --dry-run is set.
     #[command(verbatim_doc_comment)]
     SetDefault(commands::set_default::SetDefaultArgs),
-    /// Delete one model block from the config. This command deletes a model block.
+    /// Delete one model block and its child tables from the config. This command deletes a model block.
     #[command(verbatim_doc_comment)]
     Remove(commands::remove::RemoveArgs),
     /// Write a default `OpenRouter` [router] table when the file has none. An existing [router] table is left unchanged. This command writes unless --dry-run is set.
