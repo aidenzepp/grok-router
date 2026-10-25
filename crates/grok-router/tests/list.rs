@@ -584,17 +584,40 @@ fn completions_bash_prints_a_script_without_reading_config() {
 }
 
 #[test]
-fn schema_prints_a_json_schema_without_reading_config() {
+fn schema_is_rejected_and_creates_no_config() {
     let dir = temp_root("schema");
     let output = run(&dir, &["schema"]);
     let stdout = stdout_text(&output);
-    assert_eq!(exit_code(&output), 0, "schema should exit 0; stderr: {}", stderr_text(&output));
-    let body: serde_json::Value = serde_json::from_str(stdout.trim()).expect("schema should be JSON");
+    let stderr = stderr_text(&output);
+    assert_ne!(exit_code(&output), 0, "schema should be rejected; stderr: {stderr}");
     assert!(
-        body.get("$schema").and_then(|value| value.as_str()).is_some_and(|schema| schema.contains("json-schema.org")),
-        "schema should name a JSON Schema dialect; stdout: {stdout}"
+        stderr.contains("unrecognized subcommand") && stderr.contains("schema"),
+        "schema should be an unknown command; stderr: {stderr}"
     );
-    assert!(!dir.join("config.toml").exists(), "schema should not create a config");
+    assert!(
+        !stdout.contains("$schema") && !stdout.contains("json-schema.org") && !stderr.contains("json-schema.org"),
+        "schema should not print a schema document; stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        !dir.join("config.toml").exists() && !dir.join(".grok").exists(),
+        "schema should not create a config"
+    );
+    let help = run(&dir, &["help"]);
+    let help_text = format!("{}{}", stdout_text(&help), stderr_text(&help));
+    assert!(
+        !help_text.to_lowercase().contains("schema"),
+        "grok-router help should not list schema; output: {help_text}"
+    );
+    let long = run(&dir, &["--help"]);
+    let long_text = format!("{}{}", stdout_text(&long), stderr_text(&long));
+    assert!(
+        !long_text.to_lowercase().contains("schema"),
+        "grok-router --help should not list schema; output: {long_text}"
+    );
+    assert!(
+        !dir.join("config.toml").exists() && !dir.join(".grok").exists(),
+        "help should not create a config"
+    );
     remove_temp(&dir);
 }
 

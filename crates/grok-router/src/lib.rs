@@ -151,7 +151,6 @@ impl Cli {
             Some(Commands::SetDefault(_)) => "set-default",
             Some(Commands::Remove(_)) => "remove",
             Some(Commands::Completions(_)) => "completions",
-            Some(Commands::Schema(_)) => "schema",
             Some(Commands::Skill(args)) => args.command_name(),
             Some(Commands::Internal(_)) => "skill",
         }
@@ -183,9 +182,6 @@ pub enum Commands {
     /// Print a shell completion script. This command does not read a config and does not use the network.
     #[command(verbatim_doc_comment)]
     Completions(CompletionsArgs),
-    /// Print the JSON Schema (draft 2020-12) for this command's JSON output. This command does not read a config and does not use the network.
-    #[command(verbatim_doc_comment)]
-    Schema(SchemaArgs),
     /// Print the built-in skill guide. Not a human command. This command does not modify anything.
     #[command(name = "__internal", hide = true, verbatim_doc_comment)]
     Internal(commands::skill::InternalArgs),
@@ -210,25 +206,6 @@ impl CompletionsArgs {
         match render_completion(&self.shell, mode) {
             Ok(body) => write_stdout(mode, &body, "completion script", "completions"),
             Err(err) => fail_message(mode, "completions", &err),
-        }
-    }
-}
-
-/// Print the JSON Schema (draft 2020-12) for this command's JSON output. This command does not read a config and does not use the network.
-#[derive(Debug, Args)]
-#[command(
-    verbatim_doc_comment,
-    after_help = "Examples:\n  grok-router schema\n  grok-router schema --output json"
-)]
-pub struct SchemaArgs;
-
-impl SchemaArgs {
-    /// Print the schema. Does not read a config and does not use the network.
-    #[must_use]
-    pub fn run(&self, mode: OutputMode) -> i32 {
-        match schema_document() {
-            Ok(body) => write_stdout(mode, &body, "schema", "schema"),
-            Err(err) => fail_message(mode, "schema", &err),
         }
     }
 }
@@ -313,30 +290,6 @@ fn completion_script(shell: &str) -> Result<String, error::Error> {
         error::Error::command(
             "the completion script was not valid UTF-8, so nothing was written. Retry completions.",
         )
-    })
-}
-
-/// JSON Schema (draft 2020-12) for the JSON values this command prints.
-///
-/// # Errors
-///
-/// Returns an error when the document cannot be encoded.
-fn schema_document() -> Result<String, error::Error> {
-    let body = serde_json::json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://grok-router.local/output.schema.json",
-        "title": "grok-router JSON output",
-        "description": "One JSON value. json and jsonl print this same value.",
-        "oneOf": [
-            {"type": "array"},
-            {"type": "object"},
-            {"type": "string"}
-        ]
-    });
-    serde_json::to_string(&body).map_err(|err| {
-        error::Error::command(format!(
-            "could not encode the output schema as JSON: {err}. Retry schema."
-        ))
     })
 }
 

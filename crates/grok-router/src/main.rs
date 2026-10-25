@@ -55,7 +55,6 @@ fn dispatch(cli: &Cli, mode: OutputMode) -> i32 {
         Some(Commands::Remove(args)) => remove::run(config, args, mode),
         Some(Commands::Skill(args)) => skill::run(args, mode),
         Some(Commands::Completions(args)) => args.run(mode),
-        Some(Commands::Schema(args)) => args.run(mode),
         Some(Commands::Internal(args)) => skill::run_internal(args, mode),
     }
 }
@@ -199,7 +198,6 @@ fn usage_command_name() -> &'static str {
             "set-default" => "set-default",
             "remove" => "remove",
             "completions" => "completions",
-            "schema" => "schema",
             "skill" | "__internal" => "skill",
             _ => "grok-router",
         };
