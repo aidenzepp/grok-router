@@ -1,10 +1,14 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "tests report failures rather than document callable contracts"
-    )
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "these files are integration-test crates, so clippy.toml allow-expect-in-tests and allow-panic-in-tests do not see the helpers"
+)]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
 )]
 
 //! `grok-router list` prints the saved default and configured models.
@@ -61,10 +65,8 @@ fn remove_temp(path: &Path) {
 }
 
 fn temp_root(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "grok-router-list-{label}-{}",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("grok-router-list-{label}-{}", std::process::id()));
     remove_temp(&path);
     fs::create_dir_all(&path).expect("the temp list directory should be created");
     path
@@ -110,6 +112,13 @@ fn exit_code(output: &std::process::Output) -> i32 {
         .expect("the child should have an exit status")
 }
 
+fn json_field<'a>(value: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+    match value.get(key) {
+        Some(field) => field,
+        None => panic!("{key} should be present in {value}"),
+    }
+}
+
 fn write_pair(dir: &Path) -> (PathBuf, PathBuf) {
     let config = dir.join("named.toml");
     let decoy = dir.join("config.toml");
@@ -121,7 +130,8 @@ fn write_pair(dir: &Path) -> (PathBuf, PathBuf) {
 fn assert_same_bytes(path: &Path, before: &[u8], label: &str) {
     let after = fs::read(path).expect("the config should still be readable");
     assert_eq!(
-        after, before,
+        after,
+        before,
         "{label} should leave {} byte-identical",
         path.display()
     );
@@ -373,10 +383,7 @@ fn missing_config_exits_1_and_says_what_to_do_next() {
         stderr.contains("pass --config") || stderr.contains("Create the file"),
         "the error should say what to do next; stderr: {stderr}"
     );
-    assert!(
-        !missing.exists(),
-        "a missing config must not be created"
-    );
+    assert!(!missing.exists(), "a missing config must not be created");
     remove_temp(&dir);
 }
 
@@ -452,17 +459,38 @@ fn root_help_shows_global_output_flags_and_a_shorter_short_help() {
     let short = run(&dir, &["-h"]);
     let long_text = stdout_text(&long);
     let short_text = stdout_text(&short);
-    assert_eq!(exit_code(&long), 0, "long help should exit 0; stderr: {}", stderr_text(&long));
-    assert_eq!(exit_code(&short), 0, "short help should exit 0; stderr: {}", stderr_text(&short));
-    assert!(long_text.contains("--output"), "root help should show --output; help: {long_text}");
-    assert!(long_text.contains("--json"), "root help should show --json; help: {long_text}");
-    assert!(long_text.contains("--quiet"), "root help should show --quiet; help: {long_text}");
+    assert_eq!(
+        exit_code(&long),
+        0,
+        "long help should exit 0; stderr: {}",
+        stderr_text(&long)
+    );
+    assert_eq!(
+        exit_code(&short),
+        0,
+        "short help should exit 0; stderr: {}",
+        stderr_text(&short)
+    );
+    assert!(
+        long_text.contains("--output"),
+        "root help should show --output; help: {long_text}"
+    );
+    assert!(
+        long_text.contains("--json"),
+        "root help should show --json; help: {long_text}"
+    );
+    assert!(
+        long_text.contains("--quiet"),
+        "root help should show --quiet; help: {long_text}"
+    );
     assert!(
         long_text.contains("[default: text]"),
         "root help should print the text default; help: {long_text}"
     );
     assert!(
-        long_text.contains("$GROK_HOME") && long_text.contains("~/.grok") && long_text.contains("require --config"),
+        long_text.contains("$GROK_HOME")
+            && long_text.contains("~/.grok")
+            && long_text.contains("require --config"),
         "config help should name the default read path and the write requirement; help: {long_text}"
     );
     assert!(
@@ -483,12 +511,16 @@ fn root_help_shows_global_output_flags_and_a_shorter_short_help() {
                 waiting = false;
             }
         }
-        if line.contains("grok-router list --config config.toml") && !line.contains("--output json") {
+        if line.contains("grok-router list --config config.toml") && !line.contains("--output json")
+        {
             waiting = true;
             distance = 0;
         }
     }
-    assert!(paired, "help should pair a text list with --output json within five lines; help: {long_text}");
+    assert!(
+        paired,
+        "help should pair a text list with --output json within five lines; help: {long_text}"
+    );
     remove_temp(&dir);
 }
 
@@ -497,19 +529,43 @@ fn output_json_on_help_and_version_prints_one_json_value() {
     let dir = temp_root("help-json");
     let help = run(&dir, &["--help", "--output", "json"]);
     let version = run(&dir, &["--version", "--output", "json"]);
-    assert_eq!(exit_code(&help), 0, "json help should exit 0; stderr: {}", stderr_text(&help));
-    assert_eq!(exit_code(&version), 0, "json version should exit 0; stderr: {}", stderr_text(&version));
+    assert_eq!(
+        exit_code(&help),
+        0,
+        "json help should exit 0; stderr: {}",
+        stderr_text(&help)
+    );
+    assert_eq!(
+        exit_code(&version),
+        0,
+        "json version should exit 0; stderr: {}",
+        stderr_text(&version)
+    );
     let help_body: serde_json::Value = serde_json::from_str(stdout_text(&help).trim())
         .expect("json help should be one JSON value");
     assert!(help_body.is_object(), "json help should be one JSON object");
     let version_body: serde_json::Value = serde_json::from_str(stdout_text(&version).trim())
         .expect("json version should be one JSON value");
-    assert!(version_body.get("version").is_some(), "json version should name version");
-    let bad = run(&dir, &["--this-flag-does-not-exist-anc", "--output", "json"]);
-    assert_eq!(exit_code(&bad), 2, "a bad flag should exit 2; stderr: {}", stderr_text(&bad));
+    assert!(
+        version_body.get("version").is_some(),
+        "json version should name version"
+    );
+    let bad = run(
+        &dir,
+        &["--this-flag-does-not-exist-anc", "--output", "json"],
+    );
+    assert_eq!(
+        exit_code(&bad),
+        2,
+        "a bad flag should exit 2; stderr: {}",
+        stderr_text(&bad)
+    );
     let bad_body: serde_json::Value = serde_json::from_str(stderr_text(&bad).trim())
         .expect("a bad flag in json mode should print one JSON value on stderr");
-    assert!(bad_body.get("message").is_some(), "the usage error should include a message");
+    assert!(
+        bad_body.get("message").is_some(),
+        "the usage error should include a message"
+    );
     remove_temp(&dir);
 }
 
@@ -524,7 +580,12 @@ fn env_selects_json_and_an_explicit_flag_wins() {
         .args(["list", "--config", &config_arg])
         .output()
         .expect("the grok-router binary should start");
-    assert_eq!(exit_code(&from_env), 0, "env json should list; stderr: {}", stderr_text(&from_env));
+    assert_eq!(
+        exit_code(&from_env),
+        0,
+        "env json should list; stderr: {}",
+        stderr_text(&from_env)
+    );
     let env_body: serde_json::Value = serde_json::from_str(stdout_text(&from_env).trim())
         .expect("GROK_ROUTER_OUTPUT=json should print JSON");
     assert!(env_body.is_array(), "env json list should be a JSON array");
@@ -533,7 +594,12 @@ fn env_selects_json_and_an_explicit_flag_wins() {
         .args(["list", "--config", &config_arg, "--output", "text"])
         .output()
         .expect("the grok-router binary should start");
-    assert_eq!(exit_code(&forced_text), 0, "explicit text should win; stderr: {}", stderr_text(&forced_text));
+    assert_eq!(
+        exit_code(&forced_text),
+        0,
+        "explicit text should win; stderr: {}",
+        stderr_text(&forced_text)
+    );
     assert!(
         !stdout_text(&forced_text).trim_start().starts_with('['),
         "explicit --output text should stay text; stdout: {}",
@@ -541,12 +607,48 @@ fn env_selects_json_and_an_explicit_flag_wins() {
     );
     let json_flag = run(&dir, &["list", "--config", &config_arg, "--json"]);
     let as_json = run(&dir, &["list", "--config", &config_arg, "--output", "json"]);
-    let as_jsonl = run(&dir, &["list", "--config", &config_arg, "--output", "jsonl"]);
-    assert_eq!(exit_code(&json_flag), 0, "--json should take no value; stderr: {}", stderr_text(&json_flag));
-    assert_eq!(stdout_text(&as_json), stdout_text(&as_jsonl), "json and jsonl should print the same value");
-    let conflict = run(&dir, &["list", "--config", &config_arg, "--json", "--output", "text"]);
-    assert_ne!(exit_code(&conflict), 0, "--json with --output text should fail");
-    let quiet = run(&dir, &["list", "--config", &config_arg, "--quiet", "--output", "json"]);
+    let as_jsonl = run(
+        &dir,
+        &["list", "--config", &config_arg, "--output", "jsonl"],
+    );
+    assert_eq!(
+        exit_code(&json_flag),
+        0,
+        "--json should take no value; stderr: {}",
+        stderr_text(&json_flag)
+    );
+    assert_eq!(
+        stdout_text(&as_json),
+        stdout_text(&as_jsonl),
+        "json and jsonl should print the same value"
+    );
+    let conflict = run(
+        &dir,
+        &[
+            "list",
+            "--config",
+            &config_arg,
+            "--json",
+            "--output",
+            "text",
+        ],
+    );
+    assert_ne!(
+        exit_code(&conflict),
+        0,
+        "--json with --output text should fail"
+    );
+    let quiet = run(
+        &dir,
+        &[
+            "list",
+            "--config",
+            &config_arg,
+            "--quiet",
+            "--output",
+            "json",
+        ],
+    );
     assert_ne!(exit_code(&quiet), 0, "--quiet with json should fail");
     assert!(
         stderr_text(&quiet).contains("quiet"),
@@ -561,7 +663,12 @@ fn completions_bash_prints_a_script_without_reading_config() {
     let dir = temp_root("completions");
     let output = run(&dir, &["completions", "bash"]);
     let stdout = stdout_text(&output);
-    assert_eq!(exit_code(&output), 0, "completions bash should exit 0; stderr: {}", stderr_text(&output));
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "completions bash should exit 0; stderr: {}",
+        stderr_text(&output)
+    );
     assert!(
         stdout.contains("grok-router") && stdout.contains("complete"),
         "bash completions should be a completion script; stdout: {stdout}"
@@ -572,9 +679,16 @@ fn completions_bash_prints_a_script_without_reading_config() {
     );
     let unknown = run(&dir, &["completions", "nope"]);
     let stderr = stderr_text(&unknown);
-    assert_eq!(exit_code(&unknown), 1, "an unknown shell should exit 1; stderr: {stderr}");
+    assert_eq!(
+        exit_code(&unknown),
+        1,
+        "an unknown shell should exit 1; stderr: {stderr}"
+    );
     for name in ["bash", "zsh", "fish", "elvish", "powershell"] {
-        assert!(stderr.contains(name), "the refusal should list {name}; stderr: {stderr}");
+        assert!(
+            stderr.contains(name),
+            "the refusal should list {name}; stderr: {stderr}"
+        );
     }
     assert!(
         stderr.contains("not read"),
@@ -589,13 +703,19 @@ fn schema_is_rejected_and_creates_no_config() {
     let output = run(&dir, &["schema"]);
     let stdout = stdout_text(&output);
     let stderr = stderr_text(&output);
-    assert_ne!(exit_code(&output), 0, "schema should be rejected; stderr: {stderr}");
+    assert_ne!(
+        exit_code(&output),
+        0,
+        "schema should be rejected; stderr: {stderr}"
+    );
     assert!(
         stderr.contains("unrecognized subcommand") && stderr.contains("schema"),
         "schema should be an unknown command; stderr: {stderr}"
     );
     assert!(
-        !stdout.contains("$schema") && !stdout.contains("json-schema.org") && !stderr.contains("json-schema.org"),
+        !stdout.contains("$schema")
+            && !stdout.contains("json-schema.org")
+            && !stderr.contains("json-schema.org"),
         "schema should not print a schema document; stdout: {stdout}; stderr: {stderr}"
     );
     assert!(
@@ -676,14 +796,37 @@ fn list_limit_keeps_the_first_rows_and_drops_the_rest() {
     );
     let json = run(
         &dir,
-        &["list", "--config", &config_arg, "--limit", "1", "--output", "json"],
+        &[
+            "list",
+            "--config",
+            &config_arg,
+            "--limit",
+            "1",
+            "--output",
+            "json",
+        ],
     );
-    assert_eq!(exit_code(&json), 0, "json --limit should list; stderr: {}", stderr_text(&json));
+    assert_eq!(
+        exit_code(&json),
+        0,
+        "json --limit should list; stderr: {}",
+        stderr_text(&json)
+    );
     let body: serde_json::Value =
         serde_json::from_str(stdout_text(&json).trim()).expect("limited json should be one value");
     let rows = body.as_array().expect("limited json should stay an array");
-    assert_eq!(rows.len(), 1, "json --limit 1 should keep one object; body: {body}");
-    assert_eq!(rows[0]["slug"], "or-deepseek-flash");
+    assert_eq!(
+        rows.len(),
+        1,
+        "json --limit 1 should keep one object; body: {body}"
+    );
+    assert_eq!(
+        json_field(
+            rows.first().expect("limited json should keep one row"),
+            "slug"
+        ),
+        "or-deepseek-flash"
+    );
     let quiet = run(
         &dir,
         &["list", "--config", &config_arg, "--limit", "1", "--quiet"],
@@ -763,21 +906,22 @@ fn json_error_carries_command_format_and_the_text_sentence() {
     );
     let body: serde_json::Value = serde_json::from_str(stderr_text(&json).trim())
         .expect("a json failure should be one JSON object");
-    assert_eq!(body["command"], "list");
-    assert_eq!(body["format"], "json");
-    assert_eq!(body["error"], "list_config_missing");
-    assert_eq!(body["kind"], "list_config_missing");
+    assert_eq!(json_field(&body, "command"), "list");
+    assert_eq!(json_field(&body, "format"), "json");
+    assert_eq!(json_field(&body, "error"), "list_config_missing");
+    assert_eq!(json_field(&body, "kind"), "list_config_missing");
     assert_eq!(
-        body["message"].as_str(),
+        json_field(&body, "message").as_str(),
         Some(sentence.trim()),
         "the json message should be the text sentence"
     );
-    let jsonl = run(
-        &dir,
-        &["list", "--config", &missing_arg, "--jsonl"],
-    );
+    let jsonl = run(&dir, &["list", "--config", &missing_arg, "--jsonl"]);
     let jsonl_body: serde_json::Value = serde_json::from_str(stderr_text(&jsonl).trim())
         .expect("jsonl should still be one JSON object");
-    assert_eq!(jsonl_body["format"], "json", "jsonl errors use format json");
+    assert_eq!(
+        json_field(&jsonl_body, "format"),
+        "json",
+        "jsonl errors use format json"
+    );
     remove_temp(&dir);
 }

@@ -1,10 +1,14 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "tests report failures rather than document callable contracts"
-    )
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "these files are integration-test crates, so clippy.toml allow-expect-in-tests and allow-panic-in-tests do not see the helpers"
+)]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
 )]
 
 //! `grok-router set-default` writes `[models].default` in a temp config.
@@ -121,7 +125,9 @@ fn assert_model_span_and_effort(text: &str) {
         "default_reasoning_effort should stay; config: {text}"
     );
     assert_eq!(
-        text.lines().filter(|line| line.starts_with("[model.")).count(),
+        text.lines()
+            .filter(|line| line.starts_with("[model."))
+            .count(),
         1,
         "set-default should not add or remove a model span; config: {text}"
     );
@@ -189,7 +195,8 @@ fn set_default_saves_a_builtin_and_leaves_the_model_span() {
         "the previous default line should be replaced; config: {after}"
     );
     assert_model_span_and_effort(&after);
-    let previous = fs::read(backup_path(&config)).expect("a real write should leave a sibling backup");
+    let previous =
+        fs::read(backup_path(&config)).expect("a real write should leave a sibling backup");
     assert_eq!(
         previous, before,
         "the sibling backup should be the original bytes"
@@ -217,8 +224,14 @@ fn set_default_saves_a_configured_slug_and_leaves_the_model_span() {
         0,
         "setting a configured slug should exit 0; stderr: {stderr}; stdout: {stdout}"
     );
-    assert!(stderr.is_empty(), "stderr should stay empty; stderr: {stderr}");
-    assert_eq!(stdout, "or-glm-5-3\n", "stdout should be the configured slug");
+    assert!(
+        stderr.is_empty(),
+        "stderr should stay empty; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout, "or-glm-5-3\n",
+        "stdout should be the configured slug"
+    );
     let after = fs::read_to_string(&config).expect("the edited config should be UTF-8");
     assert!(
         after.contains("default = \"or-glm-5-3\"\n"),
@@ -258,7 +271,10 @@ fn an_unknown_slug_exits_1_and_leaves_the_file() {
         "the failure should say what to pass next; stderr: {stderr}"
     );
     let after = fs::read(&config).expect("the config fixture should still exist");
-    assert_eq!(after, before, "an unknown slug should leave the file bytes identical");
+    assert_eq!(
+        after, before,
+        "an unknown slug should leave the file bytes identical"
+    );
     assert!(
         !backup_path(&config).exists(),
         "an unknown slug should not write a backup"
@@ -296,7 +312,10 @@ fn dry_run_prints_the_slug_and_changes_nothing() {
         stdout.contains("would save"),
         "--dry-run should say it would save the slug; stdout: {stdout}"
     );
-    assert!(stderr.is_empty(), "dry-run should not prompt; stderr: {stderr}");
+    assert!(
+        stderr.is_empty(),
+        "dry-run should not prompt; stderr: {stderr}"
+    );
     let after = fs::read(&config).expect("the config fixture should still exist");
     assert_eq!(after, before, "--dry-run should leave the file unchanged");
     assert!(

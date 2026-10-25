@@ -1,10 +1,14 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "tests report failures rather than document callable contracts"
-    )
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "these files are integration-test crates, so clippy.toml allow-expect-in-tests and allow-panic-in-tests do not see the helpers"
+)]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
 )]
 
 //! `grok-router skill` installs a short stub and prints the guide.
@@ -59,9 +63,9 @@ fn setup_status_show_and_internal_guide_agree() {
         stderr_text(&setup)
     );
     let setup_json = json_stdout(&setup);
-    assert_eq!(setup_json["status"], "current");
-    assert_eq!(setup_json["effect"], "wrote");
-    assert_eq!(setup_json["dry_run"], false);
+    assert_eq!(json_field(&setup_json, "status"), "current");
+    assert_eq!(json_field(&setup_json, "effect"), "wrote");
+    assert_eq!(json_field(&setup_json, "dry_run"), false);
 
     let file = fixture.skills.join("grok-router").join("SKILL.md");
     let body = fs::read_to_string(&file).expect("setup should write SKILL.md");
@@ -97,13 +101,23 @@ fn setup_status_show_and_internal_guide_agree() {
         "--output",
         "json",
     ]);
-    assert_eq!(exit_code(&status_json), 0, "stderr: {}", stderr_text(&status_json));
-    assert_eq!(json_stdout(&status_json)["status"], "current");
+    assert_eq!(
+        exit_code(&status_json),
+        0,
+        "stderr: {}",
+        stderr_text(&status_json)
+    );
+    assert_eq!(json_field(&json_stdout(&status_json), "status"), "current");
 
     let show = fixture.run(&["skill", "show"]);
     let internal = fixture.run(&["__internal", "skill"]);
     assert_eq!(exit_code(&show), 0, "stderr: {}", stderr_text(&show));
-    assert_eq!(exit_code(&internal), 0, "stderr: {}", stderr_text(&internal));
+    assert_eq!(
+        exit_code(&internal),
+        0,
+        "stderr: {}",
+        stderr_text(&internal)
+    );
     let guide = stdout_text(&show);
     assert_eq!(
         guide,
@@ -156,8 +170,8 @@ fn second_setup_does_not_write_a_second_stub() {
         "a second setup should not write; stderr: {}",
         stderr_text(&again)
     );
-    assert_eq!(json_stdout(&again)["effect"], "unchanged");
-    assert_eq!(json_stdout(&again)["status"], "current");
+    assert_eq!(json_field(&json_stdout(&again), "effect"), "unchanged");
+    assert_eq!(json_field(&json_stdout(&again), "status"), "current");
     let after = fs::read(fixture.skills.join("grok-router").join("SKILL.md"))
         .expect("the stub should still be readable");
     assert_eq!(before, after);
@@ -172,7 +186,12 @@ fn second_setup_does_not_write_a_second_stub() {
 fn remove_yes_deletes_only_a_marked_stub_directory() {
     let fixture = Fixture::open("remove-yes");
     let installed = fixture.run(&["skill", "setup", "--skill-root", &fixture.skills_arg]);
-    assert_eq!(exit_code(&installed), 0, "stderr: {}", stderr_text(&installed));
+    assert_eq!(
+        exit_code(&installed),
+        0,
+        "stderr: {}",
+        stderr_text(&installed)
+    );
     let notes = fixture.skills.join("notes");
     fs::create_dir_all(&notes).expect("a sibling directory should be created");
     fs::write(notes.join("keep.txt"), b"keep\n").expect("a sibling file should be written");
@@ -187,8 +206,8 @@ fn remove_yes_deletes_only_a_marked_stub_directory() {
         "--json",
     ]);
     assert_eq!(exit_code(&preview), 0, "stderr: {}", stderr_text(&preview));
-    assert_eq!(json_stdout(&preview)["effect"], "would_remove");
-    assert_eq!(json_stdout(&preview)["dry_run"], true);
+    assert_eq!(json_field(&json_stdout(&preview), "effect"), "would_remove");
+    assert_eq!(json_field(&json_stdout(&preview), "dry_run"), true);
     assert!(
         fixture
             .skills
@@ -237,8 +256,16 @@ fn unmarked_directory_is_left_in_place() {
     let before = tree(&fixture.skills);
 
     let setup = fixture.run(&["skill", "setup", "--skill-root", &fixture.skills_arg]);
-    assert_eq!(exit_code(&setup), 1, "setup should refuse a foreign directory");
-    assert_eq!(tree(&fixture.skills), before, "setup should not replace a foreign directory");
+    assert_eq!(
+        exit_code(&setup),
+        1,
+        "setup should refuse a foreign directory"
+    );
+    assert_eq!(
+        tree(&fixture.skills),
+        before,
+        "setup should not replace a foreign directory"
+    );
 
     let removed = fixture.run(&[
         "skill",
@@ -249,7 +276,7 @@ fn unmarked_directory_is_left_in_place() {
         "--json",
     ]);
     assert_eq!(exit_code(&removed), 0, "stderr: {}", stderr_text(&removed));
-    assert_eq!(json_stdout(&removed)["effect"], "left");
+    assert_eq!(json_field(&json_stdout(&removed), "effect"), "left");
     assert_eq!(tree(&fixture.skills), before);
 }
 
@@ -261,22 +288,34 @@ fn remove_without_yes_and_dry_run_change_nothing() {
         "skill",
         "setup",
         "--skill-root",
-        &absent.to_str().expect("the absent path should be utf-8"),
+        absent.to_str().expect("the absent path should be utf-8"),
         "--dry-run",
     ]);
-    assert_eq!(exit_code(&dry_setup), 0, "stderr: {}", stderr_text(&dry_setup));
+    assert_eq!(
+        exit_code(&dry_setup),
+        0,
+        "stderr: {}",
+        stderr_text(&dry_setup)
+    );
     assert!(
         stdout_text(&dry_setup).contains("would write"),
         "dry-run setup should say what it would write; stdout: {}",
         stdout_text(&dry_setup)
     );
     assert!(
-        !absent.try_exists().expect("the absent path should be stat-able"),
+        !absent
+            .try_exists()
+            .expect("the absent path should be stat-able"),
         "dry-run setup should not create the skill root"
     );
 
     let installed = fixture.run(&["skill", "setup", "--skill-root", &fixture.skills_arg]);
-    assert_eq!(exit_code(&installed), 0, "stderr: {}", stderr_text(&installed));
+    assert_eq!(
+        exit_code(&installed),
+        0,
+        "stderr: {}",
+        stderr_text(&installed)
+    );
     let before = tree(&fixture.skills);
 
     let refused = fixture.run(&[
@@ -293,9 +332,9 @@ fn remove_without_yes_and_dry_run_change_nothing() {
         stdout_text(&refused)
     );
     let err = stderr_json(&refused);
-    assert_eq!(err["kind"], "refused");
+    assert_eq!(json_field(&err, "kind"), "refused");
     assert!(
-        err["message"]
+        json_field(&err, "message")
             .as_str()
             .expect("the refusal message should be a string")
             .contains("--yes"),
@@ -395,10 +434,8 @@ fn help_states_examples_and_whether_the_command_writes() {
 
 impl Fixture {
     fn open(label: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "grok-router-skill-{label}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("grok-router-skill-{label}-{}", std::process::id()));
         remove_temp(&dir);
         let home = dir.join("home");
         let skills = dir.join("skills");
@@ -470,6 +507,13 @@ fn json_stdout(output: &Output) -> serde_json::Value {
     serde_json::from_str(stdout_text(output).trim()).expect("stdout should be one JSON object")
 }
 
+fn json_field<'a>(value: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+    match value.get(key) {
+        Some(field) => field,
+        None => panic!("{key} should be present in {value}"),
+    }
+}
+
 fn stderr_json(output: &Output) -> serde_json::Value {
     serde_json::from_str(stderr_text(output).trim()).expect("stderr should be one JSON object")
 }
@@ -477,7 +521,9 @@ fn stderr_json(output: &Output) -> serde_json::Value {
 fn assert_no_hook_or_settings(root: &Path) {
     for path in tree(root).keys() {
         assert!(
-            !path.ends_with("settings.json") && !path.ends_with("hooks.json") && !path.contains("hooks"),
+            !path.ends_with("settings.json")
+                && !path.ends_with("hooks.json")
+                && !path.contains("hooks"),
             "the skill root should not contain a hook or settings.json; found {path}"
         );
     }
@@ -550,6 +596,12 @@ fn make_writable(path: &Path) {
         return;
     };
     let mut perms = meta.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(perms.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
     perms.set_readonly(false);
     match fs::set_permissions(path, perms) {
         Ok(()) | Err(_) => {}

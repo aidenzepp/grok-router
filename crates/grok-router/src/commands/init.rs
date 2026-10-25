@@ -1,6 +1,6 @@
 //! `init` subcommand.
 //!
-//! Writes a default OpenRouter `[router]` table when the file has none.
+//! Writes a default `OpenRouter` `[router]` table when the file has none.
 //! `--config` selects the file. Otherwise the path is
 //! `${GROK_HOME:-$HOME/.grok}/config.toml`. `--dry-run` does not create or replace the file.
 
@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use crate::OutputMode;
 use crate::config_edit::{self, Backup, RouterInit, RouterInitError};
 use crate::error::Error;
-use crate::OutputMode;
 
-/// Write a default OpenRouter [router] table when the file has none. An existing [router] table is left unchanged. This command writes unless --dry-run is set.
+/// Write a default `OpenRouter` [router] table when the file has none. An existing [router] table is left unchanged. This command writes unless --dry-run is set.
 #[derive(Debug, Args)]
 #[command(
     verbatim_doc_comment,
@@ -41,6 +41,10 @@ pub fn run(config: Option<&str>, args: &InitArgs, mode: OutputMode) -> i32 {
 }
 
 /// Resolve the path, append the router block unless one is already a table, and write unless this is `--dry-run`.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved, the existing `[router]` value is not a table, or the write fails.
 fn apply(config: Option<&str>, dry_run: bool, mode: OutputMode) -> Result<String, Error> {
     let path = config_path(config)?;
     let report = match read_config(&path)? {
@@ -71,10 +75,10 @@ fn config_path(config: Option<&str>) -> Result<PathBuf, Error> {
 /// Returns an error when `GROK_HOME` is unset or empty and `HOME` cannot name a path.
 /// Nothing is written.
 fn default_config_path() -> Result<PathBuf, Error> {
-    if let Some(grok_home) = env::var_os("GROK_HOME") {
-        if !grok_home.is_empty() {
-            return Ok(PathBuf::from(grok_home).join("config.toml"));
-        }
+    if let Some(grok_home) = env::var_os("GROK_HOME")
+        && !grok_home.is_empty()
+    {
+        return Ok(PathBuf::from(grok_home).join("config.toml"));
     }
     match env::var_os("HOME") {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".grok").join("config.toml")),
@@ -108,7 +112,7 @@ fn read_config(path: &Path) -> Result<Option<String>, Error> {
     }
 }
 
-/// Create the missing file as the OpenRouter block. A missing file has nothing to back up.
+/// Create the missing file as the `OpenRouter` block. A missing file has nothing to back up.
 ///
 /// `replace_file` reads the existing bytes before it writes, so a new file uses [`config_edit::create_file`].
 ///
@@ -175,6 +179,10 @@ fn report(path: &Path, wrote: bool, unchanged: bool, dry_run: bool) -> InitRepor
 }
 
 /// Human text, the same line for quiet, or one JSON object.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the report cannot be encoded.
 fn render(mode: OutputMode, report: &InitReport) -> Result<String, Error> {
     if mode == OutputMode::Json {
         return serde_json::to_string(report).map_err(|err| Error::JsonEncode {
@@ -197,10 +205,7 @@ fn status_line(report: &InitReport) -> String {
     if report.wrote {
         return format!("{} wrote", report.path);
     }
-    format!(
-        "{} already has [router]; nothing was written",
-        report.path
-    )
+    format!("{} already has [router]; nothing was written", report.path)
 }
 
 /// Write the body and a trailing newline. A closed pipe is success.

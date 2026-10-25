@@ -3,6 +3,10 @@ name = "grok-router"
 version = "0.1.0"
 edition = "2024"
 description = "grok-router command line"
+repository = "https://github.com/aidenzepp/grok-router"
+readme = "../../README.md"
+keywords = ["cli", "grok", "config"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }

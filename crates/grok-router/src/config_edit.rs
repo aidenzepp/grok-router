@@ -7,8 +7,8 @@
 //! [`read_configured`] reports the saved default and configured models and does
 //! not change the text. [`resolve_provider`] reads one
 //! `[router.provider.<name>]` record and does not fall back to a compiled
-//! OpenRouter URL. [`builtins_from`] reads `builtins` from `[router]`.
-//! [`init_router_text`] appends a default OpenRouter `[router]` table when that
+//! `OpenRouter` URL. [`builtins_from`] reads `builtins` from `[router]`.
+//! [`init_router_text`] appends a default `OpenRouter` `[router]` table when that
 //! key is absent and leaves every earlier byte in place.
 //! None of the readers write the document. Model splices do not write `[router]` back.
 
@@ -234,7 +234,7 @@ pub enum RefuseReason {
 }
 
 impl RefuseReason {
-    /// Snake_case name of this refusal.
+    /// `Snake_case` name of this refusal.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -322,7 +322,7 @@ pub struct ReplaceError {
 }
 
 impl ReplaceError {
-    /// Snake_case name of the failed replace step.
+    /// `Snake_case` name of the failed replace step.
     #[must_use]
     pub const fn failure_kind(&self) -> &'static str {
         match self.kind {
@@ -357,7 +357,7 @@ pub enum SecretError {
 }
 
 impl SecretError {
-    /// Snake_case name of this secret refusal.
+    /// `Snake_case` name of this secret refusal.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -393,7 +393,7 @@ struct Span {
 /// [`ProviderChoice::Default`] reads `default_provider` and refuses when `[router]`
 /// is missing, when that key is missing, blank, or not a string, or when the
 /// named record is missing. A miss is [`RefuseReason::InvalidSetting`]. It is
-/// not a compiled OpenRouter URL, and another provider record is not a silent
+/// not a compiled `OpenRouter` URL, and another provider record is not a silent
 /// default. `base_url` must match `^https?://\S+$` and `env_key` must match
 /// `^[A-Za-z_][A-Za-z0-9_]*$`, both with no trim. Absent or blank `catalog`
 /// is [`None`]. Any other string is returned as written. This function does
@@ -665,13 +665,13 @@ fn render_direct_block(block: &DirectBlock<'_>) -> Result<String, RefuseReason> 
             "must match ^https?://\\S+$ with no trim",
         ));
     }
-    if let Some(name) = block.name {
-        if name.is_empty() {
-            return Err(invalid_setting(
-                "name",
-                "must be non-empty when passed; the value is not trimmed and is not copied from the model id",
-            ));
-        }
+    if let Some(name) = block.name
+        && name.is_empty()
+    {
+        return Err(invalid_setting(
+            "name",
+            "must be non-empty when passed; the value is not trimmed and is not copied from the model id",
+        ));
     }
     if block.api_backend.is_empty() {
         return Err(invalid_setting(
@@ -733,10 +733,10 @@ fn model_span_text(text: &str, slug: &str) -> Result<Option<String>, RefuseReaso
     let spans = table_spans(&lines_ref);
     let mut found = Vec::new();
     for span in &spans {
-        if let Some(header_slug) = model_slug_from_header(&span.name)? {
-            if header_slug == slug {
-                found.push((span.start, span.end));
-            }
+        if let Some(header_slug) = model_slug_from_header(&span.name)?
+            && header_slug == slug
+        {
+            found.push((span.start, span.end));
         }
     }
     let (start, end) = match found.as_slice() {
@@ -892,7 +892,7 @@ pub fn read_configured(config: &str) -> Result<ConfiguredInventory, Refused> {
     })
 }
 
-/// The OpenRouter `[router]` block `init` writes, including its trailing newline.
+/// The `OpenRouter` `[router]` block `init` writes, including its trailing newline.
 ///
 /// `builtins` is [`BUILTIN_SLUGS`] in order. This function does not read a file.
 #[must_use = "the block is the only copy of the bytes init writes"]
@@ -912,7 +912,7 @@ catalog = \"openrouter-models\"
     )
 }
 
-/// Append the OpenRouter router block, or report that `[router]` is already a table.
+/// Append the `OpenRouter` router block, or report that `[router]` is already a table.
 ///
 /// A missing `[router]` key appends [`openrouter_router_block`]. Every earlier byte
 /// stays. When `config` is non-empty and does not end in a newline, one newline is
@@ -1024,14 +1024,13 @@ pub fn refuse_named_secrets(text: &str, also: &[&str]) -> Result<(), SecretError
     }
     for name in names {
         match std::env::var(&name) {
-            Err(std::env::VarError::NotPresent) => {}
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(SecretError::NotUnicode { name });
             }
             Ok(value) if !value.is_empty() && text.contains(&value) => {
                 return Err(SecretError::ValueInConfig { name });
             }
-            Ok(_) => {}
+            Err(std::env::VarError::NotPresent) | Ok(_) => {}
         }
     }
     Ok(())
@@ -1042,12 +1041,11 @@ fn collect_env_keys(value: &toml::Value, names: &mut BTreeSet<String>) {
     match value {
         toml::Value::Table(table) => {
             for (key, child) in table {
-                if key == "env_key" {
-                    if let Some(name) = child.as_str() {
-                        if is_env_key(name) {
-                            let _inserted = names.insert(name.to_owned());
-                        }
-                    }
+                if key == "env_key"
+                    && let Some(name) = child.as_str()
+                    && is_env_key(name)
+                {
+                    let _inserted = names.insert(name.to_owned());
                 }
                 collect_env_keys(child, names);
             }
@@ -1098,15 +1096,14 @@ pub fn replace_file(
         Backup::CacheDir(cache_dir) => cache_dir.join("config.toml.prev"),
         Backup::Sibling => sibling_prev(path),
     };
-    if let Some(parent) = backup_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                return Err(ReplaceError {
-                    kind: ReplaceKind::Backup,
-                    detail: io_detail("create backup directory", parent, &error),
-                });
-            }
-        }
+    if let Some(parent) = backup_path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return Err(ReplaceError {
+            kind: ReplaceKind::Backup,
+            detail: io_detail("create backup directory", parent, &error),
+        });
     }
     if let Err(error) = std::fs::write(&backup_path, &original) {
         return Err(ReplaceError {
@@ -1148,15 +1145,14 @@ pub fn create_file(path: &Path, bytes: &[u8], secret: &str) -> Result<(), Replac
             detail: format!("{} already exists, so it was not created", path.display()),
         });
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                return Err(ReplaceError {
-                    kind: ReplaceKind::Temp,
-                    detail: io_detail("create config directory", parent, &error),
-                });
-            }
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return Err(ReplaceError {
+            kind: ReplaceKind::Temp,
+            detail: io_detail("create config directory", parent, &error),
+        });
     }
     write_temp_and_rename(path, bytes)
 }
@@ -1186,6 +1182,10 @@ fn write_temp_and_rename(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> 
 }
 
 /// Format an optional slug the way a refusal message names a missing default.
+#[allow(
+    clippy::ref_option,
+    reason = "the thiserror format argument is already &Option<String>"
+)]
 fn display_optional(value: &Option<String>) -> String {
     match value {
         Some(text) => format!("{text:?}"),
@@ -1261,6 +1261,10 @@ fn is_http_base(text: &str) -> bool {
 }
 
 /// Accept `builtins` only as an array of non-empty strings. An empty array is none.
+///
+/// # Errors
+///
+/// Returns a refusal when the value is not an array of non-empty strings.
 fn builtin_list(value: &toml::Value) -> Result<Vec<String>, RefuseReason> {
     let Some(items) = value.as_array() else {
         return Err(invalid_setting(
@@ -1495,7 +1499,7 @@ fn record_catalog(value: Option<&toml::Value>) -> Result<Option<String>, RefuseR
 }
 
 /// Use the catalog name when it has a non-blank trimmed form, otherwise the provider id.
-fn display_name<'a>(model: CatalogModel<'a>) -> &'a str {
+fn display_name(model: CatalogModel<'_>) -> &str {
     match model.name.map(str::trim) {
         Some(name) if !name.is_empty() => name,
         _ => model.id,
@@ -1503,6 +1507,10 @@ fn display_name<'a>(model: CatalogModel<'a>) -> &'a str {
 }
 
 /// Header for `slug`. Dotted and other non-bare slugs are quoted so they stay one key.
+///
+/// # Errors
+///
+/// Returns a refusal when `slug` is not a legal model header.
 fn model_header(slug: &str) -> Result<String, RefuseReason> {
     require_slug(slug)?;
     if is_bare_slug(slug) {
@@ -1553,6 +1561,10 @@ fn push_unicode_escape(encoded: &mut String, control: char) {
 }
 
 /// Decode a TOML basic string used as a model header key.
+///
+/// # Errors
+///
+/// Returns a refusal when `quoted` is not a TOML basic string.
 fn toml_unquote(quoted: &str) -> Result<String, RefuseReason> {
     if quoted.len() < 2 || !quoted.starts_with('"') || !quoted.ends_with('"') {
         return Err(RefuseReason::Parse {
@@ -1594,6 +1606,10 @@ fn toml_unquote(quoted: &str) -> Result<String, RefuseReason> {
 }
 
 /// Read a model slug from a header body such as `model.or-glm-5-3` or `model."or.vision"`.
+///
+/// # Errors
+///
+/// Returns a refusal when a `model.` header key cannot be decoded.
 fn model_slug_from_header(name: &str) -> Result<Option<String>, RefuseReason> {
     let Some(rest) = name.strip_prefix("model.") else {
         return Ok(None);
@@ -1610,6 +1626,10 @@ fn model_slug_from_header(name: &str) -> Result<Option<String>, RefuseReason> {
 }
 
 /// Reject duplicate `[models]` headers and duplicate model slugs before editing.
+///
+/// # Errors
+///
+/// Returns a refusal when `[models]` or one model slug is declared twice.
 fn structural_problem(text: &str) -> Result<(), RefuseReason> {
     let lines = split_keepends(text);
     let spans = table_spans(&lines);
@@ -1634,6 +1654,10 @@ fn structural_problem(text: &str) -> Result<(), RefuseReason> {
 }
 
 /// Parse `config` after the duplicate-header check.
+///
+/// # Errors
+///
+/// Returns [`Refused`] when the text has a duplicate header or is not a TOML table.
 fn read_config(config: &str) -> Result<toml::Table, Refused> {
     if let Err(reason) = structural_problem(config) {
         return Err(refuse(config, reason));
@@ -1650,6 +1674,10 @@ fn read_config(config: &str) -> Result<toml::Table, Refused> {
 }
 
 /// Re-parse `spliced` and keep it only when the edit invariants hold.
+///
+/// # Errors
+///
+/// Returns [`Refused`] when the spliced text does not re-parse or breaks an edit invariant.
 fn finish(
     original: &str,
     before: &toml::Table,
@@ -1680,6 +1708,10 @@ fn finish(
 }
 
 /// Compare parsed documents after a splice.
+///
+/// # Errors
+///
+/// Returns a refusal when the splice dropped a table, changed a provider id, or missed the edit.
 fn preserve(
     before: &toml::Table,
     after: &toml::Table,
@@ -1727,12 +1759,12 @@ fn preserve(
             }
         }
     }
-    if let Some(slug) = removed {
-        if after_models.contains_key(slug) {
-            return Err(RefuseReason::RemoveFailed {
-                slug: slug.to_owned(),
-            });
-        }
+    if let Some(slug) = removed
+        && after_models.contains_key(slug)
+    {
+        return Err(RefuseReason::RemoveFailed {
+            slug: slug.to_owned(),
+        });
     }
     let before_default = saved_default(before);
     let after_default = saved_default(after);
@@ -1820,10 +1852,10 @@ fn split_keepends(text: &str) -> Vec<&str> {
         }
         index = index.saturating_add(1);
     }
-    if start < text.len() {
-        if let Some(line) = text.get(start..) {
-            lines.push(line);
-        }
+    if start < text.len()
+        && let Some(line) = text.get(start..)
+    {
+        lines.push(line);
     }
     lines
 }
@@ -1866,8 +1898,7 @@ fn table_spans(lines: &[&str]) -> Vec<Span> {
     for (position, (start, name)) in headers.iter().enumerate() {
         let end = headers
             .get(position.saturating_add(1))
-            .map(|(next, _)| *next)
-            .unwrap_or(lines.len());
+            .map_or(lines.len(), |(next, _)| *next);
         spans.push(Span {
             start: *start,
             end,
@@ -1935,6 +1966,10 @@ fn append_block(text: &str, block: &str) -> String {
 }
 
 /// Replace the first `default =` line in `[models]`, or append the table when it is absent.
+///
+/// # Errors
+///
+/// Returns a refusal when `[models]` cannot be updated for `slug`.
 fn rewrite_default(text: &str, slug: &str) -> Result<String, RefuseReason> {
     let lines_ref = split_keepends(text);
     let spans = table_spans(&lines_ref);
@@ -1983,7 +2018,8 @@ fn append_models_table(text: &str, slug: &str) -> String {
     }
     body.push('\n');
     body.push_str("[models]\n");
-    body.push_str(&format!("default = {}\n", toml_basic_string(slug)));
+    let default_line = format!("default = {}\n", toml_basic_string(slug));
+    body.push_str(&default_line);
     body
 }
 
@@ -1992,15 +2028,19 @@ fn append_models_table(text: &str, slug: &str) -> String {
 /// The span runs from its header through the line before the next header,
 /// including blank lines that sit in that span. Bytes outside the span are
 /// copied unchanged. Other gaps are not restyled.
+///
+/// # Errors
+///
+/// Returns a refusal when `slug` has no single model header to delete.
 fn delete_span(text: &str, slug: &str) -> Result<String, RefuseReason> {
     let lines_ref = split_keepends(text);
     let spans = table_spans(&lines_ref);
     let mut found = Vec::new();
     for span in &spans {
-        if let Some(header_slug) = model_slug_from_header(&span.name)? {
-            if header_slug == slug {
-                found.push((span.start, span.end));
-            }
+        if let Some(header_slug) = model_slug_from_header(&span.name)?
+            && header_slug == slug
+        {
+            found.push((span.start, span.end));
         }
     }
     let (start, end) = match found.as_slice() {
@@ -2055,10 +2095,10 @@ fn temp_path(path: &Path) -> PathBuf {
 
 /// Append `suffix` to the file name, preserving the parent directory.
 fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_else(|| std::ffi::OsString::from("config.toml"));
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("config.toml"),
+        std::ffi::OsStr::to_os_string,
+    );
     name.push(suffix);
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
@@ -2085,15 +2125,9 @@ mod tests {
 
     const FIXTURE_BASE: &str = "https://openrouter.ai/api/v1";
 
-    /// Splice with the OpenRouter base and env name. The slug is already chosen.
+    /// Splice with the `OpenRouter` base and env name. The slug is already chosen.
     fn open_insert(config: &str, model: CatalogModel<'_>, slug: &str) -> Result<String, Refused> {
-        insert_model(
-            config,
-            model,
-            slug,
-            FIXTURE_BASE,
-            "OPENROUTER_API_KEY",
-        )
+        insert_model(config, model, slug, FIXTURE_BASE, "OPENROUTER_API_KEY")
     }
 
     const COMMENT: &str = "# kept comment\n";
@@ -3640,12 +3674,7 @@ catalog = \"openrouter-models\"
         );
         assert_eq!(
             BUILTIN_SLUGS,
-            [
-                "grok-4.7",
-                "grok-4.7-build-fast",
-                "grok-4.6",
-                "grok-4.5"
-            ],
+            ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"],
             "init's acceptance block is these four compiled slugs"
         );
     }

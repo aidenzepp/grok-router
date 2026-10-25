@@ -1,10 +1,14 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "tests report failures rather than document callable contracts"
-    )
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "these files are integration-test crates, so clippy.toml allow-expect-in-tests and allow-panic-in-tests do not see the helpers"
+)]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
 )]
 
 //! `grok-router remove` deletes one model block from a temp config.
@@ -61,10 +65,8 @@ fn remove_temp(path: &Path) {
 }
 
 fn temp_root(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "grok-router-remove-{label}-{}",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("grok-router-remove-{label}-{}", std::process::id()));
     remove_temp(&path);
     fs::create_dir_all(&path).expect("the temp remove directory should be created");
     path
@@ -119,10 +121,7 @@ fn sibling_backup(path: &Path) -> PathBuf {
 
 fn assert_file_unchanged(config: &Path, before: &[u8]) {
     let after = fs::read(config).expect("the config should still be readable");
-    assert_eq!(
-        after, before,
-        "the config bytes should stay identical"
-    );
+    assert_eq!(after, before, "the config bytes should stay identical");
     let backup = sibling_backup(config);
     assert!(
         !backup.exists(),
@@ -170,13 +169,7 @@ fn remove_with_yes_deletes_that_span_and_leaves_every_other_model_span() {
     let before = fs::read(&config).expect("the config fixture should be readable");
     let output = run(
         &dir,
-        &[
-            "remove",
-            "--yes",
-            "--config",
-            "config.toml",
-            "or-glm-5-3",
-        ],
+        &["remove", "--yes", "--config", "config.toml", "or-glm-5-3"],
     );
     assert_eq!(
         exit_code(&output),
@@ -272,13 +265,7 @@ fn remove_of_a_missing_slug_exits_1_and_leaves_the_file_unchanged() {
     let before = fs::read(&config).expect("the config fixture should be readable");
     let output = run(
         &dir,
-        &[
-            "remove",
-            "--yes",
-            "--config",
-            "config.toml",
-            "or-missing",
-        ],
+        &["remove", "--yes", "--config", "config.toml", "or-missing"],
     );
     let stderr = stderr_text(&output);
     assert_eq!(
@@ -375,9 +362,8 @@ fn json_prints_one_object() {
         "remove --json should succeed; stderr: {}",
         stderr_text(&output)
     );
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect(
-        "remove --json should print one JSON value and nothing else",
-    );
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("remove --json should print one JSON value and nothing else");
     assert!(
         value.is_object(),
         "remove --json should print one object; stdout: {stdout}"

@@ -6,6 +6,11 @@
         reason = "tests report failures rather than document callable contracts"
     )
 )]
+#![allow(
+    clippy::multiple_crate_versions,
+    reason = "windows-sys 0.52 and 0.61 are transitive dependencies this crate does not select"
+)]
+#![allow(clippy::cargo_common_metadata, reason = "no license has been chosen")]
 
 //! Library for the `grok-router` command.
 
@@ -54,7 +59,7 @@ pub enum OutputMode {
     after_help = "Examples:\n  grok-router list --config config.toml\n  grok-router list --config config.toml --output json"
 )]
 pub struct Cli {
-    /// Reads default to $GROK_HOME/config.toml or ~/.grok/config.toml.
+    /// Reads default to `$GROK_HOME/config.toml` or ~/.grok/config.toml.
     /// init writes that file when --config is omitted.
     /// add, set-default, and remove still require --config.
     #[arg(long, global = true, value_name = "PATH", verbatim_doc_comment)]
@@ -174,7 +179,7 @@ pub enum Commands {
     /// Delete one model block from the config. This command deletes a model block.
     #[command(verbatim_doc_comment)]
     Remove(commands::remove::RemoveArgs),
-    /// Write a default OpenRouter [router] table when the file has none. An existing [router] table is left unchanged. This command writes unless --dry-run is set.
+    /// Write a default `OpenRouter` [router] table when the file has none. An existing [router] table is left unchanged. This command writes unless --dry-run is set.
     #[command(verbatim_doc_comment)]
     Init(commands::init::InitArgs),
     /// Install, check, or remove the skill stub, or print its guide. setup and remove write; status and show do not.
@@ -257,11 +262,13 @@ pub fn write_failure(mode: OutputMode, command: &str, err: &error::Error) {
 fn render_completion(shell: &str, mode: OutputMode) -> Result<String, error::Error> {
     let script = completion_script(shell)?;
     match mode {
-        OutputMode::Json => serde_json::to_string(&script).map_err(|err| error::Error::JsonEncode {
-            what: "the completion script",
-            source: err,
-            retry: "Retry completions.",
-        }),
+        OutputMode::Json => {
+            serde_json::to_string(&script).map_err(|err| error::Error::JsonEncode {
+                what: "the completion script",
+                source: err,
+                retry: "Retry completions.",
+            })
+        }
         OutputMode::Text | OutputMode::Quiet => Ok(script),
     }
 }
@@ -300,13 +307,6 @@ fn write_stdout(mode: OutputMode, body: &str, what: &'static str, command: &str)
     match stdout.write_all(&bytes) {
         Ok(()) => 0,
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
-        Err(err) => fail_message(
-            mode,
-            command,
-            &error::Error::Stdout {
-                what,
-                source: err,
-            },
-        ),
+        Err(err) => fail_message(mode, command, &error::Error::Stdout { what, source: err }),
     }
 }

@@ -1,10 +1,14 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "tests report failures rather than document callable contracts"
-    )
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "these files are integration-test crates, so clippy.toml allow-expect-in-tests and allow-panic-in-tests do not see the helpers"
+)]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
 )]
 
 //! Lived-in config bytes survive `add`, `set-default`, and `remove`.
@@ -518,7 +522,8 @@ fn init_appends_the_openrouter_block_and_keeps_lived_in_bytes() {
     );
     assert_lived_in_outside_models(&edited);
     assert_eq!(
-        fs::read(config.with_file_name("config.toml.prev")).expect("init should back up an existing file"),
+        fs::read(config.with_file_name("config.toml.prev"))
+            .expect("init should back up an existing file"),
         before,
         "the backup should be the lived-in bytes from before the write"
     );

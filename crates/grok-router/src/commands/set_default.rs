@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use crate::OutputMode;
 use crate::config_edit::{self, Backup, RefuseReason};
 use crate::error::Error;
-use crate::OutputMode;
 
 /// Set [models].default for the next session. This does not switch the running session. This command writes the saved default unless --dry-run is set.
 #[derive(Debug, Args)]
@@ -43,12 +43,16 @@ pub fn run(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> i32
 }
 
 /// Read `--config`, set the default in that text, and replace the file unless this is `--dry-run`.
+///
+/// # Errors
+///
+/// Returns an error when the path, slug, or edit is refused. Nothing is written.
 fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Result<String, Error> {
     let path = configured_path(config)?;
     let slug = requested_slug(&args.slug)?;
     let original = read_config_text(&path)?;
-    let edited =
-        config_edit::set_default(&original, &slug).map_err(|refused| edit_failure(refused.reason))?;
+    let edited = config_edit::set_default(&original, &slug)
+        .map_err(|refused| edit_failure(refused.reason))?;
     let unchanged = edited == original;
     let dry_run = args.dry_run;
     let wrote = if unchanged || dry_run {
@@ -69,6 +73,10 @@ fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Resul
 }
 
 /// `--config` from the global flag. Never a home path.
+///
+/// # Errors
+///
+/// Returns an error when `--config` is omitted or empty.
 fn configured_path(config: Option<&str>) -> Result<PathBuf, Error> {
     match config {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
@@ -78,6 +86,10 @@ fn configured_path(config: Option<&str>) -> Result<PathBuf, Error> {
 }
 
 /// The required slug. An empty string is a usage failure.
+///
+/// # Errors
+///
+/// Returns an error when the slug is empty.
 fn requested_slug(slug: &str) -> Result<String, Error> {
     if slug.is_empty() {
         Err(Error::SetDefaultSlugEmpty)
@@ -87,6 +99,10 @@ fn requested_slug(slug: &str) -> Result<String, Error> {
 }
 
 /// Read the named config. A missing file is a failure and not a reason to look elsewhere.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or is not UTF-8.
 fn read_config_text(path: &Path) -> Result<String, Error> {
     let bytes = fs::read(path).map_err(|err| Error::SetDefaultConfigIo {
         path: path.to_path_buf(),
@@ -103,6 +119,10 @@ fn edit_failure(reason: RefuseReason) -> Error {
 }
 
 /// Human text, the slug, or one JSON object.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the report cannot be encoded.
 fn render(mode: OutputMode, report: &SetDefaultReport) -> Result<String, Error> {
     if mode == OutputMode::Json {
         return serde_json::to_string(report).map_err(|err| Error::JsonEncode {

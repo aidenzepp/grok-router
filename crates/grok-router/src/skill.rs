@@ -8,10 +8,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Directory name written under the skill root.
 const STUB_DIR_NAME: &str = "grok-router";
+/// File name of the installed stub.
 const STUB_FILE_NAME: &str = "SKILL.md";
+/// Line that marks a directory this command may remove.
 const MARKER: &str = "grok-router-skill-stub";
 
+/// Long guide printed by `skill show`. Not written into the stub.
 const GUIDE: &str = "\
 grok-router
 
@@ -42,6 +46,7 @@ Examples:
   grok-router skill remove --skill-root /tmp/skills --yes
 ";
 
+/// Short `SKILL.md` body. It points the agent at `__internal skill`.
 const STUB: &str = "\
 ---
 name: grok-router
@@ -193,6 +198,7 @@ impl SkillFailure {
         }
     }
 
+    /// Build an I/O failure that names `path` and what to do next.
     fn io(path: &Path, source: io::Error, next: &'static str) -> Self {
         Self::Io {
             path: path.to_path_buf(),
@@ -323,10 +329,16 @@ pub fn remove(
     }
 }
 
+/// Path of the `grok-router` directory under `root`.
 fn stub_dir(root: &Path) -> PathBuf {
     root.join(STUB_DIR_NAME)
 }
 
+/// Whether `dir` is missing, current, stale, or foreign.
+///
+/// # Errors
+///
+/// Returns [`SkillFailure::Io`] when the directory cannot be inspected.
 fn presence(dir: &Path) -> Result<Presence, SkillFailure> {
     let meta = match fs::symlink_metadata(dir) {
         Ok(meta) => meta,
@@ -364,10 +376,16 @@ fn presence(dir: &Path) -> Result<Presence, SkillFailure> {
     }
 }
 
+/// Whether `text` contains the stub marker on its own line.
 fn has_marker(text: &str) -> bool {
     text.lines().any(|line| line == MARKER)
 }
 
+/// Whether `dir` has no entries.
+///
+/// # Errors
+///
+/// Returns [`SkillFailure::Io`] when the directory cannot be listed.
 fn directory_is_empty(dir: &Path) -> Result<bool, SkillFailure> {
     let mut entries = fs::read_dir(dir).map_err(|source| {
         SkillFailure::io(
@@ -387,6 +405,11 @@ fn directory_is_empty(dir: &Path) -> Result<bool, SkillFailure> {
     }
 }
 
+/// Create the stub directory and write `SKILL.md`.
+///
+/// # Errors
+///
+/// Returns [`SkillFailure::Io`] when the stub directory or file cannot be written.
 fn write_stub(dir: &Path) -> Result<(), SkillFailure> {
     fs::create_dir_all(dir).map_err(|source| {
         SkillFailure::io(
@@ -412,8 +435,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        Confirmation, Effect, Presence, SkillFailure, WriteMode, guide, inspect, remove, setup,
-        MARKER, STUB, STUB_DIR_NAME, STUB_FILE_NAME,
+        Confirmation, Effect, MARKER, Presence, STUB, STUB_DIR_NAME, STUB_FILE_NAME, SkillFailure,
+        WriteMode, guide, inspect, remove, setup,
     };
 
     const NEXT_SESSION: &str = "The saved default applies to the next session.";
@@ -501,7 +524,10 @@ mod tests {
         assert_eq!(again.effect, Effect::Unchanged);
         assert_eq!(again.disk, Presence::Current);
         let after = fs::read(&file).expect("SKILL.md should still be readable");
-        assert_eq!(after, bytes, "a second setup should leave the one stub in place");
+        assert_eq!(
+            after, bytes,
+            "a second setup should leave the one stub in place"
+        );
         assert_eq!(names(&root), vec!["grok-router".to_owned()]);
     }
 
@@ -551,8 +577,8 @@ mod tests {
             "dry-run remove should not delete the stub"
         );
 
-        let deleted =
-            remove(&root, Confirmation::Yes, WriteMode::Apply).expect("remove --yes should delete our stub");
+        let deleted = remove(&root, Confirmation::Yes, WriteMode::Apply)
+            .expect("remove --yes should delete our stub");
         assert_eq!(deleted.effect, Effect::Removed);
         assert_eq!(deleted.disk, Presence::Missing);
         assert!(
@@ -562,7 +588,8 @@ mod tests {
                 .expect("the deleted stub path should be stat-able"),
             "remove --yes should delete the marked stub directory"
         );
-        let kept = fs::read(sibling.join("keep.txt")).expect("the sibling file should still be readable");
+        let kept =
+            fs::read(sibling.join("keep.txt")).expect("the sibling file should still be readable");
         assert_eq!(kept, b"keep\n");
     }
 
@@ -573,10 +600,13 @@ mod tests {
         fs::create_dir_all(&foreign).expect("a foreign stub directory should be created");
         let file = foreign.join("SKILL.md");
         fs::write(&file, b"not ours\n").expect("a foreign SKILL.md should be written");
-        fs::write(foreign.join("extra.txt"), b"extra\n").expect("a foreign extra file should be written");
+        fs::write(foreign.join("extra.txt"), b"extra\n")
+            .expect("a foreign extra file should be written");
 
         let setup_err = match setup(&root, WriteMode::Apply) {
-            Ok(report) => panic!("setup should refuse a directory without the marker; report: {report:?}"),
+            Ok(report) => {
+                panic!("setup should refuse a directory without the marker; report: {report:?}")
+            }
             Err(err) => err,
         };
         assert_eq!(setup_err.kind(), "refused");
@@ -599,12 +629,16 @@ mod tests {
     #[test]
     fn empty_stub_directory_can_be_filled_without_a_second_copy() {
         let root = temp_root("empty");
-        fs::create_dir_all(root.join("grok-router")).expect("an empty stub directory should be created");
+        fs::create_dir_all(root.join("grok-router"))
+            .expect("an empty stub directory should be created");
         let looked = inspect(&root).expect("an empty stub directory should be readable");
         assert_eq!(looked.disk, Presence::Missing);
         let report = setup(&root, WriteMode::Apply).expect("setup should fill the empty directory");
         assert_eq!(report.effect, Effect::Wrote);
-        assert_eq!(names(&root.join("grok-router")), vec!["SKILL.md".to_owned()]);
+        assert_eq!(
+            names(&root.join("grok-router")),
+            vec!["SKILL.md".to_owned()]
+        );
     }
 
     #[test]
@@ -649,6 +683,12 @@ mod tests {
             return;
         };
         let mut perms = meta.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(perms.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
         perms.set_readonly(false);
         match fs::set_permissions(path, perms) {
             Ok(()) | Err(_) => {}

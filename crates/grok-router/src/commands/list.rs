@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use crate::OutputMode;
 use crate::config_edit::{self, ConfiguredInventory, RefuseReason};
 use crate::error::Error;
-use crate::OutputMode;
 
 /// List configured models and the saved default. This command does not modify the config.
 #[derive(Debug, Args)]
@@ -50,6 +50,10 @@ pub fn run(config: Option<&str>, limit: Option<&str>, mode: OutputMode) -> i32 {
 }
 
 /// Read the config and render the inventory. Does not write the file.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read or `--limit` is not a positive whole number.
 fn list_models(
     config: Option<&str>,
     limit: Option<&str>,
@@ -64,6 +68,10 @@ fn list_models(
 }
 
 /// `--config` when it was passed. Otherwise `${GROK_HOME:-$HOME/.grok}/config.toml`.
+///
+/// # Errors
+///
+/// Returns an error when `--config` is empty or the home path cannot be built.
 fn config_path(config: Option<&str>) -> Result<PathBuf, Error> {
     match config {
         Some("") => Err(Error::ListConfigEmpty),
@@ -73,11 +81,15 @@ fn config_path(config: Option<&str>) -> Result<PathBuf, Error> {
 }
 
 /// `${GROK_HOME:-$HOME/.grok}/config.toml`. An empty `GROK_HOME` falls through to `HOME`.
+///
+/// # Errors
+///
+/// Returns an error when `GROK_HOME` is empty and `HOME` is unset, or `HOME` itself is unset.
 fn default_config_path() -> Result<PathBuf, Error> {
-    if let Some(grok_home) = env::var_os("GROK_HOME") {
-        if !grok_home.is_empty() {
-            return Ok(PathBuf::from(grok_home).join("config.toml"));
-        }
+    if let Some(grok_home) = env::var_os("GROK_HOME")
+        && !grok_home.is_empty()
+    {
+        return Ok(PathBuf::from(grok_home).join("config.toml"));
     }
     match env::var_os("HOME") {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".grok").join("config.toml")),
@@ -87,6 +99,10 @@ fn default_config_path() -> Result<PathBuf, Error> {
 }
 
 /// Read the named config. A missing file is a failure and not a reason to look elsewhere.
+///
+/// # Errors
+///
+/// Returns an error when the file is missing, unreadable, or not UTF-8.
 fn read_config_text(path: &Path) -> Result<String, Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -156,6 +172,10 @@ fn display_rows(inventory: &ConfiguredInventory) -> Vec<Row> {
 }
 
 /// JSON, one slug per line, or text that marks the default.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the rows cannot be encoded.
 fn render(rows: &[Row], mode: OutputMode) -> Result<String, Error> {
     match mode {
         OutputMode::Json => format_json(rows),
@@ -165,6 +185,10 @@ fn render(rows: &[Row], mode: OutputMode) -> Result<String, Error> {
 }
 
 /// JSON array. `provider_id` is omitted when the slug has no block.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the rows cannot be encoded.
 fn format_json(rows: &[Row]) -> Result<String, Error> {
     let hits = rows
         .iter()

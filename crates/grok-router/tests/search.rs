@@ -1,17 +1,21 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "tests report failures rather than document callable contracts"
-    )
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "these files are integration-test crates, so clippy.toml allow-expect-in-tests and allow-panic-in-tests do not see the helpers"
+)]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
 )]
 
 //! `grok-router search` resolves one `[router]` provider record, selects its
 //! cartridge, and then reads a catalog fixture or that record's cache.
 //!
 //! `--catalog-file` does not skip resolution and does not GET. A missing
-//! config file is not created and is not the compiled OpenRouter base. These
+//! config file is not created and is not the compiled `OpenRouter` base. These
 //! tests do not call the network and do not read provider env vars. Cache and
 //! config paths point at a temp directory.
 
@@ -274,7 +278,7 @@ fn search_json_parses_and_uses_the_fixture_without_a_key_or_a_network() {
         serde_json::json!([{
             "id": "gpt-4-turbo",
             "name": "GPT-4 Turbo",
-            "context_length": 128000
+            "context_length": 128_000
         }]),
         "json output should keep the context_length key; stdout: {stdout}"
     );
@@ -721,7 +725,7 @@ fn blank_default_provider_still_honors_an_explicit_provider() {
         serde_json::json!([{
             "id": "deepseek-v4-pro",
             "name": "DeepSeek V4 Pro",
-            "context_length": 128000
+            "context_length": 128_000
         }]),
         "the deepseek fixture should keep the context_length key; stdout: {stdout}"
     );
@@ -833,7 +837,9 @@ fn an_unknown_catalog_id_is_named_and_does_not_select_openrouter() {
         "stderr should say no catalog cartridge is configured; stderr: {stderr}"
     );
     assert!(
-        !refusal_sentence(&stderr).to_ascii_lowercase().contains("json"),
+        !refusal_sentence(&stderr)
+            .to_ascii_lowercase()
+            .contains("json"),
         "the fixture must not be parsed as OpenRouter; stderr: {stderr}"
     );
     let retired = format!("{} was not selected", "openrouter-models");
@@ -954,10 +960,7 @@ fn an_openrouter_base_uses_models_json_even_when_the_name_is_not_openrouter() {
     mark_fresh(&models);
     let models_before = fs::read(&models).expect("models.json should be readable");
     let openrouter_url = grok_router::catalog::models_url(COMPILED_URL);
-    let mut hex = String::new();
-    for byte in openrouter_url.as_bytes() {
-        hex.push_str(&format!("{byte:02x}"));
-    }
+    let hex = hex_digits(openrouter_url.as_bytes());
     let hex_path = grok_router::catalog::cache_path_for(&cache, &openrouter_url);
     let expected_name = format!("models-{hex}.json");
     assert_eq!(
@@ -1144,10 +1147,24 @@ fn timeout_zero_or_a_non_integer_refuses_before_a_download_or_a_write() {
         );
     }
     let help = stdout_text(&run(&dir, &["search", "--help"]));
-    assert!(help.contains("--timeout"), "search help should show --timeout");
+    assert!(
+        help.contains("--timeout"),
+        "search help should show --timeout"
+    );
     assert!(
         help.contains("30"),
         "search help should show the 30 second default"
     );
     remove_temp(&dir);
+}
+
+fn hex_digits(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        if write!(hex, "{byte:02x}").is_err() {
+            break;
+        }
+    }
+    hex
 }

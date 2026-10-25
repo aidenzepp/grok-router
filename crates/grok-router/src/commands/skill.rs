@@ -9,11 +9,11 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+use crate::OutputMode;
 use crate::error::Error;
 use crate::skill::{
     Confirmation, Effect, Presence, Report, SkillFailure, WriteMode, guide, inspect, remove, setup,
 };
-use crate::OutputMode;
 
 /// Install, check, or remove the skill stub, or print its guide. setup and remove write; status and show do not.
 #[derive(Debug, Args)]
@@ -88,7 +88,10 @@ struct RemoveArgs {
 
 /// Print the skill guide. This command does not modify anything.
 #[derive(Debug, Args)]
-#[command(verbatim_doc_comment, after_help = "Examples:\n  grok-router skill show")]
+#[command(
+    verbatim_doc_comment,
+    after_help = "Examples:\n  grok-router skill show"
+)]
 struct ShowArgs {}
 
 /// Print the built-in skill guide. Not a human command. This command does not modify anything.
@@ -173,6 +176,7 @@ pub fn run_internal(args: &InternalArgs, mode: OutputMode) -> i32 {
     }
 }
 
+/// Install the stub under `--skill-root` and print the result.
 fn run_setup(args: &SetupArgs, mode: OutputMode) -> i32 {
     let flags = &args.flags.read;
     let root = match skill_root(flags) {
@@ -182,6 +186,7 @@ fn run_setup(args: &SetupArgs, mode: OutputMode) -> i32 {
     finish(mode, "setup", setup(&root, write_mode(args.flags.dry_run)))
 }
 
+/// Print whether the stub under `--skill-root` is current.
 fn run_status(args: &StatusArgs, mode: OutputMode) -> i32 {
     let root = match skill_root(&args.flags) {
         Ok(root) => root,
@@ -190,6 +195,7 @@ fn run_status(args: &StatusArgs, mode: OutputMode) -> i32 {
     finish(mode, "status", inspect(&root))
 }
 
+/// Delete a marked stub when `--yes` was passed.
 fn run_remove(args: &RemoveArgs, mode: OutputMode) -> i32 {
     let flags = &args.flags.read;
     let confirmation = confirmation(args.yes);
@@ -228,6 +234,7 @@ fn write_guide(mode: OutputMode) -> i32 {
     write_stdout(mode, &body)
 }
 
+/// Render a skill result, or print the failure.
 fn finish(mode: OutputMode, command: &str, result: Result<Report, SkillFailure>) -> i32 {
     match result {
         Ok(report) => match render(command, &report, mode) {
@@ -238,6 +245,11 @@ fn finish(mode: OutputMode, command: &str, result: Result<Report, SkillFailure>)
     }
 }
 
+/// Directory named by `--skill-root`.
+///
+/// # Errors
+///
+/// Returns an error when `--skill-root` is omitted or empty.
 fn skill_root(flags: &ReadFlags) -> Result<PathBuf, Error> {
     let Some(path) = &flags.skill_root else {
         return Err(Error::SkillRootOmitted);
@@ -248,6 +260,7 @@ fn skill_root(flags: &ReadFlags) -> Result<PathBuf, Error> {
     Ok(path.clone())
 }
 
+/// Dry-run when the flag is set, otherwise apply the write.
 fn write_mode(dry_run: bool) -> WriteMode {
     if dry_run {
         WriteMode::DryRun
@@ -256,6 +269,7 @@ fn write_mode(dry_run: bool) -> WriteMode {
     }
 }
 
+/// `--yes` confirms removal. Anything else refuses.
 fn confirmation(yes: bool) -> Confirmation {
     if yes {
         Confirmation::Yes
@@ -264,6 +278,11 @@ fn confirmation(yes: bool) -> Confirmation {
     }
 }
 
+/// Text, one quiet line, or one JSON object.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the JSON report cannot be encoded.
 fn render(command: &str, report: &Report, mode: OutputMode) -> Result<String, Error> {
     match mode {
         OutputMode::Json => render_json(command, report),
@@ -272,6 +291,11 @@ fn render(command: &str, report: &Report, mode: OutputMode) -> Result<String, Er
     }
 }
 
+/// One JSON object for setup, status, or remove.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the report cannot be encoded.
 fn render_json(command: &str, report: &Report) -> Result<String, Error> {
     let body = JsonReport {
         command,
@@ -287,16 +311,17 @@ fn render_json(command: &str, report: &Report) -> Result<String, Error> {
     })
 }
 
+/// One line and no path label, except where the effect is the line.
 fn render_quiet(command: &str, report: &Report) -> String {
     match (command, report.effect) {
         ("status", _) => report.disk.as_str().to_owned(),
-        ("remove", Effect::Removed | Effect::WouldRemove) => report.path.display().to_string(),
         ("remove", Effect::Left) => "left".to_owned(),
         ("remove", Effect::Unchanged) => "missing".to_owned(),
         _ => report.path.display().to_string(),
     }
 }
 
+/// Human lines for setup, status, or remove.
 fn render_text(command: &str, report: &Report) -> String {
     let path = report.path.display().to_string();
     match command {
@@ -351,6 +376,7 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
     }
 }
 
+/// Print a skill failure and return the failure status.
 fn fail_command(mode: OutputMode, err: &Error) -> i32 {
     crate::fail_message(mode, "skill", err)
 }

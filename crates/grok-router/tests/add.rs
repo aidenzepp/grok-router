@@ -1,10 +1,14 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "tests report failures rather than document callable contracts"
-    )
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "these files are integration-test crates, so clippy.toml allow-expect-in-tests and allow-panic-in-tests do not see the helpers"
+)]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
 )]
 
 //! `grok-router add` writes one model from a `[router]` provider record.
@@ -1613,6 +1617,12 @@ fn a_pasted_secret_refuses_before_a_write() {
         "a third env key should leave the file unchanged"
     );
 
+    remove_temp(&dir);
+    remove_temp(&mirror_dir);
+}
+
+#[test]
+fn a_non_unicode_env_value_refuses_before_a_write() {
     use std::os::unix::ffi::OsStringExt;
     let raw_dir = temp_root("pasted-raw");
     let raw_config = write_named(
@@ -1669,8 +1679,6 @@ fn a_pasted_secret_refuses_before_a_write() {
         "a non-Unicode env value should leave the file unchanged"
     );
 
-    remove_temp(&dir);
-    remove_temp(&mirror_dir);
     remove_temp(&raw_dir);
 }
 
@@ -1683,13 +1691,7 @@ fn an_openrouter_base_reads_models_json_and_a_deepseek_base_does_not() {
     mark_fresh(&models);
     let models_before = fs::read(&models).expect("models.json should be readable");
     let openrouter_url = grok_router::catalog::models_url("https://openrouter.ai/api/v1");
-    let hex_name = {
-        let mut hex = String::new();
-        for byte in openrouter_url.as_bytes() {
-            hex.push_str(&format!("{byte:02x}"));
-        }
-        format!("models-{hex}.json")
-    };
+    let hex_name = format!("models-{}.json", hex_digits(openrouter_url.as_bytes()));
     let hex_path = grok_router::catalog::cache_path_for(&cache, &openrouter_url);
     assert_eq!(
         hex_path.file_name().and_then(|name| name.to_str()),
@@ -1733,7 +1735,11 @@ fn an_openrouter_base_reads_models_json_and_a_deepseek_base_does_not() {
     let after = fs::read_to_string(&config).expect("the config should be UTF-8");
     assert_secret_absent("config", &after, "cache-hit-token");
     assert!(after.contains("[model.or-widget-v2]\n"));
+    remove_temp(&dir);
+}
 
+#[test]
+fn a_deepseek_base_reads_its_own_cache_and_not_models_json() {
     let deepseek_dir = temp_root("deepseek-cache");
     let deepseek_config = write_named(
         &deepseek_dir,
@@ -1785,7 +1791,6 @@ fn an_openrouter_base_reads_models_json_and_a_deepseek_base_does_not() {
     assert!(written.contains("[model.deepseek-v4-text]\n"));
     assert!(written.contains(&format!("base_url = \"{DEEPSEEK_BASE}\"\n")));
     assert_secret_absent("config", &written, "deepseek-cache-token");
-    remove_temp(&dir);
     remove_temp(&deepseek_dir);
 }
 
@@ -2181,7 +2186,10 @@ fn timeout_zero_or_a_non_integer_writes_nothing_on_catalog_and_direct_adds() {
             1,
             "catalog add --timeout {bad} should exit 1; stderr: {stderr}"
         );
-        assert!(stderr.contains("--timeout"), "stderr should name --timeout; stderr: {stderr}");
+        assert!(
+            stderr.contains("--timeout"),
+            "stderr should name --timeout; stderr: {stderr}"
+        );
         assert!(
             stderr.contains("Nothing was downloaded"),
             "stderr should say nothing was downloaded; stderr: {stderr}"
@@ -2224,6 +2232,20 @@ fn timeout_zero_or_a_non_integer_writes_nothing_on_catalog_and_direct_adds() {
     }
     let help = stdout_text(&run(&dir, &["add", "--help"]));
     assert!(help.contains("--timeout"), "add help should show --timeout");
-    assert!(help.contains("30"), "add help should show the 30 second default");
+    assert!(
+        help.contains("30"),
+        "add help should show the 30 second default"
+    );
     remove_temp(&dir);
+}
+
+fn hex_digits(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        if write!(hex, "{byte:02x}").is_err() {
+            break;
+        }
+    }
+    hex
 }

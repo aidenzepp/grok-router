@@ -19,14 +19,18 @@ use std::time::{Duration, SystemTime};
 
 use clap::{ArgAction, Args};
 
+use crate::OutputMode;
 use crate::catalog::{
     self, CachedBodyOrFetch, Cartridge, CartridgeError, CatalogCartridge, CatalogError,
 };
 use crate::config_edit::{self, Backup, ProviderChoice, RefuseReason};
 use crate::error::Error;
-use crate::OutputMode;
 
 /// Add one model from the selected provider record, or write one block from --model, --base-url, --env-key, and --api-backend without resolving a provider. This command writes unless --dry-run is set.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "vision, default, refresh, and dry-run are independent flags"
+)]
 #[derive(Debug, Args)]
 #[command(
     verbatim_doc_comment,
@@ -37,7 +41,7 @@ pub struct AddArgs {
     #[arg(value_name = "QUERY", action = ArgAction::Append, verbatim_doc_comment)]
     query: Vec<String>,
 
-    /// Provider record under [router.provider]. Omitted uses default_provider.
+    /// Provider record under [router.provider]. Omitted uses `default_provider`.
     #[arg(long, value_name = "NAME", verbatim_doc_comment)]
     provider: Option<String>,
 
@@ -57,7 +61,7 @@ pub struct AddArgs {
     #[arg(long, value_name = "KEY", verbatim_doc_comment)]
     env_key: Option<String>,
 
-    /// api_backend value written on the direct path. Not trimmed.
+    /// `api_backend` value written on the direct path. Not trimmed.
     #[arg(long, value_name = "BACKEND", verbatim_doc_comment)]
     api_backend: Option<String>,
 
@@ -65,7 +69,7 @@ pub struct AddArgs {
     #[arg(long, value_name = "TEXT", verbatim_doc_comment)]
     name: Option<String>,
 
-    /// context_window written on the direct path when greater than zero.
+    /// `context_window` written on the direct path when greater than zero.
     #[arg(
         long,
         value_name = "N",
@@ -129,6 +133,10 @@ pub fn run(config: Option<&str>, args: &AddArgs, mode: OutputMode) -> i32 {
 const DIRECT_FLAGS: [&str; 4] = ["--model", "--base-url", "--env-key", "--api-backend"];
 
 /// Resolve one provider record, or write one direct block, and write once.
+///
+/// # Errors
+///
+/// Returns an error when the path, flags, provider, catalog, or write is refused. The file is left unchanged.
 fn run_add(
     config: Option<&str>,
     args: &AddArgs,
@@ -244,6 +252,10 @@ fn partial_direct(present: &[&str], missing: &[&str]) -> Error {
 }
 
 /// `--as` for a direct add. Empty is not trimmed into absence.
+///
+/// # Errors
+///
+/// Returns an error when `--as` is omitted or empty.
 fn required_direct_slug(args: &AddArgs) -> Result<&str, Error> {
     match args.as_slug.as_deref() {
         Some(slug) if !slug.is_empty() => Ok(slug),
@@ -255,6 +267,10 @@ fn required_direct_slug(args: &AddArgs) -> Result<&str, Error> {
 /// Write one block from the four direct flags. Does not resolve a provider or download a catalog.
 ///
 /// `--default` sets `[models].default` in the same `replace_file`. A refused default writes nothing.
+///
+/// # Errors
+///
+/// Returns an error when the block or `--default` is refused. Nothing is written.
 fn run_direct_add(
     config_path: &Path,
     original: &str,
@@ -268,21 +284,16 @@ fn run_direct_add(
         });
     }
     let slug = required_direct_slug(args)?;
-    let (model, base_url, env_key, api_backend) = match (
+    let (Some(model), Some(base_url), Some(env_key), Some(api_backend)) = (
         args.model.as_deref(),
         args.base_url.as_deref(),
         args.env_key.as_deref(),
         args.api_backend.as_deref(),
-    ) {
-        (Some(model), Some(base_url), Some(env_key), Some(api_backend)) => {
-            (model, base_url, env_key, api_backend)
-        }
-        _ => {
-            return Err(partial_direct(
-                &direct_flags_present(args),
-                &direct_flags_missing(&direct_flags_present(args)),
-            ));
-        }
+    ) else {
+        return Err(partial_direct(
+            &direct_flags_present(args),
+            &direct_flags_missing(&direct_flags_present(args)),
+        ));
     };
     let inserted = config_edit::insert_direct(
         original,
@@ -329,6 +340,10 @@ fn run_direct_add(
 }
 
 /// Resolve one provider record, parse with its cartridge, and write once.
+///
+/// # Errors
+///
+/// Returns an error when the provider, cartridge, catalog, or write is refused. Nothing is written.
 fn run_catalog_add(
     config_path: &Path,
     original: &str,
@@ -337,13 +352,12 @@ fn run_catalog_add(
     timeout: Duration,
 ) -> Result<String, Error> {
     let choice = provider_choice(args);
-    let record =
-        config_edit::resolve_provider(original, choice).map_err(resolve_failure)?;
+    let record = config_edit::resolve_provider(original, choice).map_err(resolve_failure)?;
     let selected = catalog::cartridge(record.catalog.as_deref())
         .map_err(|err| cartridge_failure(&record_name(original, choice), err))?;
     let _builtins = config_edit::builtins_from(original).map_err(early_refusal)?;
     let terms = query_terms(&args.query)?;
-    let rows = load_rows(args, &selected, &record.base_url, &record.env_key, timeout)?;
+    let rows = load_rows(args, selected, &record.base_url, &record.env_key, timeout)?;
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let row = catalog::resolve(&rows, &term_refs)
         .map_err(|err| Error::ResolveUnwritten { source: err })?;
@@ -380,6 +394,10 @@ fn run_catalog_add(
 }
 
 /// `--config` from the global flag. Never a home path.
+///
+/// # Errors
+///
+/// Returns an error when `--config` is omitted or empty.
 fn configured_path(config: Option<&str>) -> Result<PathBuf, Error> {
     match config {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
@@ -440,6 +458,10 @@ fn early_refusal(reason: RefuseReason) -> Error {
 }
 
 /// Positional query terms. An empty term is a usage failure.
+///
+/// # Errors
+///
+/// Returns an error when a positional term is empty.
 fn query_terms(values: &[String]) -> Result<Vec<String>, Error> {
     let mut terms = Vec::new();
     for term in values {
@@ -456,9 +478,13 @@ fn query_terms(values: &[String]) -> Result<Vec<String>, Error> {
 /// `--catalog-file` calls [`CatalogCartridge::parse`] and does not call
 /// [`catalog::parse_catalog`] or the network. The cache path calls
 /// [`catalog::prepare_cached_body`] and then the same parse.
+///
+/// # Errors
+///
+/// Returns an error when the catalog file, bearer, cache, or parse fails.
 fn load_rows(
     args: &AddArgs,
-    cartridge: &Cartridge,
+    cartridge: Cartridge,
     base_url: &str,
     env_key: &str,
     timeout: Duration,
@@ -491,10 +517,7 @@ fn load_rows(
             let stored = catalog::write_cache(&cache_dir, base_url, &bytes)
                 .map_err(|err| Error::CatalogUnwritten { source: err })?;
             if stored != catalog::cache_path_for(&cache_dir, &catalog::models_url(base_url)) {
-                return Err(Error::CacheOutside {
-                    stored,
-                    cache_dir,
-                });
+                return Err(Error::CacheOutside { stored, cache_dir });
             }
             cartridge
                 .parse(&bytes)
@@ -504,6 +527,10 @@ fn load_rows(
 }
 
 /// The record's bearer. A missing or blank value fails before a download or a cache write.
+///
+/// # Errors
+///
+/// Returns an error when the variable is unset, empty, or only whitespace.
 fn required_bearer(env_key: &str) -> Result<String, Error> {
     match env::var(env_key) {
         Ok(value) if !value.is_empty() && !value.chars().all(char::is_whitespace) => Ok(value),
@@ -520,6 +547,10 @@ fn required_bearer(env_key: &str) -> Result<String, Error> {
 }
 
 /// Default cache directory `~/.cache/grok-router`. This is not the config file.
+///
+/// # Errors
+///
+/// Returns an error when `HOME` is unset.
 fn default_cache_dir() -> Result<PathBuf, Error> {
     let Some(home) = env::var_os("HOME") else {
         return Err(Error::AddCacheHomeUnset);
@@ -531,6 +562,10 @@ fn default_cache_dir() -> Result<PathBuf, Error> {
 }
 
 /// Read the named config. A missing file is a failure and not a reason to look elsewhere.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or is not UTF-8.
 fn read_config_text(path: &Path) -> Result<String, Error> {
     let bytes = fs::read(path).map_err(|err| Error::AddConfigIo {
         path: path.to_path_buf(),
@@ -542,6 +577,10 @@ fn read_config_text(path: &Path) -> Result<String, Error> {
 }
 
 /// Insert the row with the record's base and env name, then set the default when asked.
+///
+/// # Errors
+///
+/// Returns an error when the insert or the default edit is refused.
 fn edited_config(
     original: &str,
     row: &crate::catalog::CatalogRow,
@@ -565,6 +604,10 @@ fn edit_failure(reason: RefuseReason) -> Error {
 }
 
 /// Human text, the slug, or one JSON object.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the report cannot be encoded.
 fn render(mode: OutputMode, report: &AddReport, path: &Path) -> Result<String, Error> {
     if mode == OutputMode::Json {
         return serde_json::to_string(report).map_err(|err| Error::JsonEncode {
@@ -611,12 +654,22 @@ fn fail(mode: OutputMode, err: &Error) -> i32 {
 }
 
 /// One JSON object for a finished add.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "wrote, dry_run, unchanged, and default are independent report facts"
+)]
 #[derive(serde::Serialize)]
 struct AddReport {
+    /// Slug written or already present.
     slug: String,
+    /// Provider model id.
     provider_id: String,
+    /// Whether the file was replaced.
     wrote: bool,
+    /// Whether `--dry-run` was set.
     dry_run: bool,
+    /// Whether the spliced text matched the file.
     unchanged: bool,
+    /// Whether this add also set the saved default.
     default: bool,
 }

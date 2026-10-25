@@ -16,12 +16,12 @@ use std::time::{Duration, SystemTime};
 
 use clap::{ArgAction, Args};
 
+use crate::OutputMode;
 use crate::catalog::{
     self, CachedBodyOrFetch, CartridgeError, CatalogCartridge, CatalogError, CatalogRow,
 };
 use crate::config_edit::{self, ProviderChoice, RefuseReason};
 use crate::error::Error;
-use crate::OutputMode;
 
 /// Search the selected provider catalog. This command does not modify the config.
 #[derive(Debug, Args)]
@@ -34,7 +34,7 @@ pub struct SearchArgs {
     #[arg(value_name = "TERM", action = ArgAction::Append, verbatim_doc_comment)]
     terms: Vec<String>,
 
-    /// Provider record under [router.provider]. Omitted uses default_provider.
+    /// Provider record under [router.provider]. Omitted uses `default_provider`.
     #[arg(long, value_name = "NAME", verbatim_doc_comment)]
     provider: Option<String>,
 
@@ -117,6 +117,10 @@ fn run_search(config: Option<&str>, args: &SearchArgs, mode: OutputMode, timeout
 }
 
 /// Terms from the positional arguments. An empty term is a usage failure.
+///
+/// # Errors
+///
+/// Returns an error when a positional term is empty.
 fn collect_terms(values: &[String]) -> Result<Vec<String>, Error> {
     let mut terms = Vec::new();
     for term in values {
@@ -146,8 +150,7 @@ fn load_rows(
     let config_path = search_config_path(config)?;
     let text = read_config_text(&config_path)?;
     let choice = provider_choice(args);
-    let record =
-        config_edit::resolve_provider(&text, choice).map_err(resolve_failure)?;
+    let record = config_edit::resolve_provider(&text, choice).map_err(resolve_failure)?;
     let selected = catalog::cartridge(record.catalog.as_deref())
         .map_err(|err| cartridge_failure(&record_name(&text, choice), err))?;
     if let Some(path) = &args.catalog_file {
@@ -174,7 +177,7 @@ fn load_rows(
         &record.base_url,
         &record.env_key,
     )
-        .map_err(|err| cache_failure(err, &record.env_key))?
+    .map_err(|err| cache_failure(err, &record.env_key))?
     {
         CachedBodyOrFetch::Cached(bytes) => selected
             .parse(&bytes)
@@ -274,10 +277,10 @@ fn search_config_path(config: Option<&str>) -> Result<PathBuf, Error> {
 ///
 /// Returns an error when `GROK_HOME` is unset or empty and `HOME` cannot name a path.
 fn default_config_path() -> Result<PathBuf, Error> {
-    if let Some(grok_home) = env::var_os("GROK_HOME") {
-        if !grok_home.is_empty() {
-            return Ok(PathBuf::from(grok_home).join("config.toml"));
-        }
+    if let Some(grok_home) = env::var_os("GROK_HOME")
+        && !grok_home.is_empty()
+    {
+        return Ok(PathBuf::from(grok_home).join("config.toml"));
     }
     match env::var_os("HOME") {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".grok").join("config.toml")),
@@ -313,6 +316,10 @@ fn read_config_text(path: &Path) -> Result<String, Error> {
 }
 
 /// Default cache directory `~/.cache/grok-router`.
+///
+/// # Errors
+///
+/// Returns an error when `HOME` is unset.
 fn default_cache_dir() -> Result<PathBuf, Error> {
     let Some(home) = env::var_os("HOME") else {
         return Err(Error::SearchCacheHomeUnset);
@@ -351,13 +358,15 @@ enum LimitParse {
         raw: String,
     },
     /// Zero would hide every row.
-    #[error(
-        "--limit 0 would hide every row. Pass --limit 30 or another number greater than zero."
-    )]
+    #[error("--limit 0 would hide every row. Pass --limit 30 or another number greater than zero.")]
     Zero,
 }
 
 /// Reject zero. Clap prints the returned error and exits.
+///
+/// # Errors
+///
+/// Returns an error when the value is zero or not a whole number.
 fn parse_limit(raw: &str) -> Result<usize, LimitParse> {
     let limit: usize = raw.parse().map_err(|_| LimitParse::NotWhole {
         raw: raw.to_owned(),
@@ -405,7 +414,11 @@ fn quoted_terms(terms: &[String]) -> String {
     }
 }
 
-/// JSON array of id, name, and context_length. Nothing else.
+/// JSON array of id, name, and `context_length`. Nothing else.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the rows cannot be encoded.
 fn format_json(rows: &[&CatalogRow]) -> Result<String, Error> {
     let hits = rows
         .iter()
@@ -501,8 +514,11 @@ fn fail(mode: OutputMode, err: &Error) -> i32 {
 /// One JSON object in the search array.
 #[derive(serde::Serialize)]
 struct JsonHit<'a> {
+    /// Provider id.
     id: &'a str,
+    /// Display name.
     name: &'a str,
+    /// Token context length, when the catalog gave one.
     context_length: Option<i64>,
 }
 

@@ -1,13 +1,17 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "tests report failures rather than document callable contracts"
-    )
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "these files are integration-test crates, so clippy.toml allow-expect-in-tests and allow-panic-in-tests do not see the helpers"
+)]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
 )]
 
-//! `grok-router init` writes a default OpenRouter `[router]` table.
+//! `grok-router init` writes a default `OpenRouter` `[router]` table.
 //!
 //! These tests use temp files. They set `HOME` and `GROK_HOME` themselves.
 //! They do not read or write a real home config and do not call the network.
@@ -41,10 +45,8 @@ fn remove_temp(path: &Path) {
 }
 
 fn temp_root(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "grok-router-init-{label}-{}",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("grok-router-init-{label}-{}", std::process::id()));
     remove_temp(&path);
     fs::create_dir_all(&path).expect("the temp init directory should be created");
     path
@@ -190,9 +192,18 @@ fn init_json_reports_the_write() {
     );
     let body: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("json init should print one JSON object");
-    assert_eq!(body.get("command").and_then(|value| value.as_str()), Some("init"));
-    assert_eq!(body.get("format").and_then(|value| value.as_str()), Some("json"));
-    assert_eq!(body.get("path").and_then(|value| value.as_str()), Some(arg.as_str()));
+    assert_eq!(
+        body.get("command").and_then(|value| value.as_str()),
+        Some("init")
+    );
+    assert_eq!(
+        body.get("format").and_then(|value| value.as_str()),
+        Some("json")
+    );
+    assert_eq!(
+        body.get("path").and_then(|value| value.as_str()),
+        Some(arg.as_str())
+    );
     assert_eq!(body.get("wrote"), Some(&serde_json::Value::Bool(true)));
     assert_eq!(body.get("unchanged"), Some(&serde_json::Value::Bool(false)));
     assert_eq!(body.get("dry_run"), Some(&serde_json::Value::Bool(false)));
@@ -303,7 +314,9 @@ fn init_dry_run_leaves_a_missing_path_missing() {
         "dry-run should succeed; stderr: {stderr}; stdout: {stdout}"
     );
     assert!(
-        stdout.contains(&arg) && stdout.contains("would write") && !stdout.contains("would write nothing"),
+        stdout.contains(&arg)
+            && stdout.contains("would write")
+            && !stdout.contains("would write nothing"),
         "dry-run should name the path and that it would write; stdout: {stdout}"
     );
     assert!(
@@ -426,9 +439,18 @@ fn init_does_not_print_an_openrouter_key_value() {
         "a key value that is not in the block should not refuse the write; stderr: {stderr}"
     );
     let written = fs::read_to_string(&config).expect("the config should be written");
-    assert!(!written.contains(sentinel), "the written file should not contain the key value");
-    assert!(!stdout.contains(sentinel), "stdout should not contain the key value; stdout: {stdout}");
-    assert!(!stderr.contains(sentinel), "stderr should not contain the key value; stderr: {stderr}");
+    assert!(
+        !written.contains(sentinel),
+        "the written file should not contain the key value"
+    );
+    assert!(
+        !stdout.contains(sentinel),
+        "stdout should not contain the key value; stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains(sentinel),
+        "stderr should not contain the key value; stderr: {stderr}"
+    );
     assert_eq!(written, BLOCK);
     remove_temp(&dir);
 }
@@ -471,14 +493,27 @@ fn init_refuses_a_router_key_that_is_not_a_table_and_writes_nothing() {
     let json_err = stderr_text(&json);
     let body: serde_json::Value = serde_json::from_str(json_err.trim())
         .expect("a json refusal should be one JSON object on stderr");
-    assert_eq!(body.get("command").and_then(|value| value.as_str()), Some("init"));
-    assert_eq!(body.get("format").and_then(|value| value.as_str()), Some("json"));
+    assert_eq!(
+        body.get("command").and_then(|value| value.as_str()),
+        Some("init")
+    );
+    assert_eq!(
+        body.get("format").and_then(|value| value.as_str()),
+        Some("json")
+    );
     assert_eq!(
         body.get("error").and_then(|value| value.as_str()),
         Some("init_router_not_table")
     );
-    assert_eq!(body.get("kind").and_then(|value| value.as_str()), Some("init_router_not_table"));
-    assert!(body.get("message").and_then(|value| value.as_str()).is_some());
+    assert_eq!(
+        body.get("kind").and_then(|value| value.as_str()),
+        Some("init_router_not_table")
+    );
+    assert!(
+        body.get("message")
+            .and_then(|value| value.as_str())
+            .is_some()
+    );
     assert_eq!(
         fs::read_to_string(&config).expect("the json refusal should leave the file"),
         original
@@ -506,7 +541,10 @@ fn init_refuses_an_unparsed_file_and_an_empty_config_flag() {
         fs::read_to_string(&config).expect("the broken file should stay"),
         broken
     );
-    assert!(!backup_path(&config).exists(), "a parse refusal should not take a backup");
+    assert!(
+        !backup_path(&config).exists(),
+        "a parse refusal should not take a backup"
+    );
 
     let empty = run(&dir, &["--config", "", "init"]);
     let empty_err = stderr_text(&empty);

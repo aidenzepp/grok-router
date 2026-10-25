@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::config_edit::{CatalogModel, RefuseReason, require_slug};
 
 /// A cache younger than this duration is the answer, unless refresh was asked for.
-pub const CACHE_FRESH: Duration = Duration::from_secs(60 * 60);
+pub const CACHE_FRESH: Duration = Duration::from_hours(1);
 
 /// Largest response body accepted from the models endpoint.
 const CATALOG_BODY_LIMIT: u64 = 32 * 1024 * 1024;
@@ -24,10 +24,15 @@ const CATALOG_BODY_LIMIT: u64 = 32 * 1024 * 1024;
 /// One catalog row, parsed once so later edits do not parse the JSON again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogRow {
+    /// Provider id, such as `z-ai/glm-5.3`.
     id: String,
+    /// Catalog display name. Empty when the document omitted it.
     name: String,
+    /// Catalog description. Empty when the document omitted it.
     description: String,
+    /// Token context length when the document gave an integer.
     context_length: Option<i64>,
+    /// Whether an input modality names an image.
     sees_image: bool,
 }
 
@@ -125,7 +130,7 @@ pub enum CatalogError {
         /// Parser detail.
         detail: String,
     },
-    /// The JSON was not an OpenRouter models document.
+    /// The JSON was not an `OpenRouter` models document.
     #[error("{detail}. Pass an OpenRouter /api/v1/models document via --catalog-file.")]
     Shape {
         /// What was missing.
@@ -168,7 +173,7 @@ pub enum CatalogError {
         "refusing to write an empty catalog cache. 0 bytes. Pass --catalog-file or retry the download."
     )]
     EmptyCacheWrite,
-    /// Direct-catalog bytes were not JSON. This is not an OpenRouter document error.
+    /// Direct-catalog bytes were not JSON. This is not an `OpenRouter` document error.
     #[error(
         "the catalog JSON could not be parsed: {detail}. Pass a deepseek-list-models document. Nothing was written."
     )]
@@ -195,7 +200,7 @@ impl CatalogError {
 }
 
 impl CatalogError {
-    /// Snake_case name of this catalog failure.
+    /// `Snake_case` name of this catalog failure.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -253,8 +258,11 @@ fn http_sentence(detail: &str, env_key: &str) -> String {
 /// GET request for the models catalog. Building it does not send it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CatalogRequest {
+    /// Bearer token. `Debug` redacts it.
     api_key: String,
+    /// Models URL this request would GET.
     url: String,
+    /// Environment variable the bearer was read from.
     env_key: String,
 }
 
@@ -286,7 +294,7 @@ impl fmt::Debug for CatalogRequest {
             .field("url", &self.url())
             .field("env_key", &self.env_key)
             .field("authorization", &"Bearer <redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -335,7 +343,7 @@ impl ResolveError {
 }
 
 impl ResolveError {
-    /// Snake_case name of this match failure.
+    /// `Snake_case` name of this match failure.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -402,7 +410,7 @@ pub fn cache_choice(age: Duration, refresh: bool) -> CacheChoice {
     }
 }
 
-/// Parse an OpenRouter `/api/v1/models` document.
+/// Parse an `OpenRouter` `/api/v1/models` document.
 ///
 /// # Errors
 ///
@@ -451,7 +459,7 @@ pub enum CartridgeError {
 }
 
 impl CartridgeError {
-    /// Snake_case name of this cartridge failure.
+    /// `Snake_case` name of this cartridge failure.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -470,8 +478,8 @@ pub struct TimeoutError;
 
 /// Parse catalog bytes and choose a config slug.
 ///
-/// `slug`'s second argument is `--as`. OpenRouter derives `or-` plus the leaf
-/// when it is absent. DeepSeek uses the model id itself and does not invent a leaf.
+/// `slug`'s second argument is `--as`. `OpenRouter` derives `or-` plus the leaf
+/// when it is absent. `DeepSeek` uses the model id itself and does not invent a leaf.
 pub trait CatalogCartridge {
     /// Parse `bytes` into rows.
     ///
@@ -507,7 +515,7 @@ impl CatalogCartridge for Cartridge {
 /// Select the cartridge named by `catalog_id`.
 ///
 /// `None` and `Some("")` are missing. Any other string is unknown and does not
-/// select OpenRouter. This is the only match on the catalog id strings.
+/// select `OpenRouter`. This is the only match on the catalog id strings.
 ///
 /// # Errors
 ///
@@ -522,9 +530,13 @@ pub fn cartridge(catalog_id: Option<&str>) -> Result<Cartridge, CartridgeError> 
     }
 }
 
-/// OpenRouter slug: `or-` plus the leaf, or `--as` as given.
+/// `OpenRouter` slug: `or-` plus the leaf, or `--as` as given.
 ///
 /// This is the only path that adds an `or-` prefix.
+///
+/// # Errors
+///
+/// Returns a refusal when `--as` or the derived leaf is not a legal slug.
 fn openrouter_slug(model_id: &str, explicit: Option<&str>) -> Result<String, RefuseReason> {
     match explicit {
         Some(slug) => {
@@ -536,6 +548,10 @@ fn openrouter_slug(model_id: &str, explicit: Option<&str>) -> Result<String, Ref
 }
 
 /// `or-` plus the normalized last path segment of `provider_id`.
+///
+/// # Errors
+///
+/// Returns a refusal when `provider_id` is empty or its leaf is not a legal slug.
 fn openrouter_leaf_slug(provider_id: &str) -> Result<String, RefuseReason> {
     if provider_id.is_empty() {
         return Err(RefuseReason::EmptyProviderId);
@@ -575,7 +591,11 @@ fn normalize_leaf(leaf: &str) -> String {
     normalized
 }
 
-/// DeepSeek slug: the id itself, or `--as` when present. Never a derived leaf.
+/// `DeepSeek` slug: the id itself, or `--as` when present. Never a derived leaf.
+///
+/// # Errors
+///
+/// Returns a refusal when the id or `--as` is not a legal slug.
 fn deepseek_slug(model_id: &str, explicit: Option<&str>) -> Result<String, RefuseReason> {
     let slug = explicit.unwrap_or(model_id);
     require_slug(slug)?;
@@ -672,7 +692,10 @@ pub fn prepare_cached_body(
 /// A fresh non-empty cache body, or the GET that should replace it.
 enum FreshBytesOrFetch {
     /// Bytes younger than one hour. Not parsed.
-    Fresh { bytes: Vec<u8> },
+    Fresh {
+        /// Cache body.
+        bytes: Vec<u8>,
+    },
     /// GET the caller should perform.
     Fetch(CatalogRequest),
 }
@@ -681,6 +704,10 @@ enum FreshBytesOrFetch {
 ///
 /// Does not parse. An empty cache and a cache at least one hour old both fall
 /// through to the request. `refresh` skips the cache.
+///
+/// # Errors
+///
+/// Returns [`CatalogError::MissingKey`] when a download needs a blank key, and [`CatalogError::CacheIo`] when the cache file cannot be read.
 fn fresh_bytes_or_fetch(
     cache_dir: &Path,
     now: SystemTime,
@@ -691,12 +718,12 @@ fn fresh_bytes_or_fetch(
 ) -> Result<FreshBytesOrFetch, CatalogError> {
     let url = models_url(base_url);
     let path = cache_path_for(cache_dir, &url);
-    if !refresh {
-        if let Some((bytes, age)) = read_cache_age(&path, now)? {
-            if !bytes.is_empty() && cache_choice(age, false) == CacheChoice::Use {
-                return Ok(FreshBytesOrFetch::Fresh { bytes });
-            }
-        }
+    if !refresh
+        && let Some((bytes, age)) = read_cache_age(&path, now)?
+        && !bytes.is_empty()
+        && cache_choice(age, false) == CacheChoice::Use
+    {
+        return Ok(FreshBytesOrFetch::Fresh { bytes });
     }
     catalog_request(api_key, &url, env_key).map(FreshBytesOrFetch::Fetch)
 }
@@ -792,9 +819,22 @@ fn cache_file_name(models_url: &str) -> String {
 fn encode_hex(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
-        encoded.push_str(&format!("{byte:02x}"));
+        push_hex_byte(&mut encoded, *byte);
     }
     encoded
+}
+
+/// Append two lowercase hex digits.
+fn push_hex_byte(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let Some(high) = HEX.get(usize::from(byte >> 4)) else {
+        return;
+    };
+    let Some(low) = HEX.get(usize::from(byte & 0x0f)) else {
+        return;
+    };
+    out.push(char::from(*high));
+    out.push(char::from(*low));
 }
 
 /// Store catalog bytes for `base_url` under `cache_dir`.
@@ -833,6 +873,10 @@ pub fn write_cache(
 }
 
 /// Parse one `data` element into a row.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the element is not an object or a required field has the wrong type.
 fn parse_row(index: usize, item: &Value) -> Result<CatalogRow, CatalogError> {
     let Some(object) = item.as_object() else {
         return Err(CatalogError::Row {
@@ -869,6 +913,10 @@ fn parse_row(index: usize, item: &Value) -> Result<CatalogRow, CatalogError> {
 /// Reads `id`, `name`, `context_window`, and `input_modalities` from each
 /// `data` element. Does not read `description`, `context_length`,
 /// `architecture`, or any other field. Does not write a file.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the bytes are not a direct catalog document or a row cannot be read.
 fn parse_direct(bytes: &[u8]) -> Result<Vec<CatalogRow>, CatalogError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|err| CatalogError::DirectJson {
         detail: err.to_string(),
@@ -886,6 +934,10 @@ fn parse_direct(bytes: &[u8]) -> Result<Vec<CatalogRow>, CatalogError> {
 }
 
 /// Parse one direct `data` element. Other fields on the object are ignored.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the element is not an object or a required field has the wrong type.
 fn parse_direct_row(index: usize, item: &Value) -> Result<CatalogRow, CatalogError> {
     let Some(object) = item.as_object() else {
         return Err(CatalogError::Row {
@@ -916,6 +968,10 @@ fn parse_direct_row(index: usize, item: &Value) -> Result<CatalogRow, CatalogErr
 /// Read `context_window` when it is an integer, null, or absent.
 ///
 /// Zero and other non-positive integers are kept. A present non-integer fails the row.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the field is present and is not an integer or null.
 fn optional_context_window(
     value: Option<&Value>,
     index: usize,
@@ -949,6 +1005,10 @@ fn optional_context_window(
 /// Whether top-level `input_modalities` contains `image`.
 ///
 /// Absence and null are no image. A present non-array fails the row.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the field is present and is not an array or null.
 fn direct_sees_image(value: Option<&Value>, index: usize) -> Result<bool, CatalogError> {
     match value {
         None | Some(Value::Null) => Ok(false),
@@ -964,6 +1024,10 @@ fn direct_sees_image(value: Option<&Value>, index: usize) -> Result<bool, Catalo
 }
 
 /// Read a required string field.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the field is missing or not a string.
 fn required_string(
     value: Option<&Value>,
     index: usize,
@@ -983,6 +1047,10 @@ fn required_string(
 }
 
 /// Read an optional string field. Null and absence become `None`.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the field is present and is not a string or null.
 fn optional_string(
     value: Option<&Value>,
     index: usize,
@@ -999,6 +1067,10 @@ fn optional_string(
 }
 
 /// Read `context_length` when it is an integer, null, or absent.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the field is present and is not an integer or null.
 fn optional_context_length(
     value: Option<&Value>,
     index: usize,
@@ -1030,6 +1102,10 @@ fn optional_context_length(
 }
 
 /// Whether architecture input modalities include image.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the modalities are present and not an array.
 fn sees_image(value: Option<&Value>, index: usize) -> Result<bool, CatalogError> {
     let Some(value) = value else {
         return Ok(false);
@@ -1095,6 +1171,10 @@ fn display_terms(terms: &[String]) -> String {
 }
 
 /// Age of a cache file, or `None` when the file is absent or its mtime is in the future.
+///
+/// # Errors
+///
+/// Returns [`CatalogError::CacheIo`] when the file exists and cannot be read.
 fn read_cache_age(
     path: &Path,
     now: SystemTime,
@@ -1318,11 +1398,11 @@ mod tests {
             turbo.sees_image(),
             "Image in input_modalities should count, regardless of case"
         );
-        assert_eq!(turbo.context_length(), Some(128000));
+        assert_eq!(turbo.context_length(), Some(128_000));
         let model = turbo.as_catalog_model();
         assert_eq!(model.id, "gpt-4-turbo");
         assert_eq!(model.name, Some("GPT-4 Turbo"));
-        assert_eq!(model.context_window, Some(128000));
+        assert_eq!(model.context_window, Some(128_000));
         assert!(model.sees_image);
 
         let plain = row(&rows, "gpt-4");
@@ -1472,7 +1552,7 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let before = fs::read(&path).expect("the cache fixture should still be readable");
-        let now = modified + Duration::from_secs(30 * 60);
+        let now = modified + Duration::from_mins(30);
         let prepared = prepare_cached_body(&dir, now, false, "", OPENROUTER_BASE, OPENROUTER_ENV)
             .expect("a fresh cache should load without an API key");
         match prepared {
@@ -1503,8 +1583,15 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let now = modified + CACHE_FRESH;
-        let prepared = prepare_cached_body(&dir, now, false, "test-key", OPENROUTER_BASE, OPENROUTER_ENV)
-            .expect("a stale cache with a key should plan a download");
+        let prepared = prepare_cached_body(
+            &dir,
+            now,
+            false,
+            "test-key",
+            OPENROUTER_BASE,
+            OPENROUTER_ENV,
+        )
+        .expect("a stale cache with a key should plan a download");
         match prepared {
             CachedBodyOrFetch::Fetch(request) => {
                 assert_eq!(request.method(), "GET");
@@ -1531,8 +1618,9 @@ mod tests {
             .set_modified(modified)
             .expect("the test should set the cache mtime");
         let now = modified + Duration::from_secs(1);
-        let prepared = prepare_cached_body(&dir, now, true, "test-key", OPENROUTER_BASE, OPENROUTER_ENV)
-            .expect("refresh with a key should plan a download");
+        let prepared =
+            prepare_cached_body(&dir, now, true, "test-key", OPENROUTER_BASE, OPENROUTER_ENV)
+                .expect("refresh with a key should plan a download");
         assert!(
             matches!(prepared, CachedBodyOrFetch::Fetch(_)),
             "refresh must ignore a fresh cache"
@@ -1687,7 +1775,7 @@ mod tests {
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         set_cache_mtime(&path, modified);
         set_cache_mtime(&decoy, modified);
-        let now = modified + Duration::from_secs(30 * 60);
+        let now = modified + Duration::from_mins(30);
         let prepared = prepare_cached_body(&dir, now, false, "", OPENROUTER_BASE, OPENROUTER_ENV)
             .expect("a fresh hex cache should answer the OpenRouter URL");
         match prepared {
@@ -1750,7 +1838,7 @@ mod tests {
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         set_cache_mtime(&custom, modified);
         set_cache_mtime(&decoy, modified);
-        let now = modified + Duration::from_secs(30 * 60);
+        let now = modified + Duration::from_mins(30);
         let prepared = prepare_cached_body(
             &dir,
             now,
@@ -1759,7 +1847,7 @@ mod tests {
             "https://example.invalid/v1/",
             "EXAMPLE_API_KEY",
         )
-            .expect("a fresh cache for the derived custom URL should load");
+        .expect("a fresh cache for the derived custom URL should load");
         match prepared {
             CachedBodyOrFetch::Cached(bytes) => {
                 let rows = parse_catalog(&bytes)
@@ -2308,7 +2396,7 @@ mod tests {
         fs::write(&path, bytes).expect("the fresh body fixture should be written");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         set_cache_mtime(&path, modified);
-        let now = modified + Duration::from_secs(30 * 60);
+        let now = modified + Duration::from_mins(30);
         let prepared = prepare_cached_body(&dir, now, false, "", base, "DEEPSEEK_API_KEY")
             .expect("a fresh cache body should load without an API key");
         match prepared {
@@ -2363,11 +2451,7 @@ mod tests {
     }
 
     fn lowercase_hex(text: &str) -> String {
-        let mut hex = String::new();
-        for byte in text.as_bytes() {
-            hex.push_str(&format!("{byte:02x}"));
-        }
-        hex
+        encode_hex(text.as_bytes())
     }
 
     fn set_cache_mtime(path: &Path, modified: SystemTime) {

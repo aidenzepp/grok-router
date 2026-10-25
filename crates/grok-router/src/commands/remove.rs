@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use crate::OutputMode;
 use crate::config_edit::{self, Backup, RefuseReason};
 use crate::error::Error;
-use crate::OutputMode;
 
 /// Delete one model block from the config. This command deletes a model block.
 #[derive(Debug, Args)]
@@ -46,12 +46,16 @@ pub fn run(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> i32 {
 }
 
 /// Delete one slug, or preview that deletion. Does not prompt.
+///
+/// # Errors
+///
+/// Returns an error when the slug, path, or deletion is refused. Nothing is deleted on that path.
 fn run_remove(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> Result<String, Error> {
     let slug = required_slug(&args.slug)?;
     let config_path = configured_path(config)?;
     let original = read_config_text(&config_path)?;
-    let edited =
-        config_edit::remove_model(&original, &slug).map_err(|refused| edit_failure(refused.reason))?;
+    let edited = config_edit::remove_model(&original, &slug)
+        .map_err(|refused| edit_failure(refused.reason))?;
     let dry_run = args.dry_run;
     let confirmed = args.yes;
     if !dry_run && !confirmed {
@@ -74,6 +78,10 @@ fn run_remove(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> Resu
 }
 
 /// The positional slug. An empty slug is a usage failure and deletes nothing.
+///
+/// # Errors
+///
+/// Returns an error when the slug is empty.
 fn required_slug(slug: &str) -> Result<String, Error> {
     if slug.is_empty() {
         Err(Error::RemoveSlugEmpty)
@@ -83,6 +91,10 @@ fn required_slug(slug: &str) -> Result<String, Error> {
 }
 
 /// `--config` from the global flag. Never a home path.
+///
+/// # Errors
+///
+/// Returns an error when `--config` is omitted or empty.
 fn configured_path(config: Option<&str>) -> Result<PathBuf, Error> {
     match config {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
@@ -92,6 +104,10 @@ fn configured_path(config: Option<&str>) -> Result<PathBuf, Error> {
 }
 
 /// Read the named config. A missing file is a failure and not a reason to look elsewhere.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or is not UTF-8.
 fn read_config_text(path: &Path) -> Result<String, Error> {
     let bytes = fs::read(path).map_err(|err| Error::RemoveConfigIo {
         path: path.to_path_buf(),
@@ -108,6 +124,10 @@ fn edit_failure(reason: RefuseReason) -> Error {
 }
 
 /// Human text, the slug, or one JSON object.
+///
+/// # Errors
+///
+/// Returns [`Error::JsonEncode`] when the report cannot be encoded.
 fn render(mode: OutputMode, report: &RemoveReport) -> Result<String, Error> {
     if mode == OutputMode::Json {
         return serde_json::to_string(report).map_err(|err| Error::JsonEncode {

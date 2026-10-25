@@ -6,6 +6,11 @@
         reason = "tests report failures rather than document callable contracts"
     )
 )]
+#![allow(
+    clippy::cargo_common_metadata,
+    clippy::multiple_crate_versions,
+    reason = "license is unset, and windows-sys 0.52 and 0.61 are transitive"
+)]
 
 //! Binary for the `grok-router` command.
 
@@ -69,10 +74,10 @@ fn output_source(matches: &clap::ArgMatches) -> ValueSource {
 
 /// Walk root and subcommand matches. Keep the strongest `--output` source.
 fn consider_output(matches: &clap::ArgMatches, best: &mut ValueSource) {
-    if let Some(source) = matches.value_source("output") {
-        if source_rank(source) > source_rank(*best) {
-            *best = source;
-        }
+    if let Some(source) = matches.value_source("output")
+        && source_rank(source) > source_rank(*best)
+    {
+        *best = source;
     }
     if let Some((_, child)) = matches.subcommand() {
         consider_output(child, best);
@@ -169,19 +174,16 @@ fn argv_requests_json() -> bool {
     if saw_json_flag {
         return true;
     }
-    std::env::var("GROK_ROUTER_OUTPUT")
-        .ok()
-        .is_some_and(|value| is_json_format(&value))
+    std::env::var("GROK_ROUTER_OUTPUT").is_ok_and(|value| is_json_format(&value))
 }
 
 /// Top-level subcommand named in a clap usage error.
 ///
 /// A failure before any of those names uses `grok-router`. `skill` stays `skill`.
 fn usage_command_name() -> &'static str {
-    let args: Vec<String> = std::env::args().skip(1).map(|arg| arg).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
+    while let Some(arg) = args.get(index).map(String::as_str) {
         if arg == "--" {
             break;
         }

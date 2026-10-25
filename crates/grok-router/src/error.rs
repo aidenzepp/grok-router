@@ -335,9 +335,7 @@ pub enum Error {
         source: CartridgeError,
     },
     /// Built-in membership failed before a catalog read.
-    #[error(
-        "{reason}. The file was left unchanged. Nothing was downloaded. Nothing was written."
-    )]
+    #[error("{reason}. The file was left unchanged. Nothing was downloaded. Nothing was written.")]
     AddEarlyRefusal {
         /// Why membership could not be read.
         #[source]
@@ -474,9 +472,7 @@ pub enum Error {
         source: CatalogError,
     },
     /// `search` was given an empty `--config`.
-    #[error(
-        "--config is empty, so the catalog was not read. Pass --config with the file to read."
-    )]
+    #[error("--config is empty, so the catalog was not read. Pass --config with the file to read.")]
     SearchConfigEmpty,
     /// `search` has no home path.
     #[error(
@@ -846,7 +842,10 @@ fn remove_next(reason: &RefuseReason) -> String {
 
 /// `add` refusal, including the next action.
 fn add_edit_sentence(reason: &RefuseReason) -> String {
-    format!("{reason}. The file was left unchanged. {}", add_next(reason))
+    format!(
+        "{reason}. The file was left unchanged. {}",
+        add_next(reason)
+    )
 }
 
 /// The next action for a refused add.
