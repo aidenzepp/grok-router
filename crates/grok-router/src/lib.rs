@@ -16,6 +16,7 @@ use clap::{ArgAction, Args, Command, CommandFactory, Parser, Subcommand, ValueEn
 pub mod catalog;
 pub mod commands;
 pub mod config_edit;
+pub mod error;
 pub mod skill;
 
 /// Format named by `--output`. `Json` and `Jsonl` render the same one JSON value.
@@ -57,6 +58,12 @@ pub struct Cli {
     /// add, set-default, and remove still require --config.
     #[arg(long, global = true, value_name = "PATH", verbatim_doc_comment)]
     pub config: Option<String>,
+
+    /// Rows for a bare invocation, which runs list. Not global. list --limit is the same flag.
+    ///
+    /// Omitting it lists every row.
+    #[arg(long, value_name = "N", hide = true, verbatim_doc_comment)]
+    pub limit: Option<String>,
 
     /// text, json, or jsonl. json and jsonl print the same one JSON value.
     #[arg(
@@ -105,14 +112,14 @@ impl Cli {
     pub fn resolve_output(
         &self,
         source: clap::parser::ValueSource,
-    ) -> Result<OutputMode, String> {
+    ) -> Result<OutputMode, error::Error> {
         let json_alias = self.json || self.jsonl;
         let format = if source == clap::parser::ValueSource::CommandLine {
             if json_alias && self.output == OutputFormat::Text {
                 let flag = if self.json { "--json" } else { "--jsonl" };
-                return Err(format!(
+                return Err(error::Error::command(format!(
                     "{flag} conflicts with --output text, so nothing was written. Drop {flag} or pass --output json."
-                ));
+                )));
             }
             self.output
         } else if json_alias {
@@ -121,16 +128,33 @@ impl Cli {
             self.output
         };
         if self.quiet && matches!(format, OutputFormat::Json | OutputFormat::Jsonl) {
-            return Err(
-                "--quiet conflicts with json output, so nothing was written. Drop --quiet or pass --output text."
-                    .to_owned(),
-            );
+            return Err(error::Error::command(
+                "--quiet conflicts with json output, so nothing was written. Drop --quiet or pass --output text.",
+            ));
         }
         Ok(match (self.quiet, format) {
             (true, _) => OutputMode::Quiet,
             (_, OutputFormat::Json | OutputFormat::Jsonl) => OutputMode::Json,
             (_, OutputFormat::Text) => OutputMode::Text,
         })
+    }
+
+    /// Subcommand name for a failure, including bare invocation as `list`.
+    ///
+    /// Skill and `__internal` report `skill`.
+    #[must_use]
+    pub fn command_name(&self) -> &'static str {
+        match &self.command {
+            None | Some(Commands::List(_)) => "list",
+            Some(Commands::Search(_)) => "search",
+            Some(Commands::Add(_)) => "add",
+            Some(Commands::SetDefault(_)) => "set-default",
+            Some(Commands::Remove(_)) => "remove",
+            Some(Commands::Completions(_)) => "completions",
+            Some(Commands::Schema(_)) => "schema",
+            Some(Commands::Skill(args)) => args.command_name(),
+            Some(Commands::Internal(_)) => "skill",
+        }
     }
 }
 
@@ -184,8 +208,8 @@ impl CompletionsArgs {
     #[must_use]
     pub fn run(&self, mode: OutputMode) -> i32 {
         match render_completion(&self.shell, mode) {
-            Ok(body) => write_stdout(mode, &body, "completion script"),
-            Err(message) => fail_message(mode, &message),
+            Ok(body) => write_stdout(mode, &body, "completion script", "completions"),
+            Err(err) => fail_message(mode, "completions", &err),
         }
     }
 }
@@ -203,8 +227,8 @@ impl SchemaArgs {
     #[must_use]
     pub fn run(&self, mode: OutputMode) -> i32 {
         match schema_document() {
-            Ok(body) => write_stdout(mode, &body, "schema"),
-            Err(message) => fail_message(mode, &message),
+            Ok(body) => write_stdout(mode, &body, "schema", "schema"),
+            Err(err) => fail_message(mode, "schema", &err),
         }
     }
 }
@@ -215,25 +239,36 @@ pub fn command() -> Command {
     Cli::command()
 }
 
-/// Print `message` to stderr and return `1`.
+/// Print `err` to stderr and return `1`.
 ///
-/// JSON mode prints one object with `error`, `kind`, and `message`.
+/// Text and quiet print the sentence. JSON prints one object with `command`,
+/// `format`, `error`, `kind`, and `message`. `format` is `json` for both JSON modes.
 #[must_use]
-pub fn fail_message(mode: OutputMode, message: &str) -> i32 {
+pub fn fail_message(mode: OutputMode, command: &str, err: &error::Error) -> i32 {
+    write_failure(mode, command, err);
+    1
+}
+
+/// Print `err` without choosing the exit code.
+///
+/// Clap usage keeps clap's exit code and uses this for the JSON body.
+pub fn write_failure(mode: OutputMode, command: &str, err: &error::Error) {
     match mode {
         OutputMode::Json => {
+            let kind = err.kind();
             let body = serde_json::json!({
-                "error": "error",
-                "kind": "error",
-                "message": message,
+                "command": command,
+                "format": "json",
+                "error": kind,
+                "kind": kind,
+                "message": err.to_string(),
             });
             eprintln!("{body}");
         }
         OutputMode::Text | OutputMode::Quiet => {
-            eprintln!("{message}");
+            eprintln!("{err}");
         }
     }
-    1
 }
 
 /// Completion script for one shell, or the refusal that names the five shells.
@@ -241,13 +276,13 @@ pub fn fail_message(mode: OutputMode, message: &str) -> i32 {
 /// # Errors
 ///
 /// Returns the refusal when `shell` is not one of the five names. The config was not read.
-fn render_completion(shell: &str, mode: OutputMode) -> Result<String, String> {
+fn render_completion(shell: &str, mode: OutputMode) -> Result<String, error::Error> {
     let script = completion_script(shell)?;
     match mode {
         OutputMode::Json => serde_json::to_string(&script).map_err(|err| {
-            format!(
+            error::Error::command(format!(
                 "could not encode the completion script as JSON: {err}. Retry completions."
-            )
+            ))
         }),
         OutputMode::Text | OutputMode::Quiet => Ok(script),
     }
@@ -258,7 +293,7 @@ fn render_completion(shell: &str, mode: OutputMode) -> Result<String, String> {
 /// # Errors
 ///
 /// Returns the refusal when `shell` is not bash, zsh, fish, elvish, or powershell.
-fn completion_script(shell: &str) -> Result<String, String> {
+fn completion_script(shell: &str) -> Result<String, error::Error> {
     let clap_shell = match shell {
         "bash" => clap_complete::Shell::Bash,
         "zsh" => clap_complete::Shell::Zsh,
@@ -266,17 +301,18 @@ fn completion_script(shell: &str) -> Result<String, String> {
         "elvish" => clap_complete::Shell::Elvish,
         "powershell" => clap_complete::Shell::PowerShell,
         _ => {
-            return Err(format!(
+            return Err(error::Error::command(format!(
                 "unknown shell {shell}. Pass bash, zsh, fish, elvish, or powershell. The config was not read and nothing was written."
-            ));
+            )));
         }
     };
     let mut cmd = command();
     let mut buf = Vec::new();
     clap_complete::generate(clap_shell, &mut cmd, "grok-router", &mut buf);
     String::from_utf8(buf).map_err(|_| {
-        "the completion script was not valid UTF-8, so nothing was written. Retry completions."
-            .to_owned()
+        error::Error::command(
+            "the completion script was not valid UTF-8, so nothing was written. Retry completions.",
+        )
     })
 }
 
@@ -285,7 +321,7 @@ fn completion_script(shell: &str) -> Result<String, String> {
 /// # Errors
 ///
 /// Returns an error when the document cannot be encoded.
-fn schema_document() -> Result<String, String> {
+fn schema_document() -> Result<String, error::Error> {
     let body = serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://grok-router.local/output.schema.json",
@@ -298,12 +334,14 @@ fn schema_document() -> Result<String, String> {
         ]
     });
     serde_json::to_string(&body).map_err(|err| {
-        format!("could not encode the output schema as JSON: {err}. Retry schema.")
+        error::Error::command(format!(
+            "could not encode the output schema as JSON: {err}. Retry schema."
+        ))
     })
 }
 
 /// Write `body` and a trailing newline. A closed pipe is success.
-fn write_stdout(mode: OutputMode, body: &str, what: &str) -> i32 {
+fn write_stdout(mode: OutputMode, body: &str, what: &str, command: &str) -> i32 {
     let mut stdout = io::stdout().lock();
     let mut bytes = body.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -314,7 +352,10 @@ fn write_stdout(mode: OutputMode, body: &str, what: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail_message(
             mode,
-            &format!("could not write the {what}: {err}. Retry when stdout accepts output."),
+            command,
+            &error::Error::command(format!(
+                "could not write the {what}: {err}. Retry when stdout accepts output."
+            )),
         ),
     }
 }

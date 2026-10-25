@@ -11,15 +11,30 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use crate::config_edit::{self, ConfiguredInventory, RefuseReason};
+use crate::error::Error;
 use crate::OutputMode;
 
 /// List configured models and the saved default. This command does not modify the config.
 #[derive(Debug, Args)]
 #[command(
     verbatim_doc_comment,
-    after_help = "Examples:\n  grok-router list --config config.toml"
+    after_help = "Examples:\n  grok-router list --config config.toml\n  grok-router list --config config.toml --limit 1"
 )]
-pub struct ListArgs {}
+pub struct ListArgs {
+    /// Maximum rows to print.
+    ///
+    /// Omitting --limit lists every row.
+    #[arg(long, value_name = "N", verbatim_doc_comment)]
+    limit: Option<String>,
+}
+
+impl ListArgs {
+    /// `--limit` when it was passed. Absent lists every row.
+    #[must_use]
+    pub fn limit(&self) -> Option<&str> {
+        self.limit.as_deref()
+    }
+}
 
 /// Runs `list`, including the no-args path.
 ///
@@ -27,21 +42,25 @@ pub struct ListArgs {}
 ///
 /// Returns `0` when the inventory was printed and `1` when the config could not be read.
 #[must_use]
-pub fn run(config: Option<&str>, mode: OutputMode) -> i32 {
-    match list_models(config, mode) {
+pub fn run(config: Option<&str>, limit: Option<&str>, mode: OutputMode) -> i32 {
+    match list_models(config, limit, mode) {
         Ok(body) => write_stdout(mode, &body),
-        Err(message) => fail(mode, &message),
+        Err(err) => fail(mode, &err),
     }
 }
 
 /// Read the config and render the inventory. Does not write the file.
-fn list_models(config: Option<&str>, mode: OutputMode) -> Result<String, String> {
+fn list_models(
+    config: Option<&str>,
+    limit: Option<&str>,
+    mode: OutputMode,
+) -> Result<String, Error> {
     let path = config_path(config)?;
     let text = read_config_text(&path)?;
     let inventory =
-        config_edit::read_configured(&text).map_err(|refused| read_failure(&refused.reason))?;
-    let rows = display_rows(&inventory);
-    render(&rows, mode)
+        config_edit::read_configured(&text).map_err(|refused| read_failure(refused.reason))?;
+    let rows = limited(display_rows(&inventory), limit)?;
+    render(&rows, mode).map_err(Error::from)
 }
 
 /// `--config` when it was passed. Otherwise `${GROK_HOME:-$HOME/.grok}/config.toml`.
@@ -102,10 +121,33 @@ fn read_config_text(path: &Path) -> Result<String, String> {
 }
 
 /// What failed, why, and what to do next when the config text cannot be read.
-fn read_failure(reason: &RefuseReason) -> String {
-    format!(
+fn read_failure(reason: RefuseReason) -> Error {
+    let message = format!(
         "{reason}. The models were not listed. Fix the config so it parses as TOML, or pass --config with a readable file."
-    )
+    );
+    Error::refused(reason, message)
+}
+
+/// Keep the first `limit` rows. Omitting the flag keeps every row, in the same order.
+///
+/// # Errors
+///
+/// Returns an error when the value is zero or not a whole number. Nothing is printed.
+fn limited(rows: Vec<Row>, limit: Option<&str>) -> Result<Vec<Row>, Error> {
+    let Some(raw) = limit else {
+        return Ok(rows);
+    };
+    let Ok(count) = raw.parse::<usize>() else {
+        return Err(Error::command(format!(
+            "--limit {raw} is not a whole number, so nothing was listed. Omit --limit or pass a number greater than zero."
+        )));
+    };
+    if count == 0 {
+        return Err(Error::command(
+            "--limit 0 would hide every row, so nothing was listed. Omit --limit or pass a number greater than zero.",
+        ));
+    }
+    Ok(rows.into_iter().take(count).collect())
 }
 
 /// Configured models in slug order, plus the saved default when it has no block.
@@ -196,14 +238,16 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &format!("could not write the model list: {err}. Retry when stdout accepts output."),
+            &Error::command(format!(
+                "could not write the model list: {err}. Retry when stdout accepts output."
+            )),
         ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(mode: OutputMode, message: &str) -> i32 {
-    crate::fail_message(mode, message)
+fn fail(mode: OutputMode, err: &Error) -> i32 {
+    crate::fail_message(mode, "list", err)
 }
 
 /// One printed model.

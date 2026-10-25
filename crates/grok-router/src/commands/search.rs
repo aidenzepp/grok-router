@@ -20,6 +20,7 @@ use crate::catalog::{
     self, CachedBodyOrFetch, CartridgeError, CatalogCartridge, CatalogError, CatalogRow,
 };
 use crate::config_edit::{self, ProviderChoice, RefuseReason};
+use crate::error::Error;
 use crate::OutputMode;
 
 /// Search the selected provider catalog. This command does not modify the config.
@@ -77,7 +78,7 @@ pub struct SearchArgs {
 pub fn run(config: Option<&str>, args: &SearchArgs, mode: OutputMode) -> i32 {
     let timeout = match catalog::require_timeout(&args.timeout) {
         Ok(timeout) => timeout,
-        Err(message) => return fail(mode, &message),
+        Err(message) => return fail(mode, &Error::command(message)),
     };
     run_search(config, args, mode, timeout)
 }
@@ -86,23 +87,23 @@ pub fn run(config: Option<&str>, args: &SearchArgs, mode: OutputMode) -> i32 {
 fn run_search(config: Option<&str>, args: &SearchArgs, mode: OutputMode, timeout: Duration) -> i32 {
     let terms = match collect_terms(&args.terms) {
         Ok(terms) => terms,
-        Err(message) => return fail(mode, &message),
+        Err(message) => return fail(mode, &Error::command(message)),
     };
     let rows = match load_rows(config, args, timeout) {
         Ok(rows) => rows,
-        Err(message) => return fail(mode, &message),
+        Err(err) => return fail(mode, &err),
     };
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let matched = catalog::matching(&rows, &term_refs);
     if matched.is_empty() {
-        return fail(mode, &empty_message(&terms));
+        return fail(mode, &Error::command(empty_message(&terms)));
     }
     let shown = take_rows(&matched, args.limit);
     let color = allow_color(io::stdout().is_terminal(), no_color_is_set());
     let body = match mode {
         OutputMode::Json => match format_json(&shown) {
             Ok(body) => body,
-            Err(message) => return fail(mode, &message),
+            Err(message) => return fail(mode, &Error::command(message)),
         },
         OutputMode::Quiet => format_quiet(&shown, color),
         OutputMode::Text => format_table(&shown, color),
@@ -139,14 +140,14 @@ fn load_rows(
     config: Option<&str>,
     args: &SearchArgs,
     timeout: Duration,
-) -> Result<Vec<CatalogRow>, String> {
+) -> Result<Vec<CatalogRow>, Error> {
     let config_path = search_config_path(config)?;
     let text = read_config_text(&config_path)?;
     let choice = provider_choice(args);
     let record =
-        config_edit::resolve_provider(&text, choice).map_err(|reason| resolve_failure(&reason))?;
+        config_edit::resolve_provider(&text, choice).map_err(resolve_failure)?;
     let selected = catalog::cartridge(record.catalog.as_deref())
-        .map_err(|err| cartridge_failure(&record_name(&text, choice), &err))?;
+        .map_err(|err| cartridge_failure(&record_name(&text, choice), err))?;
     if let Some(path) = &args.catalog_file {
         let bytes = fs::read(path).map_err(|err| {
             format!(
@@ -154,9 +155,10 @@ fn load_rows(
                 path.display()
             )
         })?;
-        return selected
-            .parse(&bytes)
-            .map_err(|err| format!("{err} Nothing was downloaded. The config was not written."));
+        return selected.parse(&bytes).map_err(|err| {
+            let message = format!("{err} Nothing was downloaded. The config was not written.");
+            Error::catalog(err, message)
+        });
     }
 
     let api_key = bearer(&record.env_key)?;
@@ -173,27 +175,29 @@ fn load_rows(
         &record.base_url,
         &record.env_key,
     )
-        .map_err(|err| cache_failure(&err, &record.env_key))?
+        .map_err(|err| cache_failure(err, &record.env_key))?
     {
-        CachedBodyOrFetch::Cached(bytes) => selected
-            .parse(&bytes)
-            .map_err(|err| format!("{err} The config was not written.")),
+        CachedBodyOrFetch::Cached(bytes) => selected.parse(&bytes).map_err(|err| {
+            let message = format!("{err} The config was not written.");
+            Error::catalog(err, message)
+        }),
         CachedBodyOrFetch::Fetch(request) => {
             let bytes = catalog::fetch_catalog_bytes(&request, timeout)
-                .map_err(|err| cache_failure(&err, &record.env_key))?;
+                .map_err(|err| cache_failure(err, &record.env_key))?;
             let stored = catalog::write_cache(&cache_dir, &record.base_url, &bytes)
-                .map_err(|err| cache_failure(&err, &record.env_key))?;
+                .map_err(|err| cache_failure(err, &record.env_key))?;
             if stored != catalog::cache_path_for(&cache_dir, &catalog::models_url(&record.base_url))
             {
-                return Err(format!(
+                return Err(Error::command(format!(
                     "the catalog cache was written to {}, outside {}. The config was not written. Pass --cache-dir.",
                     stored.display(),
                     cache_dir.display()
-                ));
+                )));
             }
-            selected
-                .parse(&bytes)
-                .map_err(|err| format!("{err} The config was not written."))
+            selected.parse(&bytes).map_err(|err| {
+                let message = format!("{err} The config was not written.");
+                Error::catalog(err, message)
+            })
         }
     }
 }
@@ -225,9 +229,9 @@ fn record_name(config: &str, choice: ProviderChoice<'_>) -> String {
 }
 
 /// What failed, why the record was not used, and that nothing was downloaded or written.
-fn resolve_failure(reason: &RefuseReason) -> String {
+fn resolve_failure(reason: RefuseReason) -> Error {
     let preserved = "The file was left unchanged. Nothing was downloaded. Nothing was written.";
-    let must_write = match reason {
+    let must_write = match &reason {
         RefuseReason::InvalidSetting { key, detail }
             if key == "router"
                 || key == "default_provider"
@@ -238,29 +242,32 @@ fn resolve_failure(reason: &RefuseReason) -> String {
         }
         _ => "",
     };
-    format!("{reason}.{must_write} {preserved}")
+    let message = format!("{reason}.{must_write} {preserved}");
+    Error::refused(reason, message)
 }
 
 /// A cartridge refusal names the provider and does not parse or download.
-fn cartridge_failure(provider: &str, err: &CartridgeError) -> String {
+fn cartridge_failure(provider: &str, err: CartridgeError) -> Error {
     let next = "Set catalog to openrouter-models or deepseek-list-models, or pass --provider for a record that already has one.";
     let preserved = "Nothing was downloaded. Nothing was written.";
-    match err {
+    let message = match &err {
         CartridgeError::Missing => {
             format!("{provider} has no catalog cartridge configured. {preserved} {next}")
         }
         CartridgeError::Unknown { id } => format!(
             "catalog {id} on {provider} is not a cartridge, so no catalog cartridge is configured. {preserved} {next}"
         ),
-    }
+    };
+    Error::cartridge(err, message)
 }
 
 /// Turn a cache or download error into the command's sentence.
-fn cache_failure(err: &CatalogError, env_key: &str) -> String {
-    match err {
+fn cache_failure(err: CatalogError, env_key: &str) -> Error {
+    let message = match &err {
         CatalogError::MissingKey { .. } => missing_bearer(env_key),
         other => other.to_string(),
-    }
+    };
+    Error::catalog(err, message)
 }
 
 /// `--config` when it is set. Otherwise [`default_config_path`].
@@ -310,27 +317,27 @@ fn default_config_path() -> Result<PathBuf, String> {
 /// # Errors
 ///
 /// Returns an error when the file is missing, unreadable, or not UTF-8.
-fn read_config_text(path: &Path) -> Result<String, String> {
+fn read_config_text(path: &Path) -> Result<String, Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Err(resolve_failure(&RefuseReason::InvalidSetting {
+            return Err(resolve_failure(RefuseReason::InvalidSetting {
                 key: "router".to_owned(),
                 detail: "[router] is missing; write that table".to_owned(),
             }));
         }
         Err(err) => {
-            return Err(format!(
+            return Err(Error::command(format!(
                 "could not read config {}. {err}. The catalog was not read. Nothing was downloaded and the cache was not written. Pass --config pointing at a readable file.",
                 path.display()
-            ));
+            )));
         }
     };
     String::from_utf8(bytes).map_err(|_| {
-        format!(
+        Error::command(format!(
             "config {} is not UTF-8, so the catalog was not read. Nothing was downloaded and the cache was not written. Save it as UTF-8.",
             path.display()
-        )
+        ))
     })
 }
 
@@ -510,14 +517,16 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &format!("could not write search results: {err}. Retry when stdout accepts output."),
+            &Error::command(format!(
+                "could not write search results: {err}. Retry when stdout accepts output."
+            )),
         ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(mode: OutputMode, message: &str) -> i32 {
-    crate::fail_message(mode, message)
+fn fail(mode: OutputMode, err: &Error) -> i32 {
+    crate::fail_message(mode, "search", err)
 }
 
 /// One JSON object in the search array.

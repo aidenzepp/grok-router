@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use crate::config_edit::{self, Backup, RefuseReason};
+use crate::error::Error;
 use crate::OutputMode;
 
 /// Set [models].default for the next session. This does not switch the running session. This command writes the saved default unless --dry-run is set.
@@ -37,17 +38,17 @@ pub struct SetDefaultArgs {
 pub fn run(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> i32 {
     match apply(config, args, mode) {
         Ok(body) => write_stdout(mode, &body),
-        Err(message) => fail(mode, &message),
+        Err(err) => fail(mode, &err),
     }
 }
 
 /// Read `--config`, set the default in that text, and replace the file unless this is `--dry-run`.
-fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Result<String, String> {
+fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Result<String, Error> {
     let path = configured_path(config)?;
     let slug = requested_slug(&args.slug)?;
     let original = read_config_text(&path)?;
-    let edited = config_edit::set_default(&original, &slug)
-        .map_err(|refused| edit_failure(&refused.reason))?;
+    let edited =
+        config_edit::set_default(&original, &slug).map_err(|refused| edit_failure(refused.reason))?;
     let unchanged = edited == original;
     let dry_run = args.dry_run;
     let wrote = if unchanged || dry_run {
@@ -56,9 +57,10 @@ fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Resul
         config_edit::refuse_named_secrets(&edited, &[])?;
         config_edit::replace_file(&path, Backup::Sibling, edited.as_bytes(), "").map_err(
             |err| {
-                format!(
+                let message = format!(
                     "{err}. The saved default was not changed. Retry with a writable --config, or pass --dry-run to preview the slug."
-                )
+                );
+                Error::replace(err, message)
             },
         )?;
         true
@@ -69,7 +71,7 @@ fn apply(config: Option<&str>, args: &SetDefaultArgs, mode: OutputMode) -> Resul
         dry_run,
         unchanged,
     };
-    render(mode, &report)
+    render(mode, &report).map_err(Error::from)
 }
 
 /// `--config` from the global flag. Never a home path.
@@ -116,11 +118,12 @@ fn read_config_text(path: &Path) -> Result<String, String> {
 }
 
 /// What failed, why, and what to do next. The file was not written.
-fn edit_failure(reason: &RefuseReason) -> String {
-    format!(
+fn edit_failure(reason: RefuseReason) -> Error {
+    let message = format!(
         "{reason}. The file was left unchanged. {}",
-        next_step(reason)
-    )
+        next_step(&reason)
+    );
+    Error::refused(reason, message)
 }
 
 /// The next action for a refused edit.
@@ -187,16 +190,16 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &format!(
+            &Error::command(format!(
                 "could not write the set-default result: {err}. Retry when stdout accepts output."
-            ),
+            )),
         ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(mode: OutputMode, message: &str) -> i32 {
-    crate::fail_message(mode, message)
+fn fail(mode: OutputMode, err: &Error) -> i32 {
+    crate::fail_message(mode, "set-default", err)
 }
 
 /// One JSON object for a finished `set-default`.

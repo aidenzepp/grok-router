@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+use crate::error::Error;
 use crate::skill::{
     Confirmation, Effect, Presence, Report, SkillFailure, WriteMode, guide, inspect, remove, setup,
 };
@@ -136,6 +137,19 @@ struct WriteFlags {
     dry_run: bool,
 }
 
+impl SkillArgs {
+    /// Top-level command for a failure. Every skill action reports `skill`.
+    #[must_use]
+    pub const fn command_name(&self) -> &'static str {
+        match self.command {
+            SkillCommand::Setup(_)
+            | SkillCommand::Status(_)
+            | SkillCommand::Remove(_)
+            | SkillCommand::Show(_) => "skill",
+        }
+    }
+}
+
 /// Runs `skill`.
 ///
 /// Returns `0` when the command finished and `1` when it refused or failed.
@@ -163,7 +177,7 @@ fn run_setup(args: &SetupArgs, mode: OutputMode) -> i32 {
     let flags = &args.flags.read;
     let root = match skill_root(flags) {
         Ok(root) => root,
-        Err(message) => return fail_for(mode, "usage", &message),
+        Err(message) => return fail_command(mode, &Error::usage(message)),
     };
     finish(mode, "setup", setup(&root, write_mode(args.flags.dry_run)))
 }
@@ -171,7 +185,7 @@ fn run_setup(args: &SetupArgs, mode: OutputMode) -> i32 {
 fn run_status(args: &StatusArgs, mode: OutputMode) -> i32 {
     let root = match skill_root(&args.flags) {
         Ok(root) => root,
-        Err(message) => return fail_for(mode, "usage", &message),
+        Err(message) => return fail_command(mode, &Error::usage(message)),
     };
     finish(mode, "status", inspect(&root))
 }
@@ -180,15 +194,11 @@ fn run_remove(args: &RemoveArgs, mode: OutputMode) -> i32 {
     let flags = &args.flags.read;
     let confirmation = confirmation(args.yes);
     if confirmation == Confirmation::No {
-        return fail_for(
-            mode,
-            SkillFailure::NeedsYes.kind(),
-            &SkillFailure::NeedsYes.to_string(),
-        );
+        return fail_command(mode, &Error::from(SkillFailure::NeedsYes));
     }
     let root = match skill_root(flags) {
         Ok(root) => root,
-        Err(message) => return fail_for(mode, "usage", &message),
+        Err(message) => return fail_command(mode, &Error::usage(message)),
     };
     finish(
         mode,
@@ -203,27 +213,26 @@ fn write_guide(mode: OutputMode) -> i32 {
         OutputMode::Json => match serde_json::to_string(guide()) {
             Ok(json) => json,
             Err(err) => {
-                return fail_for(
+                return fail_command(
                     mode,
-                    "io",
-                    &format!(
+                    &Error::io(format!(
                         "could not encode the skill guide as JSON: {err}. Retry the command."
-                    ),
+                    )),
                 );
             }
         },
         OutputMode::Text | OutputMode::Quiet => guide().to_owned(),
     };
-    write_stdout(&body)
+    write_stdout(mode, &body)
 }
 
 fn finish(mode: OutputMode, command: &str, result: Result<Report, SkillFailure>) -> i32 {
     match result {
         Ok(report) => match render(command, &report, mode) {
-            Ok(body) => write_stdout(&body),
-            Err(message) => fail_for(mode, "io", &message),
+            Ok(body) => write_stdout(mode, &body),
+            Err(err) => fail_command(mode, &err),
         },
-        Err(err) => fail_for(mode, err.kind(), &err.to_string()),
+        Err(err) => fail_command(mode, &Error::from(err)),
     }
 }
 
@@ -259,7 +268,7 @@ fn confirmation(yes: bool) -> Confirmation {
     }
 }
 
-fn render(command: &str, report: &Report, mode: OutputMode) -> Result<String, String> {
+fn render(command: &str, report: &Report, mode: OutputMode) -> Result<String, Error> {
     match mode {
         OutputMode::Json => render_json(command, report),
         OutputMode::Quiet => Ok(render_quiet(command, report)),
@@ -267,7 +276,7 @@ fn render(command: &str, report: &Report, mode: OutputMode) -> Result<String, St
     }
 }
 
-fn render_json(command: &str, report: &Report) -> Result<String, String> {
+fn render_json(command: &str, report: &Report) -> Result<String, Error> {
     let body = JsonReport {
         command,
         status: report.disk.as_str(),
@@ -276,9 +285,9 @@ fn render_json(command: &str, report: &Report) -> Result<String, String> {
         path: report.path.display().to_string(),
     };
     serde_json::to_string(&body).map_err(|err| {
-        format!(
+        Error::io(format!(
             "could not encode the skill result as JSON: {err}. Retry the command; report this if it persists."
-        )
+        ))
     })
 }
 
@@ -327,7 +336,7 @@ fn render_text(command: &str, report: &Report) -> String {
 }
 
 /// Write the body and a trailing newline. A closed pipe is success.
-fn write_stdout(body: &str) -> i32 {
+fn write_stdout(mode: OutputMode, body: &str) -> i32 {
     let mut stdout = io::stdout().lock();
     let mut bytes = body.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -336,30 +345,17 @@ fn write_stdout(body: &str) -> i32 {
     match stdout.write_all(&bytes) {
         Ok(()) => 0,
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
-        Err(err) => fail_text(&format!(
-            "could not write the skill result: {err}. Retry when stdout accepts output."
-        )),
+        Err(err) => fail_command(
+            mode,
+            &Error::command(format!(
+                "could not write the skill result: {err}. Retry when stdout accepts output."
+            )),
+        ),
     }
 }
 
-fn fail_text(message: &str) -> i32 {
-    eprintln!("{message}");
-    1
-}
-
-fn fail_for(mode: OutputMode, kind: &str, message: &str) -> i32 {
-    match mode {
-        OutputMode::Json => {
-            let body = serde_json::json!({
-                "error": kind,
-                "kind": kind,
-                "message": message,
-            });
-            eprintln!("{body}");
-        }
-        OutputMode::Text | OutputMode::Quiet => eprintln!("{message}"),
-    }
-    1
+fn fail_command(mode: OutputMode, err: &Error) -> i32 {
+    crate::fail_message(mode, "skill", err)
 }
 
 /// One JSON object for setup, status, or remove.

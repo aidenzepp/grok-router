@@ -168,6 +168,19 @@ fn stderr_text(output: &std::process::Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("search stderr should be UTF-8")
 }
 
+/// Human sentence. JSON errors carry it in `message`; text errors are the raw stderr.
+fn refusal_sentence(stderr: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(stderr.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| stderr.to_owned())
+}
+
 fn assert_missing_router(stderr: &str, situation: &str) {
     assert!(
         stderr.contains("[router]"),
@@ -181,8 +194,9 @@ fn assert_missing_router(stderr: &str, situation: &str) {
         !stderr.contains(COMPILED_URL),
         "{situation} must not choose the compiled OpenRouter URL; stderr: {stderr}"
     );
+    let sentence = refusal_sentence(stderr);
     assert!(
-        !stderr.to_ascii_lowercase().contains("json"),
+        !sentence.to_ascii_lowercase().contains("json"),
         "{situation} must not report a JSON parse; stderr: {stderr}"
     );
 }
@@ -819,7 +833,7 @@ fn an_unknown_catalog_id_is_named_and_does_not_select_openrouter() {
         "stderr should say no catalog cartridge is configured; stderr: {stderr}"
     );
     assert!(
-        !stderr.to_ascii_lowercase().contains("json"),
+        !refusal_sentence(&stderr).to_ascii_lowercase().contains("json"),
         "the fixture must not be parsed as OpenRouter; stderr: {stderr}"
     );
     let retired = format!("{} was not selected", "openrouter-models");

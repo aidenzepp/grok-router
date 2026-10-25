@@ -15,7 +15,7 @@ use clap::error::ErrorKind;
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use grok_router::commands::{add, list, remove, search, set_default, skill};
-use grok_router::{Cli, Commands, OutputMode};
+use grok_router::{Cli, Commands, OutputMode, error};
 
 /// Runs the `grok-router` binary.
 fn main() {
@@ -29,13 +29,13 @@ fn main() {
     };
     let mode = match cli.resolve_output(output_source(&matches)) {
         Ok(mode) => mode,
-        Err(message) => {
+        Err(err) => {
             let mode = if argv_requests_json() {
                 OutputMode::Json
             } else {
                 OutputMode::Text
             };
-            std::process::exit(grok_router::fail_message(mode, &message));
+            std::process::exit(grok_router::fail_message(mode, cli.command_name(), &err));
         }
     };
     std::process::exit(dispatch(&cli, mode));
@@ -45,8 +45,10 @@ fn main() {
 fn dispatch(cli: &Cli, mode: OutputMode) -> i32 {
     let config = cli.config.as_deref();
     match &cli.command {
-        None => list::run(config, mode),
-        Some(Commands::List(_)) => list::run(config, mode),
+        None => list::run(config, cli.limit.as_deref(), mode),
+        Some(Commands::List(args)) => {
+            list::run(config, args.limit().or(cli.limit.as_deref()), mode)
+        }
         Some(Commands::Search(args)) => search::run(config, args, mode),
         Some(Commands::Add(args)) => add::run(config, args, mode),
         Some(Commands::SetDefault(args)) => set_default::run(config, args, mode),
@@ -125,19 +127,10 @@ fn json_clap_exit(err: &clap::Error) -> i32 {
             write_stdout_line(&body.to_string())
         }
         _ => {
-            let message = err.to_string();
-            let body = serde_json::json!({
-                "error": "usage",
-                "kind": "usage",
-                "message": message.trim(),
-            });
-            match writeln!(io::stderr(), "{body}") {
-                Ok(()) => err.exit_code(),
-                Err(print_err) => {
-                    eprintln!("could not write the usage error: {print_err}");
-                    err.exit_code()
-                }
-            }
+            let usage = error::Error::usage(err.to_string().trim());
+            let code = err.exit_code();
+            grok_router::write_failure(OutputMode::Json, usage_command_name(), &usage);
+            code
         }
     }
 }
@@ -179,6 +172,70 @@ fn argv_requests_json() -> bool {
     std::env::var("GROK_ROUTER_OUTPUT")
         .ok()
         .is_some_and(|value| is_json_format(&value))
+}
+
+/// Top-level subcommand named in a clap usage error.
+///
+/// A failure before any of those names uses `grok-router`. `skill` stays `skill`.
+fn usage_command_name() -> &'static str {
+    let args: Vec<String> = std::env::args().skip(1).map(|arg| arg).collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with('-') {
+            index = index.saturating_add(1);
+            if takes_value(arg) {
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        return match arg {
+            "list" => "list",
+            "search" => "search",
+            "add" => "add",
+            "set-default" => "set-default",
+            "remove" => "remove",
+            "completions" => "completions",
+            "schema" => "schema",
+            "skill" | "__internal" => "skill",
+            _ => "grok-router",
+        };
+    }
+    "grok-router"
+}
+
+/// Whether this argv token consumes the following token as its value.
+fn takes_value(arg: &str) -> bool {
+    if arg.contains('=') || arg == "--" {
+        return false;
+    }
+    let name = arg.strip_prefix("--").or_else(|| {
+        let short = arg.strip_prefix('-')?;
+        if short.len() == 1 { Some(short) } else { None }
+    });
+    matches!(
+        name,
+        Some(
+            "config"
+                | "output"
+                | "timeout"
+                | "limit"
+                | "skill-root"
+                | "cache-dir"
+                | "catalog-file"
+                | "provider"
+                | "as"
+                | "model"
+                | "base-url"
+                | "env-key"
+                | "api-backend"
+                | "name"
+                | "context-window"
+        )
+    )
 }
 
 /// `json` and `jsonl`, ignoring ASCII case, are the machine-readable formats.

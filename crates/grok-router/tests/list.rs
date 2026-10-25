@@ -174,6 +174,14 @@ fn list_help_contains_an_example_and_says_it_does_not_modify_the_config() {
         help.contains("does not modify the config"),
         "list --help should say the command does not modify the config; help: {help}"
     );
+    assert!(
+        help.contains("Omitting --limit lists every row"),
+        "list --help should say that omitting --limit lists every row; help: {help}"
+    );
+    assert!(
+        help.contains("--limit"),
+        "list --help should advertise --limit; help: {help}"
+    );
     remove_temp(&dir);
 }
 
@@ -587,5 +595,166 @@ fn schema_prints_a_json_schema_without_reading_config() {
         "schema should name a JSON Schema dialect; stdout: {stdout}"
     );
     assert!(!dir.join("config.toml").exists(), "schema should not create a config");
+    remove_temp(&dir);
+}
+
+#[test]
+fn list_without_limit_prints_every_row() {
+    let dir = temp_root("limit-all");
+    let config = dir.join("config.toml");
+    fs::write(&config, FIXTURE).expect("the config fixture should be written");
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let output = run(&dir, &["list", "--config", &config_arg]);
+    let stdout = stdout_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "omitting --limit should list; stderr: {}",
+        stderr_text(&output)
+    );
+    assert_text_inventory("omitting --limit", &stdout);
+    let bare = run(&dir, &["--config", &config_arg]);
+    assert_eq!(
+        stdout_text(&bare),
+        stdout,
+        "a bare invocation should list the same rows as list"
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn list_limit_keeps_the_first_rows_and_drops_the_rest() {
+    let dir = temp_root("limit-n");
+    let config = dir.join("config.toml");
+    fs::write(&config, FIXTURE).expect("the config fixture should be written");
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let output = run(&dir, &["list", "--config", &config_arg, "--limit", "1"]);
+    let stdout = stdout_text(&output);
+    assert_eq!(
+        exit_code(&output),
+        0,
+        "--limit 1 should list; stderr: {}",
+        stderr_text(&output)
+    );
+    assert_eq!(
+        stdout.trim(),
+        "or-deepseek-flash  deepseek/deepseek-v4.1-flash-1017",
+        "--limit 1 should keep the first row and drop the rest; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("grok-4.7"),
+        "--limit 1 should drop the later default row; stdout: {stdout}"
+    );
+    let bare = run(&dir, &["--config", &config_arg, "--limit", "1"]);
+    assert_eq!(
+        stdout_text(&bare).trim(),
+        stdout.trim(),
+        "a bare invocation should honor --limit"
+    );
+    let json = run(
+        &dir,
+        &["list", "--config", &config_arg, "--limit", "1", "--output", "json"],
+    );
+    assert_eq!(exit_code(&json), 0, "json --limit should list; stderr: {}", stderr_text(&json));
+    let body: serde_json::Value =
+        serde_json::from_str(stdout_text(&json).trim()).expect("limited json should be one value");
+    let rows = body.as_array().expect("limited json should stay an array");
+    assert_eq!(rows.len(), 1, "json --limit 1 should keep one object; body: {body}");
+    assert_eq!(rows[0]["slug"], "or-deepseek-flash");
+    let quiet = run(
+        &dir,
+        &["list", "--config", &config_arg, "--limit", "1", "--quiet"],
+    );
+    assert_eq!(
+        stdout_text(&quiet).trim(),
+        "or-deepseek-flash",
+        "quiet --limit 1 should keep the first slug; stdout: {}",
+        stdout_text(&quiet)
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn list_limit_zero_exits_nonzero_and_prints_nothing() {
+    let dir = temp_root("limit-zero");
+    let config = dir.join("config.toml");
+    fs::write(&config, FIXTURE).expect("the config fixture should be written");
+    let config_arg = utf8_arg(&config, "the config path should be UTF-8");
+    let output = run(&dir, &["list", "--config", &config_arg, "--limit", "0"]);
+    assert_ne!(exit_code(&output), 0, "--limit 0 should fail");
+    assert!(
+        stdout_text(&output).is_empty(),
+        "--limit 0 should print nothing; stdout: {}",
+        stdout_text(&output)
+    );
+    let stderr = stderr_text(&output);
+    assert!(
+        stderr.contains("--limit 0 would hide every row"),
+        "the refusal should say --limit 0 would hide every row; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Omit --limit") && stderr.contains("greater than zero"),
+        "the refusal should name the next action; stderr: {stderr}"
+    );
+    let bad = run(&dir, &["list", "--config", &config_arg, "--limit", "nope"]);
+    assert_ne!(exit_code(&bad), 0, "a non-integer --limit should fail");
+    assert!(
+        stdout_text(&bad).is_empty(),
+        "a non-integer --limit should print nothing; stdout: {}",
+        stdout_text(&bad)
+    );
+    assert!(
+        stderr_text(&bad).contains("nope"),
+        "a non-integer refusal should name the bad value; stderr: {}",
+        stderr_text(&bad)
+    );
+    remove_temp(&dir);
+}
+
+#[test]
+fn json_error_carries_command_format_and_the_text_sentence() {
+    let dir = temp_root("json-error");
+    let missing = dir.join("missing.toml");
+    let missing_arg = utf8_arg(&missing, "the missing path should be UTF-8");
+    let text = run(&dir, &["list", "--config", &missing_arg]);
+    let sentence = stderr_text(&text);
+    assert_ne!(exit_code(&text), 0, "a missing config should fail");
+    assert!(
+        stdout_text(&text).is_empty(),
+        "a text failure should not print a list; stdout: {}",
+        stdout_text(&text)
+    );
+    assert!(
+        !sentence.trim_start().starts_with('{'),
+        "text mode should stay the sentence; stderr: {sentence}"
+    );
+    let json = run(
+        &dir,
+        &["list", "--config", &missing_arg, "--output", "json"],
+    );
+    assert_ne!(exit_code(&json), 0, "json mode should still fail");
+    assert!(
+        stdout_text(&json).is_empty(),
+        "a json failure should keep stdout empty; stdout: {}",
+        stdout_text(&json)
+    );
+    let body: serde_json::Value = serde_json::from_str(stderr_text(&json).trim())
+        .expect("a json failure should be one JSON object");
+    assert_eq!(body["command"], "list");
+    assert_eq!(body["format"], "json");
+    assert_eq!(body["error"], "error");
+    assert_eq!(body["kind"], "error");
+    assert_eq!(
+        body["message"].as_str(),
+        Some(sentence.trim()),
+        "the json message should be the text sentence"
+    );
+    let jsonl = run(
+        &dir,
+        &["list", "--config", &missing_arg, "--jsonl"],
+    );
+    let jsonl_body: serde_json::Value = serde_json::from_str(stderr_text(&jsonl).trim())
+        .expect("jsonl should still be one JSON object");
+    assert_eq!(jsonl_body["format"], "json", "jsonl errors use format json");
     remove_temp(&dir);
 }

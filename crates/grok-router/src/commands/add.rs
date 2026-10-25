@@ -21,6 +21,7 @@ use clap::{ArgAction, Args};
 
 use crate::catalog::{self, CachedBodyOrFetch, Cartridge, CartridgeError, CatalogCartridge};
 use crate::config_edit::{self, Backup, ProviderChoice, RefuseReason};
+use crate::error::Error;
 use crate::OutputMode;
 
 /// Add one model from the selected provider record, or write one block from --model, --base-url, --env-key, and --api-backend without resolving a provider. This command writes unless --dry-run is set.
@@ -114,11 +115,11 @@ pub struct AddArgs {
 pub fn run(config: Option<&str>, args: &AddArgs, mode: OutputMode) -> i32 {
     let timeout = match catalog::require_timeout(&args.timeout) {
         Ok(timeout) => timeout,
-        Err(message) => return fail(mode, &message),
+        Err(message) => return fail(mode, &Error::command(message)),
     };
     match run_add(config, args, mode, timeout) {
         Ok(body) => write_stdout(mode, &body),
-        Err(message) => fail(mode, &message),
+        Err(err) => fail(mode, &err),
     }
 }
 
@@ -131,7 +132,7 @@ fn run_add(
     args: &AddArgs,
     mode: OutputMode,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     let config_path = configured_path(config)?;
     let original = read_config_text(&config_path)?;
     let present = direct_flags_present(args);
@@ -139,12 +140,12 @@ fn run_add(
     if present.is_empty() {
         let extras = catalog_refused_flags(args);
         if !extras.is_empty() {
-            return Err(catalog_flag_refusal(&extras));
+            return Err(Error::command(catalog_flag_refusal(&extras)));
         }
         return run_catalog_add(&config_path, &original, args, mode, timeout);
     }
     if !missing.is_empty() {
-        return Err(partial_direct_refusal(&present, &missing));
+        return Err(Error::command(partial_direct_refusal(&present, &missing)));
     }
     run_direct_add(&config_path, &original, args, mode)
 }
@@ -278,10 +279,10 @@ fn run_direct_add(
     original: &str,
     args: &AddArgs,
     mode: OutputMode,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     let conflicts = direct_conflicts(args);
     if !conflicts.is_empty() {
-        return Err(direct_conflict_refusal(&conflicts));
+        return Err(Error::command(direct_conflict_refusal(&conflicts)));
     }
     let slug = required_direct_slug(args)?;
     let (model, base_url, env_key, api_backend) = match (
@@ -294,10 +295,10 @@ fn run_direct_add(
             (model, base_url, env_key, api_backend)
         }
         _ => {
-            return Err(partial_direct_refusal(
+            return Err(Error::command(partial_direct_refusal(
                 &direct_flags_present(args),
                 &direct_flags_missing(&direct_flags_present(args)),
-            ));
+            )));
         }
     };
     let inserted = config_edit::insert_direct(
@@ -313,12 +314,12 @@ fn run_direct_add(
             vision: args.vision,
         },
     )
-    .map_err(|refused| edit_failure(&refused.reason))?;
+    .map_err(|refused| edit_failure(refused.reason))?;
     // `Refused.text` is the inserted document. Do not write it: the file keeps `original`.
     let edited = if args.set_default {
         match config_edit::set_default(&inserted, slug) {
             Ok(text) => text,
-            Err(refused) => return Err(edit_failure(&refused.reason)),
+            Err(refused) => return Err(edit_failure(refused.reason)),
         }
     } else {
         inserted
@@ -331,9 +332,10 @@ fn run_direct_add(
         config_edit::refuse_named_secrets(&edited, &[env_key])?;
         config_edit::replace_file(config_path, Backup::Sibling, edited.as_bytes(), "").map_err(
             |err| {
-                format!(
+                let message = format!(
                     "{err}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the edit."
-                )
+                );
+                Error::replace(err, message)
             },
         )?;
         true
@@ -346,7 +348,7 @@ fn run_direct_add(
         unchanged,
         default: args.set_default,
     };
-    render(mode, &report, config_path)
+    render(mode, &report, config_path).map_err(Error::from)
 }
 
 /// Resolve one provider record, parse with its cartridge, and write once.
@@ -356,22 +358,24 @@ fn run_catalog_add(
     args: &AddArgs,
     mode: OutputMode,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     let choice = provider_choice(args);
-    let record = config_edit::resolve_provider(original, choice)
-        .map_err(|reason| resolve_failure(&reason))?;
+    let record =
+        config_edit::resolve_provider(original, choice).map_err(resolve_failure)?;
     let selected = catalog::cartridge(record.catalog.as_deref())
-        .map_err(|err| cartridge_failure(&record_name(original, choice), &err))?;
-    let _builtins =
-        config_edit::builtins_from(original).map_err(|reason| early_refusal(&reason))?;
+        .map_err(|err| cartridge_failure(&record_name(original, choice), err))?;
+    let _builtins = config_edit::builtins_from(original).map_err(early_refusal)?;
     let terms = query_terms(&args.query)?;
     let rows = load_rows(args, &selected, &record.base_url, &record.env_key, timeout)?;
     let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let row =
-        catalog::resolve(&rows, &term_refs).map_err(|err| format!("{err} Nothing was written."))?;
+        catalog::resolve(&rows, &term_refs).map_err(|err| {
+            let message = format!("{err} Nothing was written.");
+            Error::resolve(err, message)
+        })?;
     let slug = selected
         .slug(row.id(), args.as_slug.as_deref())
-        .map_err(|reason| edit_failure(&reason))?;
+        .map_err(edit_failure)?;
     let edited = edited_config(
         original,
         row,
@@ -388,9 +392,10 @@ fn run_catalog_add(
         config_edit::refuse_named_secrets(&edited, &[record.env_key.as_str()])?;
         config_edit::replace_file(config_path, Backup::Sibling, edited.as_bytes(), "").map_err(
             |err| {
-                format!(
+                let message = format!(
                     "{err}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the edit."
-                )
+                );
+                Error::replace(err, message)
             },
         )?;
         true
@@ -403,7 +408,7 @@ fn run_catalog_add(
         unchanged,
         default: args.set_default,
     };
-    render(mode, &report, config_path)
+    render(mode, &report, config_path).map_err(Error::from)
 }
 
 /// `--config` from the global flag. Never a home path.
@@ -448,9 +453,9 @@ fn record_name(config: &str, choice: ProviderChoice<'_>) -> String {
 }
 
 /// What failed, why the record was not used, and that nothing was downloaded or written.
-fn resolve_failure(reason: &RefuseReason) -> String {
+fn resolve_failure(reason: RefuseReason) -> Error {
     let preserved = "The file was left unchanged. Nothing was downloaded. Nothing was written.";
-    let must_write = match reason {
+    let must_write = match &reason {
         RefuseReason::InvalidSetting { key, detail }
             if key == "router"
                 || key == "default_provider"
@@ -461,26 +466,31 @@ fn resolve_failure(reason: &RefuseReason) -> String {
         }
         _ => "",
     };
-    format!("{reason}.{must_write} {preserved}")
+    let message = format!("{reason}.{must_write} {preserved}");
+    Error::refused(reason, message)
 }
 
 /// A cartridge refusal names the provider and does not parse, download, or write.
-fn cartridge_failure(provider: &str, err: &CartridgeError) -> String {
+fn cartridge_failure(provider: &str, err: CartridgeError) -> Error {
     let next = "Set catalog to openrouter-models or deepseek-list-models, or pass --provider for a record that already has one.";
     let preserved = "Nothing was downloaded. Nothing was written.";
-    match err {
+    let message = match &err {
         CartridgeError::Missing => {
             format!("{provider} has no catalog cartridge configured. {preserved} {next}")
         }
         CartridgeError::Unknown { id } => format!(
             "catalog {id} on {provider} is not a cartridge, so no catalog cartridge is configured. {preserved} {next}"
         ),
-    }
+    };
+    Error::cartridge(err, message)
 }
 
 /// Built-in membership failed before any catalog parse or download.
-fn early_refusal(reason: &RefuseReason) -> String {
-    format!("{reason}. The file was left unchanged. Nothing was downloaded. Nothing was written.")
+fn early_refusal(reason: RefuseReason) -> Error {
+    let message = format!(
+        "{reason}. The file was left unchanged. Nothing was downloaded. Nothing was written."
+    );
+    Error::refused(reason, message)
 }
 
 /// Positional query terms. An empty term is a usage failure.
@@ -509,7 +519,7 @@ fn load_rows(
     base_url: &str,
     env_key: &str,
     timeout: Duration,
-) -> Result<Vec<crate::catalog::CatalogRow>, String> {
+) -> Result<Vec<crate::catalog::CatalogRow>, Error> {
     if let Some(path) = &args.catalog_file {
         let bytes = fs::read(path).map_err(|err| {
             format!(
@@ -517,9 +527,10 @@ fn load_rows(
                 path.display()
             )
         })?;
-        return cartridge
-            .parse(&bytes)
-            .map_err(|err| format!("{err} Nothing was written."));
+        return cartridge.parse(&bytes).map_err(|err| {
+            let message = format!("{err} Nothing was written.");
+            Error::catalog(err, message)
+        });
     }
 
     let api_key = required_bearer(env_key)?;
@@ -529,26 +540,35 @@ fn load_rows(
     };
     let now = SystemTime::now();
     match catalog::prepare_cached_body(&cache_dir, now, args.refresh, &api_key, base_url, env_key)
-        .map_err(|err| format!("{err} Nothing was written."))?
+        .map_err(|err| {
+            let message = format!("{err} Nothing was written.");
+            Error::catalog(err, message)
+        })?
     {
-        CachedBodyOrFetch::Cached(bytes) => cartridge
-            .parse(&bytes)
-            .map_err(|err| format!("{err} Nothing was written.")),
+        CachedBodyOrFetch::Cached(bytes) => cartridge.parse(&bytes).map_err(|err| {
+            let message = format!("{err} Nothing was written.");
+            Error::catalog(err, message)
+        }),
         CachedBodyOrFetch::Fetch(request) => {
-            let bytes = catalog::fetch_catalog_bytes(&request, timeout)
-                .map_err(|err| format!("{err} Nothing was written."))?;
-            let stored = catalog::write_cache(&cache_dir, base_url, &bytes)
-                .map_err(|err| format!("{err} Nothing was written."))?;
+            let bytes = catalog::fetch_catalog_bytes(&request, timeout).map_err(|err| {
+                let message = format!("{err} Nothing was written.");
+                Error::catalog(err, message)
+            })?;
+            let stored = catalog::write_cache(&cache_dir, base_url, &bytes).map_err(|err| {
+                let message = format!("{err} Nothing was written.");
+                Error::catalog(err, message)
+            })?;
             if stored != catalog::cache_path_for(&cache_dir, &catalog::models_url(base_url)) {
-                return Err(format!(
+                return Err(Error::command(format!(
                     "the catalog cache was written to {}, outside {}. The config was not written. Pass --cache-dir.",
                     stored.display(),
                     cache_dir.display()
-                ));
+                )));
             }
-            cartridge
-                .parse(&bytes)
-                .map_err(|err| format!("{err} The config was not written."))
+            cartridge.parse(&bytes).map_err(|err| {
+                let message = format!("{err} The config was not written.");
+                Error::catalog(err, message)
+            })
         }
     }
 }
@@ -612,22 +632,23 @@ fn edited_config(
     base_url: &str,
     env_key: &str,
     set_default: bool,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     let inserted =
         config_edit::insert_model(original, row.as_catalog_model(), slug, base_url, env_key)
-            .map_err(|refused| edit_failure(&refused.reason))?;
+            .map_err(|refused| edit_failure(refused.reason))?;
     if !set_default {
         return Ok(inserted);
     }
-    config_edit::set_default(&inserted, slug).map_err(|refused| edit_failure(&refused.reason))
+    config_edit::set_default(&inserted, slug).map_err(|refused| edit_failure(refused.reason))
 }
 
 /// What failed, why, and what to do next. The file was not written.
-fn edit_failure(reason: &RefuseReason) -> String {
-    format!(
+fn edit_failure(reason: RefuseReason) -> Error {
+    let message = format!(
         "{reason}. The file was left unchanged. {}",
-        next_step(reason)
-    )
+        next_step(&reason)
+    );
+    Error::refused(reason, message)
 }
 
 /// The next action for a refused edit.
@@ -706,14 +727,16 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &format!("could not write the add result: {err}. Retry when stdout accepts output."),
+            &Error::command(format!(
+                "could not write the add result: {err}. Retry when stdout accepts output."
+            )),
         ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(mode: OutputMode, message: &str) -> i32 {
-    crate::fail_message(mode, message)
+fn fail(mode: OutputMode, err: &Error) -> i32 {
+    crate::fail_message(mode, "add", err)
 }
 
 /// One JSON object for a finished add.

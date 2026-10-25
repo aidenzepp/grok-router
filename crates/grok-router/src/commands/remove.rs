@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use crate::config_edit::{self, Backup, RefuseReason};
+use crate::error::Error;
 use crate::OutputMode;
 
 /// Delete one model block from the config. This command deletes a model block.
@@ -40,23 +41,23 @@ pub struct RemoveArgs {
 pub fn run(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> i32 {
     match run_remove(config, args, mode) {
         Ok(body) => write_stdout(mode, &body),
-        Err(message) => fail(mode, &message),
+        Err(err) => fail(mode, &err),
     }
 }
 
 /// Delete one slug, or preview that deletion. Does not prompt.
-fn run_remove(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> Result<String, String> {
+fn run_remove(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> Result<String, Error> {
     let slug = required_slug(&args.slug)?;
     let config_path = configured_path(config)?;
     let original = read_config_text(&config_path)?;
     let edited =
-        config_edit::remove_model(&original, &slug).map_err(|refused| edit_failure(&refused.reason))?;
+        config_edit::remove_model(&original, &slug).map_err(|refused| edit_failure(refused.reason))?;
     let dry_run = args.dry_run;
     let confirmed = args.yes;
     if !dry_run && !confirmed {
-        return Err(format!(
+        return Err(Error::command(format!(
             "{slug} was not deleted. Nothing was written. To delete that model block, pass --yes. To preview, pass --dry-run."
-        ));
+        )));
     }
     let removed = if dry_run {
         false
@@ -64,9 +65,10 @@ fn run_remove(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> Resu
         config_edit::refuse_named_secrets(&edited, &[])?;
         config_edit::replace_file(&config_path, Backup::Sibling, edited.as_bytes(), "")
             .map_err(|err| {
-                format!(
+                let message = format!(
                     "{err}. The config was not replaced. Retry with a writable --config, or pass --dry-run to preview the deletion."
-                )
+                );
+                Error::replace(err, message)
             })?;
         true
     };
@@ -75,7 +77,7 @@ fn run_remove(config: Option<&str>, args: &RemoveArgs, mode: OutputMode) -> Resu
         removed,
         dry_run,
     };
-    render(mode, &report)
+    render(mode, &report).map_err(Error::from)
 }
 
 /// The positional slug. An empty slug is a usage failure and deletes nothing.
@@ -122,11 +124,12 @@ fn read_config_text(path: &Path) -> Result<String, String> {
 }
 
 /// What failed, why, and what to do next. The file was not written.
-fn edit_failure(reason: &RefuseReason) -> String {
-    format!(
+fn edit_failure(reason: RefuseReason) -> Error {
+    let message = format!(
         "{reason}. The file was left unchanged. {}",
-        next_step(reason)
-    )
+        next_step(&reason)
+    );
+    Error::refused(reason, message)
 }
 
 /// The next action for a refused removal.
@@ -199,14 +202,16 @@ fn write_stdout(mode: OutputMode, body: &str) -> i32 {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(err) => fail(
             mode,
-            &format!("could not write the remove result: {err}. Retry when stdout accepts output."),
+            &Error::command(format!(
+                "could not write the remove result: {err}. Retry when stdout accepts output."
+            )),
         ),
     }
 }
 
 /// Print a failure to stderr and return the failure status.
-fn fail(mode: OutputMode, message: &str) -> i32 {
-    crate::fail_message(mode, message)
+fn fail(mode: OutputMode, err: &Error) -> i32 {
+    crate::fail_message(mode, "remove", err)
 }
 
 /// One JSON object for a finished remove.
